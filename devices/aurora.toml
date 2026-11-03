@@ -122,6 +122,12 @@ partition = "modem"
 [partitions]
 mounted = ["persist"]
 
+# What a backup keeps of the phone's own identity: the baseband's settings
+# and the sensors' calibration. A phone that loses these loses its radio or
+# its tuning, and no ROM package puts them back.
+[backup]
+efs = ["modemst1", "modemst2", "fsg", "fsc", "persist"]
+
 [update]
 server = "https://update.miui.com/updates/miotaV3.php"
 
