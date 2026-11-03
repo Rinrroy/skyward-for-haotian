@@ -2251,21 +2251,34 @@ pub fn avb(cx: &Ctx) -> Frame {
     y = widgets::footnote(&mut c, t, f, y + t.m.card_gap, &ran);
 
     let what = l.pick([
-        "AVB 让 bootloader 与内核在开机时核对每个分区的内容是否与 vbmeta 里的清单一致。关闭这两项校验后，非官方系统也能启动；代价是官方 OTA 会失败，部分应用与售后工具会读到这个状态。",
-        "AVB 讓 bootloader 與核心在開機時核對每個分割區的內容是否與 vbmeta 裡的正確清單一致。關閉這兩項校驗後，非官方系統也能啟動；代價是官方 OTA 會失敗，部分應用程式與售後工具會讀到這個狀態。",
-        "AVB has the bootloader and the kernel check each partition against what its vbmeta block says. Turning both checks off lets a build that is not the phone's own start; official updates then fail, and some apps and service tools read the state.",
+        "AVB 让 bootloader 校验启动分区的签名，让内核逐块校验 system、vendor 的内容。\n\n关掉这两项之后，官方系统会无法启动，这一页只适用于已经刷入第三方系统的情况。代价还有：官方 OTA 会失败，部分应用与售后工具会读到这个状态。",
+        "AVB 讓 bootloader 校驗啟動分割區的簽章，讓核心逐塊校驗 system、vendor 的內容。\n\n關掉這兩項之後，官方系統會無法啟動，這一頁只適用於已經刷入第三方系統的情況。代價還有：官方 OTA 會失敗，部分應用程式與售後工具會讀到這個狀態。",
+        "AVB has the bootloader check the signature of what it starts, and the kernel check the blocks of system and vendor.\n\nWith both checks off, the phone's own system will not start; this page is for a phone already running another build. Official updates also fail, and some apps and service tools read the state.",
     ]);
     y = widgets::paragraph(&mut c, t, f, y + t.m.card_gap, what);
 
-    // What turning them back on asks of the phone, where they are off.
-    if !on {
-        let warning = l.pick([
-            "打开校验前请先刷回官方系统包。若分区仍是第三方的，打开后开不了机——那时仍可回到这里再关掉。",
-            "開啟校驗前請先刷回官方系統包。若分割區仍是第三方的，開啟後開不了機——那時仍可回到這裡再關掉。",
-            "Flash the phone's own system back before turning the checks on. If the partitions are still another build's, the phone will not start; it can be turned off again from here.",
-        ]);
-        y = widgets::footnote(&mut c, t, f, y + t.m.card_gap, warning);
-    }
+    // What the swipe below costs, said plainly and before it is dragged: a
+    // phone that came with its own system will not start once the checks are
+    // off, which is the mistake this page is here to prevent.
+    let (heading, detail) = match on {
+        true => (
+            l.pick(["关闭后，官方系统将无法启动", "關閉後，官方系統將無法啟動", "Off, the phone's own system will not start"]),
+            l.pick([
+                "这项开关只给已经刷入第三方系统的情况使用。如果这台手机现在跑的是官方系统，请保持开启；只有在准备刷第三方系统之前，才关闭它。",
+                "這項開關只給已經刷入第三方系統的情況使用。如果這台手機現在跑的是官方系統，請保持開啟；只有在準備刷第三方系統之前，才關閉它。",
+                "This switch is for a phone already running another build. Where the phone's own system still runs, keep it on, and turn it off only just before flashing another one.",
+            ]),
+        ),
+        false => (
+            l.pick(["重新打开前，请先刷回官方系统包", "重新開啟前，請先刷回官方系統包", "Flash the phone's own system back before turning these on"]),
+            l.pick([
+                "若分区仍是第三方的，打开后开不了机；那时仍可回到这一页再关掉，recovery 本身不受这个开关影响。",
+                "若分割區仍是第三方的，開啟後開不了機；那時仍可回到這一頁再關掉，recovery 本身不受這個開關影響。",
+                "With another build's partitions in place, the phone will not start; it can then be turned off again from this page, as recovery is never held by this switch.",
+            ]),
+        ),
+    };
+    y = widgets::danger_card(&mut c, t, f, y + t.m.card_gap, heading, detail);
 
     // How the last change went.
     if let Some(result) = &s.avb_result {
@@ -3645,10 +3658,13 @@ pub fn cant_start(cx: &Ctx) -> Frame {
     let mut c = page(cx);
     let mut out = Vec::new();
     let top = t.m.content_top;
+    // What put this page here, and that it was not the user's doing: a start
+    // that could not mount what it needs, which is very often something
+    // other than damaged data, so that erasing is not the first thing tried.
     let what = l.pick([
-        "无法启动系统，本机数据可能已损坏。如果每次启动都停留在此页面，可恢复出厂设置，这将清除本机的全部数据。",
-        "無法啟動系統，本機資料可能已損壞。如果每次啟動都停留在此頁面，可恢復原廠設定，這將清除本機的全部資料。",
-        "The system couldn't start, and this phone's data may be damaged. If every start ends on this page, a factory reset may help, though it wipes all of this phone's data.",
+        "系统启动时没能挂载所需的分区，因此把这一页交给你——这不是你刚才的操作造成的。\n\n先试「重试」；仍然不行就进「恢复模式」查看原因，那里不会清除任何内容。",
+        "系統啟動時沒能掛載所需的分割區，因此把這一頁交給你——這不是你剛才的操作造成的。\n\n先試「重試」；仍然不行就進「復原模式」查看原因，那裡不會清除任何內容。",
+        "The system could not mount what it needs to start, so it hands this page to you; nothing you did just now caused it.\n\nTry again first, and enter recovery to look into it if that fails: that wipes nothing.",
     ]);
     let mut y = widgets::paragraph(&mut c, t, f, top, what);
     if let Some(reason) = &s.asked.reason {
@@ -3661,9 +3677,21 @@ pub fn cant_start(cx: &Ctx) -> Frame {
     ];
     let choices = widgets::list(&mut c, t, f, y, &rows);
     out.extend(hits(&choices.rows, &[Action::RebootTo(Target::System), Action::Dismiss]));
-    let y = widgets::footnote(&mut c, t, f, choices.bottom, l.pick(["恢复出厂设置后，数据无法恢复。", "恢復原廠設定後，資料無法復原。", "Data a factory reset wipes can't be brought back."]));
+    // The erasing control sits under a card of its own, apart from the two
+    // choices above it, so that what it costs is read before it is dragged.
+    let warning = l.pick([
+        "恢复出厂设置会删除这台手机的全部数据",
+        "恢復原廠設定會刪除這台手機的全部資料",
+        "A factory reset deletes everything on this phone",
+    ]);
+    let detail = l.pick([
+        "照片、聊天记录、应用数据与内部存储都会被清除，且无法恢复。只有确认数据已经无法挽救时，才滑动下面这一条。",
+        "照片、聊天記錄、應用程式資料與內部儲存空間都會被清除，且無法復原。只有確認資料已經無法挽救時，才滑動下面這一條。",
+        "Photos, messages, app data and internal storage are all erased, and none of it comes back. Slide the bar below only once the data is beyond saving.",
+    ]);
+    y = widgets::danger_card(&mut c, t, f, choices.bottom + t.m.dp(16.0), warning, detail);
     let (label, danger) = confirm_label(Confirm::FactoryReset, cx.state);
-    let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
+    let track = widgets::confirm(&mut c, t, f, y + t.m.dp(20.0), label, danger, s.confirm);
     out.push(Hit { rect: track, action: Action::Confirm(Confirm::FactoryReset) });
     Frame { back: false, ..Frame::new(t, c, out, l.pick(["无法启动系统", "無法啟動系統", "Can't start the system"]), top) }
 }
