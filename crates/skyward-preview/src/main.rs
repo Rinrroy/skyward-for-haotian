@@ -520,9 +520,9 @@ fn main() -> Result<()> {
             app.state.backup_job = job(true, Vec::new(), None, Some(BackupEnd::Refused(BackupRefusal::DataReset)))
         }),
         ("49-advanced-light", Screen::Advanced, false, &|_| {}),
-        ("49-avb-light", Screen::Avb, false, &|app| app.set_avb(Ok(avb_blocks(false)))),
+        ("49-avb-light", Screen::Avb, false, &|app| app.set_avb(Ok(avb_blocks(false)), Some("enforcing".into()))),
         ("49-avb-dark-off", Screen::Avb, true, &|app| {
-            app.set_avb(Ok(avb_blocks(true)));
+            app.set_avb(Ok(avb_blocks(true)), Some("enforcing".into()));
             app.state.avb_result = Some(Ok(vec![
                 AvbChange { name: "vbmeta".into(), before: 0, after: 3, kept: Some("/tmp/avb/vbmeta-0x00000000-1793681979.img".into()) },
                 AvbChange { name: "vbmeta_system".into(), before: 0, after: 3, kept: Some("/tmp/avb/vbmeta_system-0x00000000-1793681979.img".into()) },

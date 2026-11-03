@@ -2170,6 +2170,7 @@ const AVB_UNKNOWN: Text = ["未知", "未知", "Unknown"];
 const AVB_READING: Text = ["正在读取 vbmeta", "正在讀取 vbmeta", "Reading the vbmeta blocks"];
 const AVB_NONE: Text = ["这个槽位没有 vbmeta 分区", "這個槽位沒有 vbmeta 分割區", "This slot keeps no vbmeta partition"];
 const AVB_UNREADABLE: Text = ["无法读取 vbmeta", "無法讀取 vbmeta", "Couldn't read the vbmeta blocks"];
+const AVB_MODE_UNKNOWN: Text = ["未知", "未知", "unknown"];
 
 /// The AVB row's trailing word: whether the checks the phone's vbmeta blocks
 /// name are on.
@@ -2236,6 +2237,18 @@ pub fn avb(cx: &Ctx) -> Frame {
             y = widgets::list(&mut c, t, f, y, &list).bottom;
         }
     }
+
+    // What the bootloader made of the flags when the phone started. A change
+    // shows here only once it has started again, which makes this the
+    // plainest sign that a change reached the bootloader at all.
+    let mode = s.verity.as_deref().unwrap_or(l.pick(AVB_MODE_UNKNOWN));
+    let ran = tr!(
+        l,
+        "本次启动：校验模式 {mode}。改动在下次启动生效。",
+        "本次啟動：校驗模式 {mode}。改動在下次啟動生效。",
+        "This start runs with verity {mode}; a change takes effect on the next start."
+    );
+    y = widgets::footnote(&mut c, t, f, y + t.m.card_gap, &ran);
 
     let what = l.pick([
         "AVB 让 bootloader 与内核在开机时核对每个分区的内容是否与 vbmeta 里的清单一致。关闭这两项校验后，非官方系统也能启动；代价是官方 OTA 会失败，部分应用与售后工具会读到这个状态。",

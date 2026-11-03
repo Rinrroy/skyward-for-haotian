@@ -1018,6 +1018,12 @@ fn read_avb() -> Result<Vec<skyward_vab::avb::Reading>, String> {
     read().map_err(|e| format!("{e:#}"))
 }
 
+/// What the bootloader made of the vbmeta flags when this phone started:
+/// what the kernel was told to enforce, as the phone's own init passes it on.
+fn verity_mode() -> Option<String> {
+    skyward_sys::prop("ro.boot.veritymode")
+}
+
 /// Turn both checks the vbmeta blocks name off, or back on, across every
 /// block the running slot keeps, giving what each held before and after.
 fn set_avb(on: bool) -> Result<Vec<skyward_vab::avb::Change>, String> {
@@ -2073,7 +2079,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     },
                     Effect::ReadMounts => app.set_mounts(mounts()),
                     Effect::ReadSlots => app.set_boot_slots(read_slots()),
-                    Effect::ReadAvb => app.set_avb(read_avb()),
+                    Effect::ReadAvb => app.set_avb(read_avb(), verity_mode()),
                     // Both checks are written across every vbmeta block the
                     // slot keeps, and what they say afterwards is read again
                     // so the page shows what the phone will act on.

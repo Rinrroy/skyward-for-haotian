@@ -1623,6 +1623,10 @@ pub struct State {
     /// What the phone's vbmeta blocks say, as the runtime last read them for
     /// the AVB page, or why it could not.
     pub avb: Option<Result<Vec<AvbReading>, String>>,
+    /// What the bootloader made of those flags when the phone last started:
+    /// `enforcing`, `disabled`, or whatever else it calls it. A change to the
+    /// flags shows here only once the phone starts again.
+    pub verity: Option<String>,
     /// The last change the AVB page made, block by block, or why it made
     /// none.
     pub avb_result: Option<Result<Vec<AvbChange>, String>>,
@@ -1752,6 +1756,7 @@ impl Default for State {
             logs_to: 0,
             boot_slots: None,
             avb: None,
+            verity: None,
             avb_result: None,
             next_slot: None,
             data: Data::Closed,
@@ -3670,9 +3675,11 @@ impl App {
         self.refresh();
     }
 
-    /// What the phone's vbmeta blocks say, as they were just read.
-    pub fn set_avb(&mut self, read: Result<Vec<AvbReading>, String>) {
+    /// What the phone's vbmeta blocks say, as they were just read, and what
+    /// the bootloader made of them when the phone started.
+    pub fn set_avb(&mut self, read: Result<Vec<AvbReading>, String>, verity: Option<String>) {
         self.state.avb = Some(read);
+        self.state.verity = verity;
         self.refresh();
     }
 
