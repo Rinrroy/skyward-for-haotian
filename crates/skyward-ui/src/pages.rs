@@ -153,6 +153,7 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
         Confirm::Avb(false) => (["滑动以关闭校验", "滑動以關閉校驗", "Slide to turn checks off"], true),
         Confirm::Avb(true) => (["滑动以打开校验", "滑動以開啟校驗", "Slide to turn checks on"], true),
         Confirm::ClearStarter => (["滑动以清除这条指令", "滑動以清除這條指令", "Slide to take the message away"], true),
+        Confirm::InstallQueue => (["滑动以依次安装", "滑動以依序安裝", "Slide to install them in turn"], false),
     };
     (s.lang.pick(label), danger)
 }
@@ -876,6 +877,43 @@ pub fn install(cx: &Ctx) -> Frame {
         "Installs A/B full OTA packages and flashable zips with an install script, and flashes boot, init_boot, vendor_boot, recovery, dtbo and vbmeta partition images. A system update installs to the other slot, which starts after a reboot. Choosing a file lists only folders and .zip and .img files.",
     ]);
     let y = widgets::footnote(&mut c, t, f, methods.bottom, what);
+
+    // Packages waiting their turn, installed one after another in the order
+    // they were chosen. A package that fails stops the queue at itself, and
+    // the page says which one it was.
+    let mut y = widgets::section(&mut c, t, f, y, l.pick(QUEUE));
+    let add = Row::new(l.pick(QUEUE_ADD)).icon(GREEN, Icon::Install).subtitle(l.pick(QUEUE_ADD_NOTE)).trail(Trail::Arrow);
+    let adding = widgets::list(&mut c, t, f, y, &[add]);
+    out.extend(hits(&adding.rows, &[Action::QueuePick(Place::Storage)]));
+    y = adding.bottom;
+    if !cx.state.queue.is_empty() {
+        let sizes: Vec<String> = cx.state.queue.iter().map(|q| package_size(q.size)).collect();
+        let queued: Vec<Row> = cx
+            .state
+            .queue
+            .iter()
+            .zip(&sizes)
+            .map(|(q, size)| Row::new(&q.name).subtitle(size).trail(Trail::Value(l.pick(QUEUE_REMOVE))))
+            .collect();
+        let list = widgets::list(&mut c, t, f, y, &queued);
+        let drops: Vec<Action> = (0..cx.state.queue.len()).map(Action::QueueDrop).collect();
+        out.extend(hits(&list.rows, &drops));
+        y = list.bottom;
+        if let Some(name) = &cx.state.queue_stopped {
+            let said = tr!(
+                l,
+                "{name} 未能安装，队列停在这里。",
+                "{name} 未能安裝，佇列停在這裡。",
+                "{name} did not install, and the queue stopped there."
+            );
+            y = widgets::footnote(&mut c, t, f, y + t.m.card_gap, &said);
+        }
+        let (label, danger) = confirm_label(Confirm::InstallQueue, cx.state);
+        let track = widgets::confirm(&mut c, t, f, y + t.m.card_gap, label, danger, cx.state.confirm);
+        out.push(Hit { rect: track, action: Action::Confirm(Confirm::InstallQueue) });
+        y = track.y + track.h;
+    }
+
     let y = widgets::section(&mut c, t, f, y, l.pick(["选项", "選項", "Options"]));
     let check = Row::new(l.pick(["验证刷机包签名", "驗證刷機包簽章", "Verify zip signatures"])).trail(Trail::Switch(cx.state.check_signature));
     let signature = widgets::list(&mut c, t, f, y, &[check]);
@@ -897,6 +935,23 @@ pub fn install(cx: &Ctx) -> Frame {
 }
 
 const SECURITY_PATCH: Text = ["安全补丁", "安全性修補程式", "Security patch"];
+
+const QUEUE: Text = ["安装队列", "安裝佇列", "Install queue"];
+const QUEUE_ADD: Text = ["添加安装包", "新增安裝檔", "Add a package"];
+const QUEUE_ADD_NOTE: Text = [
+    "从内部存储选一个包排入队列，按顺序依次安装",
+    "從內部儲存空間選一個包排入佇列，依序安裝",
+    "Choose a package in internal storage to install in its turn",
+];
+const QUEUE_REMOVE: Text = ["移除", "移除", "Remove"];
+
+/// How big a package is, in the unit that reads best.
+fn package_size(size: u64) -> String {
+    match size {
+        big if big >= 1 << 30 => format!("{:.1} GB", big as f64 / (1u64 << 30) as f64),
+        small => format!("{:.0} MB", small as f64 / (1u64 << 20) as f64),
+    }
+}
 
 /// How installing from `source` is named: on the install page, and as the
 /// title of the page that installs.

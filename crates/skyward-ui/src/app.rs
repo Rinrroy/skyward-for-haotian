@@ -823,6 +823,8 @@ pub enum Confirm {
     /// Take the bootloader message out of misc, so the next start follows
     /// the reason the bootloader itself has.
     ClearStarter,
+    /// Start the packages waiting in the queue, one after another.
+    InstallQueue,
     /// Do to the partition the filesystem page shows what it chose.
     Filesystem,
 }
@@ -1253,6 +1255,11 @@ pub enum Action {
     EditEntry,
     /// Install the file the file page shows.
     InstallEntry,
+    /// Choose a package in this place for the queue rather than to install
+    /// it at once.
+    QueuePick(Place),
+    /// Take the package at this place in the queue off it.
+    QueueDrop(usize),
     /// Write the file the editor page shows as it now stands.
     SaveText,
     /// Open the page of the permissions of the entry the file page shows.
@@ -1612,6 +1619,20 @@ pub enum Asking {
     Unsupported(String),
 }
 
+/// A package waiting its turn behind the one being installed, in the order
+/// the packages were chosen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Queued {
+    /// What the page calls it: the file's own name.
+    pub name: String,
+    /// Where it is.
+    pub path: String,
+    /// How big it is, which the page says before it is opened.
+    pub size: u64,
+    /// Where it came from, which the install page says beside it.
+    pub source: Source,
+}
+
 /// Choices the pages show and the user changes, and where installing
 /// stands.
 #[derive(Clone, Debug, PartialEq)]
@@ -1657,6 +1678,14 @@ pub struct State {
     pub source: Source,
     /// The name of the file being installed, when it is one on the phone.
     pub package_name: Option<String>,
+    /// The packages waiting to be installed, in the order they were chosen.
+    /// The one being installed is not among them.
+    pub queue: Vec<Queued>,
+    /// Whether the package being chosen from a place goes on the queue
+    /// rather than starting at once.
+    pub queue_picking: bool,
+    /// The package whose install failed, which stopped the queue there.
+    pub queue_stopped: Option<String>,
     /// What the install script last run showed, its latest lines.
     pub script_output: Vec<String>,
     /// A zip's install script runs only if the zip was signed with one of
@@ -1819,6 +1848,9 @@ impl Default for State {
             install: Install::Idle,
             source: Source::Computer,
             package_name: None,
+            queue: Vec::new(),
+            queue_picking: false,
+            queue_stopped: None,
             script_output: Vec::new(),
             check_signature: false,
             recovery_partitions: false,
@@ -5026,6 +5058,46 @@ impl App {
         }
     }
 
+    /// The next package of the queue, where the one that just ended went
+    /// through and another waits: taken off the queue and made the one being
+    /// installed, with the path the runtime opens.
+    ///
+    /// Where it did not go through, the queue stops at the package that is
+    /// still first, so the page can say which one stopped it and what waits
+    /// behind it.
+    pub fn queued_next(&mut self) -> Option<String> {
+        let through = match &self.state.install {
+            Install::Finished { outcome, .. } => {
+                matches!(outcome, Outcome::Installed { .. } | Outcome::Flashed { .. } | Outcome::Ran { .. })
+            }
+            _ => return None,
+        };
+        if !through {
+            if let Some(first) = self.state.queue.first() {
+                self.state.queue_stopped = Some(first.name.clone());
+            }
+            return None;
+        }
+        let next = self.state.queue.first()?.clone();
+        self.state.queue.remove(0);
+        self.state.queue_stopped = None;
+        let (path, name) = (next.path, next.name);
+        self.begin_install(Install::Checking { size: next.size, stage: None }, next.source, Some(name));
+        Some(path)
+    }
+
+    /// Take the package at `i` in the queue off it, as the install page asks
+    /// when one is dropped before the queue starts.
+    pub fn queue_dropped(&mut self, i: usize) {
+        if i < self.state.queue.len() {
+            self.state.queue.remove(i);
+            if self.state.queue.is_empty() {
+                self.state.queue_stopped = None;
+            }
+        }
+        self.refresh();
+    }
+
     /// What the page shown first asks of the runtime as it shows.
     pub fn arrive(&mut self) -> Vec<Effect> {
         self.arrive_at(self.screen())
@@ -5038,6 +5110,11 @@ impl App {
         // A slide that asked what it was about to do is answered on the page
         // it was made on; leaving that page puts the question down.
         self.state.armed = None;
+        // Choosing a package for the queue is a question asked from one page
+        // and answered on another; landing anywhere else puts it down.
+        if !matches!(s, Screen::Choose(_)) {
+            self.state.queue_picking = false;
+        }
         match s {
             Screen::Mount => vec![Effect::ReadMounts],
             Screen::Filesystems => vec![Effect::ReadFilesystems],
@@ -5111,6 +5188,17 @@ impl App {
                     self.open(s);
                 }
                 return self.arrive_at(s);
+            }
+            // The queue is built from the same places a package is installed
+            // from; what is chosen there waits instead of starting.
+            Action::QueuePick(place) => {
+                self.state.queue_picking = true;
+                self.open(Screen::Choose(place));
+                return self.arrive_at(Screen::Choose(place));
+            }
+            Action::QueueDrop(i) => {
+                self.queue_dropped(i);
+                return Vec::new();
             }
             Action::OpenData => return self.open_data(),
             Action::Skip => {
@@ -5655,6 +5743,20 @@ impl App {
     /// the runtime to, its page following how it goes; one install at a
     /// time.
     fn install_named(&mut self, source: Source, name: Option<String>, size: u64, start: Effect, now: u64) -> Vec<Effect> {
+        // A package chosen while the queue is being built waits its turn
+        // instead of starting: the install page then shows the queue and
+        // begins it when asked.
+        let start = match start {
+            Effect::InstallPath(path) if self.state.queue_picking => {
+                let called = name.unwrap_or_else(|| path.rsplit('/').next().unwrap_or(&path).to_string());
+                self.state.queue.push(Queued { name: called, path, size, source });
+                self.state.queue_picking = false;
+                self.state.queue_stopped = None;
+                self.open(Screen::Install);
+                return Vec::new();
+            }
+            other => other,
+        };
         match self.state.install {
             Install::Idle | Install::Finished { .. } => {
                 self.begin_install(Install::Checking { size, stage: None }, source, name);
@@ -6474,6 +6576,18 @@ impl App {
             // the next start; taking it away is the whole of what this page
             // changes, and misc holds nothing else.
             Confirm::ClearStarter => fx.push(Effect::ClearStarter),
+            // The queue begins with the package at its head, which leaves the
+            // queue and becomes the one being installed.
+            Confirm::InstallQueue => {
+                if let Some(next) = self.state.queue.first().cloned() {
+                    self.state.queue.remove(0);
+                    self.state.queue_stopped = None;
+                    let (path, name) = (next.path, next.name);
+                    self.begin_install(Install::Checking { size: next.size, stage: None }, next.source, Some(name));
+                    self.open(Screen::Installing);
+                    fx.push(Effect::InstallPath(path));
+                }
+            }
             // The data partition is reached through its own key whether or
             // not it is open, but not while it is being opened or erased.
             Confirm::Filesystem => {

@@ -1637,6 +1637,14 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         }
                         power(target)?;
                     }
+                    // A queue goes on by itself: what just ended is taken off
+                    // it and the next package starts, unless this one asked
+                    // for the phone to be erased first or did not go through.
+                    if !wipe_after && !(cache_after && app.state.cache_partition) {
+                        if let Some(path) = app.queued_next() {
+                            installer = Some(Installer::open(PathBuf::from(path), detach(cfg.services.clone()), install_options(&app))?);
+                        }
+                    }
                 }
             }
         }
