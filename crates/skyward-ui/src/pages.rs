@@ -2176,7 +2176,7 @@ const AVB_NONE: Text = ["这个槽位没有 vbmeta 分区", "這個槽位沒有 
 const AVB_UNREADABLE: Text = ["无法读取 vbmeta", "無法讀取 vbmeta", "Couldn't read the vbmeta blocks"];
 
 const BCB: Text = ["启动指令", "啟動指令", "Boot message"];
-const BCB_NONE: Text = ["这条指令是空的", "這條指令是空的", "Nothing is waiting there"];
+const BCB_NONE: Text = ["没有待执行的指令", "沒有待執行的指令", "Nothing is waiting there"];
 const BCB_NONE_VALUE: Text = ["无", "無", "None"];
 const BCB_PENDING_VALUE: Text = ["待执行", "待執行", "Waiting"];
 const BCB_UNKNOWN: Text = ["未知", "未知", "Unknown"];
@@ -2413,7 +2413,15 @@ pub fn bcb(cx: &Ctx) -> Frame {
             y = widgets::footnote(&mut c, t, f, y, why);
         }
         Some(Ok(starter)) if !starter.pending() => {
-            y = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(BCB_NONE)).trail(Trail::Value(l.pick(BCB_NONE_VALUE)))]).bottom;
+            y = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(BCB_NONE)).trail(Trail::None)]).bottom;
+            // A page that is empty most of the time has to say why it is
+            // empty, or an empty page reads as a page that does not work.
+            let quiet = l.pick([
+                "系统正常启动时，这里本来是空的。只有当系统没能启动、或它要求 recovery 做某件事时，才会在这里留下内容。",
+                "系統正常啟動時，這裡本來是空的。只有當系統沒能啟動、或它要求 recovery 做某件事時，才會在這裡留下內容。",
+                "This is empty whenever the phone starts as it should. Something is left here only where a start failed, or where the system asked the recovery to do a piece of work.",
+            ]);
+            y = widgets::footnote(&mut c, t, f, y + t.m.card_gap, quiet);
         }
         Some(Ok(starter)) => {
             pending = true;

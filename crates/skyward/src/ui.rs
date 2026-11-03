@@ -1067,9 +1067,14 @@ fn read_starter() -> Result<Starter, String> {
 }
 
 /// Take the bootloader message out of misc, leaving the fields beside it as
-/// they were.
+/// they were. What it asked for is written to the log first, so a start that
+/// behaves differently afterwards can be traced to this.
 fn clear_starter() -> Result<(), String> {
-    bcb::clear(&bcb::misc()).map_err(|e| format!("{e:#}"))
+    let misc = bcb::misc();
+    let asked = bcb::read(&misc).map(|b| b.command).unwrap_or_default();
+    bcb::clear(&misc).map_err(|e| format!("{e:#}"))?;
+    let _ = skyward_sys::kmsg(&format!("took the bootloader message {asked:?} out of misc"));
+    Ok(())
 }
 
 /// Have the bootloader start `slot` next and give what the boot control
