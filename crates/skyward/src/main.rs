@@ -45,6 +45,17 @@ struct Cli {
     cmd: Cmd,
 }
 
+/// What `avb` does with the flags it finds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum AvbAction {
+    /// Print what each block says.
+    Status,
+    /// Turn both checks off, keeping a copy of each block first.
+    Disable,
+    /// Turn both checks back on.
+    Enable,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Print what the About page shows, plus a partition summary.
@@ -73,6 +84,12 @@ enum Cmd {
     /// Reboot through init: system, recovery, fastboot, bootloader, edl, or
     /// off.
     Reboot { target: String },
+    /// Print or change the flags of the phone's vbmeta blocks: what says
+    /// whether the bootloader and the kernel check what they start.
+    Avb {
+        #[arg(value_enum, default_value_t = AvbAction::Status)]
+        action: AvbAction,
+    },
     /// Print the bootloader control block in misc.
     Bcb,
     /// Print the logical partition metadata in super.
@@ -227,6 +244,7 @@ fn main() -> Result<()> {
             let p = Power::parse(&target).ok_or_else(|| anyhow!("unknown target {target:?}"))?;
             skyward_sys::power(p)
         }
+        Cmd::Avb { action } => avb(action),
         Cmd::Bcb => {
             let b = bcb::read(&bcb::misc())?;
             println!("command = {:?}", b.command);
@@ -412,6 +430,58 @@ fn main() -> Result<()> {
 
 fn booted_slot() -> Result<skyward_vab::Slot> {
     skyward_vab::current_slot()?.context("not an A/B device")
+}
+
+/// Where a copy of each vbmeta block is kept before it is changed.
+const AVB_KEPT: &str = "/tmp/avb";
+
+/// The same, on a partition that outlasts a restart where one is mounted:
+/// a copy kept in the recovery's own memory is gone the moment it reboots,
+/// which is exactly when it would be wanted.
+fn avb_kept() -> &'static str {
+    if Path::new("/data/local/tmp").is_dir() {
+        "/data/local/tmp/avb"
+    } else {
+        AVB_KEPT
+    }
+}
+
+/// Print what the slot's vbmeta blocks say, or turn their two checks off or
+/// back on. A copy of each block goes to [`avb_kept`] before it is written,
+/// so what it held first is not lost with the change.
+fn avb(action: AvbAction) -> Result<()> {
+    let slot = booted_slot()?;
+    match action {
+        AvbAction::Status => {
+            for r in skyward_vab::avb::read(slot)? {
+                println!(
+                    "{:<22} flags=0x{:<3x} verity={:<3} verification={:<3} {}",
+                    r.name,
+                    r.flags,
+                    if r.verity() { "on" } else { "off" },
+                    if r.verification() { "on" } else { "off" },
+                    skyward_vab::avb::algorithm_name(r.algorithm),
+                );
+            }
+            println!();
+            println!("kept blocks, when any, are in {}", avb_kept());
+        }
+        AvbAction::Disable | AvbAction::Enable => {
+            let wanted = match action {
+                AvbAction::Disable => skyward_vab::avb::HASHTREE_DISABLED | skyward_vab::avb::VERIFICATION_DISABLED,
+                _ => 0,
+            };
+            for c in skyward_vab::avb::set_all(slot, wanted, Path::new(avb_kept()))? {
+                match &c.kept {
+                    Some(kept) => println!("{:<22} 0x{:x} -> 0x{:x}   kept as {}", c.name, c.before, c.after, kept.display()),
+                    None => println!("{:<22} already 0x{:x}", c.name, c.before),
+                }
+            }
+            println!();
+            println!("pull {} off the phone before leaving", avb_kept());
+        }
+    }
+    Ok(())
 }
 
 fn lp(super_dev: &Path, slot: Option<u32>) -> Result<()> {

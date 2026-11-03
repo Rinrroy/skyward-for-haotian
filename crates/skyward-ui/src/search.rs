@@ -52,6 +52,12 @@ pub const ENTRIES: &[Entry] = &[
         Screen::Filesystems,
         &["wenjianxitong", "wjxt", "genghuan", "gh", "fsck", "filesystem", "f2fs", "ext4"],
     ),
+    entry(
+        ["AVB 校验", "AVB 校驗", "AVB checks"],
+        ADVANCED,
+        Screen::Avb,
+        &["avb", "jiaoyan", "jy", "yanzheng", "yz", "verity", "verification", "vbmeta", "dmverity"],
+    ),
     entry(["导出日志", "匯出記錄", "Export logs"], ADVANCED, Screen::Logs, &["daochurizhi", "dcrz", "rizhi", "rz", "logs", "dmesg"]),
     entry(
         ["系统更新", "系統更新", "System update"],

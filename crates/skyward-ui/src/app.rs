@@ -23,6 +23,7 @@ use skyward_net::download::{Failure, Progress};
 use skyward_net::release::{Release, Unanswered};
 use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Joined, Network, Power, Stage as Joining, Traffic, Wlan};
+use skyward_vab::avb::{Change as AvbChange, Reading as AvbReading};
 use skyward_vab::{BootSlots, Hold, Slot, SnapshotState, Standing};
 
 /// The pages of the recovery.
@@ -70,6 +71,10 @@ pub enum Screen {
     /// system's rules give them: what it does and a swipe to start, then
     /// how far it has come and how it ended.
     Relabel,
+    /// What the blocks that say whether the bootloader and the kernel check
+    /// what they start say now, and a way to turn both checks off or back
+    /// on.
+    Avb,
     /// The partitions whose filesystems can be repaired or made afresh as
     /// another.
     Filesystems,
@@ -809,6 +814,9 @@ pub enum Confirm {
     /// Give the data partition's files the SELinux labels the installed
     /// system's rules give them.
     Relabel,
+    /// Turn the two checks the vbmeta blocks name off, with `false`, or back
+    /// on with `true`.
+    Avb(bool),
     /// Do to the partition the filesystem page shows what it chose.
     Filesystem,
 }
@@ -1612,6 +1620,12 @@ pub struct State {
     /// What the phone's boot control holds of the slots, as the runtime
     /// last read it for the slot or reboot page, or why it could not.
     pub boot_slots: Option<Result<BootSlots, String>>,
+    /// What the phone's vbmeta blocks say, as the runtime last read them for
+    /// the AVB page, or why it could not.
+    pub avb: Option<Result<Vec<AvbReading>, String>>,
+    /// The last change the AVB page made, block by block, or why it made
+    /// none.
+    pub avb_result: Option<Result<Vec<AvbChange>, String>>,
     /// The slot picked on the slot page to start next; with none picked,
     /// the page shows the one the boot control starts next.
     pub next_slot: Option<Slot>,
@@ -1737,6 +1751,8 @@ impl Default for State {
             logs: [true, true],
             logs_to: 0,
             boot_slots: None,
+            avb: None,
+            avb_result: None,
             next_slot: None,
             data: Data::Closed,
             code: String::new(),
@@ -1893,6 +1909,12 @@ pub enum Effect {
     /// Read what the boot control holds of the slots, telling it with
     /// [`App::set_boot_slots`].
     ReadSlots,
+    /// Read what the phone's vbmeta blocks say, telling it with
+    /// [`App::set_avb`].
+    ReadAvb,
+    /// Turn both checks the vbmeta blocks name off, or back on, telling how
+    /// it went with [`App::avb_written`].
+    SetAvb(bool),
     /// Have the bootloader start this slot next, telling how it went with
     /// [`App::slot_switched`].
     SetSlot(Slot),
@@ -3648,6 +3670,40 @@ impl App {
         self.refresh();
     }
 
+    /// What the phone's vbmeta blocks say, as they were just read.
+    pub fn set_avb(&mut self, read: Result<Vec<AvbReading>, String>) {
+        self.state.avb = Some(read);
+        self.refresh();
+    }
+
+    /// How turning the two checks the vbmeta blocks name off or on went, with
+    /// what the blocks then said.
+    pub fn avb_written(&mut self, outcome: Result<Vec<AvbChange>, String>, readings: Result<Vec<AvbReading>, String>, now: u64) {
+        match &outcome {
+            Ok(changes) => {
+                let changed = changes.iter().filter(|c| c.kept.is_some()).count();
+                if changed == 0 {
+                    self.say(self.state.lang.pick(["已是这个状态，没有改动", "已是這個狀態，沒有改動", "Already as asked, nothing changed"]), now);
+                } else {
+                    let said = tr!(
+                        self.state.lang,
+                        "已改动 {changed} 个 vbmeta 区块，原样已备份",
+                        "已改動 {changed} 個 vbmeta 區塊，原樣已備份",
+                        "{changed} vbmeta blocks changed, the older ones kept"
+                    );
+                    self.say(&said, now);
+                }
+            }
+            Err(why) => {
+                let said = tr!(self.state.lang, "没有改动：{why}", "沒有改動：{why}", "Nothing changed: {why}");
+                self.say(&said, now);
+            }
+        }
+        self.state.avb_result = Some(outcome);
+        self.state.avb = Some(readings);
+        self.refresh();
+    }
+
     /// How switching the slot to start next went: what the boot control
     /// holds of the slots now, or why it did not switch.
     pub fn slot_switched(&mut self, outcome: Result<BootSlots, String>, now: u64) {
@@ -4622,6 +4678,9 @@ impl App {
         let left = self.screen();
         match left {
             Screen::Mount => self.state.mount_failure = None,
+            // What the AVB page last did is not for the page to say again
+            // once it is left.
+            Screen::Avb => self.state.avb_result = None,
             // A slot picked and not switched to is put down.
             Screen::Slot => self.state.next_slot = None,
             Screen::Files => {
@@ -4861,6 +4920,9 @@ impl App {
         match s {
             Screen::Mount => vec![Effect::ReadMounts],
             Screen::Filesystems => vec![Effect::ReadFilesystems],
+            // The tools page says beside its row whether the checks are on,
+            // so it reads them as it opens; the AVB page reads them again.
+            Screen::Advanced | Screen::Avb => vec![Effect::ReadAvb],
             Screen::Slot | Screen::Reboot => vec![Effect::ReadSlots],
             Screen::Restore => vec![self.find_backups()],
             Screen::Files => vec![Effect::ReadDir(self.state.files.path.clone())],
@@ -6270,6 +6332,10 @@ impl App {
                     self.say(l.pick(["请先在「解密」中打开 data 分区", "請先在「解密」中開啟 data 分割區", "Open the data partition in Decrypt first"]), now)
                 }
             },
+            // Turning the checks off is what lets a build that is not the
+            // phone's own start; turning them back on is safe only once the
+            // phone's own partitions are back, which the page says.
+            Confirm::Avb(on) => fx.push(Effect::SetAvb(on)),
             // The data partition is reached through its own key whether or
             // not it is open, but not while it is being opened or erased.
             Confirm::Filesystem => {
@@ -6814,6 +6880,7 @@ mod tests {
             Screen::Backup,
             Screen::Restore,
             Screen::Advanced,
+            Screen::Avb,
             Screen::Files,
             Screen::Terminal,
             Screen::Language,

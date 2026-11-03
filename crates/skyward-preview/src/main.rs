@@ -14,6 +14,7 @@ use skyward_ui::app::{
 };
 use skyward_ui::widgets::{self, Bar, Bolt, Cap, Layer};
 use skyward_ui::{editor, fmt, pages, Canvas, Ctx, Fonts, Lang, Theme};
+use skyward_vab::avb::{Change as AvbChange, Reading as AvbReading};
 use skyward_vab::{BootSlots, FailureCode, Hold, Slot, SnapshotState, Standing};
 use std::fs::File;
 use std::io::BufWriter;
@@ -106,6 +107,15 @@ type Shot<'a> = (&'a str, Screen, bool, &'a DeviceInfo, Data, &'a [usize]);
 /// File name, dark theme, readings, a mount that failed, and the partitions
 /// left unmounted.
 type MountShot<'a> = (&'a str, bool, &'a DeviceInfo, Option<MountFailure>, &'a [&'a str]);
+
+/// The vbmeta blocks a phone keeps, as the AVB page shows them: checking
+/// with `off` false, and with both checks turned off.
+fn avb_blocks(off: bool) -> Vec<AvbReading> {
+    [("vbmeta", 1u32), ("vbmeta_system", 1u32)]
+        .into_iter()
+        .map(|(name, algorithm)| AvbReading { name: name.to_string(), flags: if off { 3 } else { 0 }, algorithm })
+        .collect()
+}
 
 /// File name, page, dark theme, and what to set before the page is drawn.
 type PageShot<'a> = (&'a str, Screen, bool, &'a dyn Fn(&mut App));
@@ -364,7 +374,7 @@ fn main() -> Result<()> {
     let adding = |app: &mut App, name: &str, security: Security, field: Field, choosing: bool| {
         app.state.adding = Some(Adding { name: name.into(), security, field, choosing });
     };
-    let pages: [PageShot; 160] = [
+    let pages: [PageShot; 162] = [
         ("11-install-light-locked", Screen::Install, false, &|app| {
             app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false };
         }),
@@ -510,6 +520,14 @@ fn main() -> Result<()> {
             app.state.backup_job = job(true, Vec::new(), None, Some(BackupEnd::Refused(BackupRefusal::DataReset)))
         }),
         ("49-advanced-light", Screen::Advanced, false, &|_| {}),
+        ("49-avb-light", Screen::Avb, false, &|app| app.set_avb(Ok(avb_blocks(false)))),
+        ("49-avb-dark-off", Screen::Avb, true, &|app| {
+            app.set_avb(Ok(avb_blocks(true)));
+            app.state.avb_result = Some(Ok(vec![
+                AvbChange { name: "vbmeta".into(), before: 0, after: 3, kept: Some("/tmp/avb/vbmeta-0x00000000-1793681979.img".into()) },
+                AvbChange { name: "vbmeta_system".into(), before: 0, after: 3, kept: Some("/tmp/avb/vbmeta_system-0x00000000-1793681979.img".into()) },
+            ]));
+        }),
         ("50-files-light", Screen::Files, false, &|app| app.set_files("/".into(), Ok(sample_root()), LISTED)),
         ("51-files-dark", Screen::Files, true, &|app| app.set_files("/".into(), Ok(sample_root()), LISTED)),
         ("52-file-info-light", Screen::FileInfo, false, &|app| app.state.file = sample_root().into_iter().find(|e| e.name == "init.environ.rc")),

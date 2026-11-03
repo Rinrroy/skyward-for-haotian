@@ -84,6 +84,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::Editor => editor(cx),
         Screen::Terminal => terminal(cx),
         Screen::Relabel => relabel(cx),
+        Screen::Avb => avb(cx),
         Screen::Filesystems => filesystems(cx),
         Screen::Filesystem => filesystem(cx),
         Screen::PartWork => part_work(cx),
@@ -130,6 +131,8 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
         Confirm::RunScript => (INSTALL, true),
         Confirm::Merge => (["滑动以合并", "滑動以合併", "Slide to merge"], true),
         Confirm::Relabel => (["滑动以修复", "滑動以修復", "Slide to fix"], true),
+        Confirm::Avb(false) => (["滑动以关闭校验", "滑動以關閉校驗", "Slide to turn checks off"], true),
+        Confirm::Avb(true) => (["滑动以打开校验", "滑動以開啟校驗", "Slide to turn checks on"], true),
     };
     (s.lang.pick(label), danger)
 }
@@ -2063,6 +2066,7 @@ pub fn advanced(cx: &Ctx) -> Frame {
         Row::new(l.pick(FILES)).icon(BLUE, Icon::Folder),
         Row::new(l.pick(TERMINAL)).icon(SLATE, Icon::Terminal),
         Row::new(l.pick(RELABEL)).icon(PURPLE, Icon::Shield),
+        Row::new(l.pick(AVB)).icon(SLATE, Icon::Lock).trail(Trail::Value(avb_value(cx))),
         Row::new(l.pick(FILESYSTEMS)).icon(RED, Icon::Mount),
         Row::new(l.pick(LOGS)).icon(ORANGE, Icon::Log),
         Row::new(l.pick(UPDATE)).icon(GREEN, Icon::Layers).trail(Trail::Value(update_value(cx))),
@@ -2071,6 +2075,7 @@ pub fn advanced(cx: &Ctx) -> Frame {
         Action::Open(Screen::Files),
         Action::Open(Screen::Terminal),
         Action::Open(Screen::Relabel),
+        Action::Open(Screen::Avb),
         Action::Open(Screen::Filesystems),
         Action::Open(Screen::Logs),
         Action::Open(Screen::Update),
@@ -2155,6 +2160,132 @@ pub fn relabel(cx: &Ctx) -> Frame {
         }
     }
     Frame { back: job.outcome.is_some(), ..Frame::new(t, c, out, title, top) }
+}
+
+const AVB: Text = ["AVB 校验", "AVB 校驗", "AVB checks"];
+const AVB_ON: Text = ["开启", "開啟", "On"];
+const AVB_OFF: Text = ["关闭", "關閉", "Off"];
+const AVB_PARTLY: Text = ["部分关闭", "部分關閉", "Partly off"];
+const AVB_UNKNOWN: Text = ["未知", "未知", "Unknown"];
+const AVB_READING: Text = ["正在读取 vbmeta", "正在讀取 vbmeta", "Reading the vbmeta blocks"];
+const AVB_NONE: Text = ["这个槽位没有 vbmeta 分区", "這個槽位沒有 vbmeta 分割區", "This slot keeps no vbmeta partition"];
+const AVB_UNREADABLE: Text = ["无法读取 vbmeta", "無法讀取 vbmeta", "Couldn't read the vbmeta blocks"];
+
+/// The AVB row's trailing word: whether the checks the phone's vbmeta blocks
+/// name are on.
+fn avb_value(cx: &Ctx) -> &'static str {
+    let l = cx.state.lang;
+    match &cx.state.avb {
+        Some(Ok(rows)) if !rows.is_empty() && rows.iter().all(|r| r.whole()) => l.pick(AVB_ON),
+        Some(Ok(rows)) if !rows.is_empty() && rows.iter().all(|r| !r.whole()) => l.pick(AVB_OFF),
+        Some(Ok(rows)) if !rows.is_empty() => l.pick(AVB_PARTLY),
+        _ => l.pick(AVB_UNKNOWN),
+    }
+}
+
+/// What the blocks that say whether the bootloader and the kernel check what
+/// they start say now, what turning the checks off means, and a swipe to turn
+/// both off or back on.
+pub fn avb(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let mut c = long_page(cx);
+    let mut out = Vec::new();
+    let top = t.m.content_top;
+    let title = l.pick(AVB);
+
+    // What each block says, or why none could be read.
+    let mut y = top;
+    let mut on = true;
+    match &s.avb {
+        None => y = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(AVB_READING)).trail(Trail::None)]).bottom,
+        Some(Err(why)) => {
+            y = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(AVB_UNREADABLE)).trail(Trail::None)]).bottom;
+            y = widgets::footnote(&mut c, t, f, y, why);
+        }
+        Some(Ok(rows)) if rows.is_empty() => {
+            y = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(AVB_NONE)).trail(Trail::None)]).bottom;
+        }
+        Some(Ok(rows)) => {
+            on = rows.iter().all(|r| r.whole());
+            let states: Vec<&'static str> = rows
+                .iter()
+                .map(|r| match (r.verity(), r.verification()) {
+                    (true, true) => l.pick(AVB_ON),
+                    (false, false) => l.pick(AVB_OFF),
+                    _ => l.pick(AVB_PARTLY),
+                })
+                .collect();
+            let subs: Vec<String> = rows
+                .iter()
+                .map(|r| {
+                    let (flags, algorithm) = (r.flags, skyward_vab::avb::algorithm_name(r.algorithm));
+                    tr!(
+                        l,
+                        "flags {flags:#x}，签名 {algorithm}",
+                        "flags {flags:#x}，簽名 {algorithm}",
+                        "flags {flags:#x}, signed {algorithm}"
+                    )
+                })
+                .collect();
+            let list: Vec<Row> = rows
+                .iter()
+                .zip(&states)
+                .zip(&subs)
+                .map(|((r, state), sub)| Row::new(&r.name).subtitle(sub).trail(Trail::Text(*state)))
+                .collect();
+            y = widgets::list(&mut c, t, f, y, &list).bottom;
+        }
+    }
+
+    let what = l.pick([
+        "AVB 让 bootloader 与内核在开机时核对每个分区的内容是否与 vbmeta 里的清单一致。关闭这两项校验后，非官方系统也能启动；代价是官方 OTA 会失败，部分应用与售后工具会读到这个状态。",
+        "AVB 讓 bootloader 與核心在開機時核對每個分割區的內容是否與 vbmeta 裡的正確清單一致。關閉這兩項校驗後，非官方系統也能啟動；代價是官方 OTA 會失敗，部分應用程式與售後工具會讀到這個狀態。",
+        "AVB has the bootloader and the kernel check each partition against what its vbmeta block says. Turning both checks off lets a build that is not the phone's own start; official updates then fail, and some apps and service tools read the state.",
+    ]);
+    y = widgets::paragraph(&mut c, t, f, y + t.m.card_gap, what);
+
+    // What turning them back on asks of the phone, where they are off.
+    if !on {
+        let warning = l.pick([
+            "打开校验前请先刷回官方系统包。若分区仍是第三方的，打开后开不了机——那时仍可回到这里再关掉。",
+            "開啟校驗前請先刷回官方系統包。若分割區仍是第三方的，開啟後開不了機——那時仍可回到這裡再關掉。",
+            "Flash the phone's own system back before turning the checks on. If the partitions are still another build's, the phone will not start; it can be turned off again from here.",
+        ]);
+        y = widgets::footnote(&mut c, t, f, y + t.m.card_gap, warning);
+    }
+
+    // How the last change went.
+    if let Some(result) = &s.avb_result {
+        let note = match result {
+            Ok(changes) => {
+                let changed = changes.iter().filter(|c| c.kept.is_some()).count();
+                match changed {
+                    0 => l.pick(["没有区块需要改动。", "沒有區塊需要改動。", "No block needed changing."]).to_string(),
+                    _ => tr!(
+                        l,
+                        "已改动 {changed} 个区块，改动前的原样已备份。",
+                        "已改動 {changed} 個區塊，改動前的原樣已備份。",
+                        "{changed} blocks changed, each kept as it was before."
+                    ),
+                }
+            }
+            Err(why) => tr!(l, "未能改动：{why}", "未能改動：{why}", "Nothing was changed: {why}"),
+        };
+        y = widgets::footnote(&mut c, t, f, y + t.m.card_gap, &note);
+    }
+
+    // The swipe, which turns them off where they are on and back on where
+    // they are off. Nothing is offered while what they say is unknown.
+    let known = matches!(&s.avb, Some(Ok(rows)) if !rows.is_empty());
+    let mut bottom = y;
+    if known {
+        let which = Confirm::Avb(!on);
+        let (label, danger) = confirm_label(which, s);
+        let track = widgets::confirm(&mut c, t, f, y + t.m.card_gap, label, danger, s.confirm);
+        out.push(Hit { rect: track, action: Action::Confirm(which) });
+        bottom = track.y + track.h;
+    }
+    Frame::new(t, fit(c, t, bottom), out, title, top)
 }
 
 /// The partitions whose filesystems can be repaired or made afresh as

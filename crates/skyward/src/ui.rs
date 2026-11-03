@@ -997,6 +997,42 @@ fn read_slots() -> Result<skyward_vab::BootSlots, String> {
     read().map_err(|e| format!("{e:#}"))
 }
 
+/// Where a copy of each vbmeta block is kept before it is changed: a
+/// partition that outlasts a restart where one is mounted, and the recovery's
+/// own memory otherwise.
+fn avb_kept() -> &'static str {
+    if Path::new("/data/local/tmp").is_dir() {
+        "/data/local/tmp/avb"
+    } else {
+        "/tmp/avb"
+    }
+}
+
+/// What every vbmeta block the running slot keeps says about the checks it
+/// names.
+fn read_avb() -> Result<Vec<skyward_vab::avb::Reading>, String> {
+    let read = || -> Result<Vec<skyward_vab::avb::Reading>> {
+        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+        skyward_vab::avb::read(slot)
+    };
+    read().map_err(|e| format!("{e:#}"))
+}
+
+/// Turn both checks the vbmeta blocks name off, or back on, across every
+/// block the running slot keeps, giving what each held before and after.
+fn set_avb(on: bool) -> Result<Vec<skyward_vab::avb::Change>, String> {
+    let write = || -> Result<Vec<skyward_vab::avb::Change>> {
+        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+        let flags = if on {
+            0
+        } else {
+            skyward_vab::avb::HASHTREE_DISABLED | skyward_vab::avb::VERIFICATION_DISABLED
+        };
+        skyward_vab::avb::set_all(slot, flags, Path::new(avb_kept()))
+    };
+    write().map_err(|e| format!("{e:#}"))
+}
+
 /// Have the bootloader start `slot` next and give what the boot control
 /// holds of the slots then, unless an update is in flight: it set the
 /// slot it needs itself.
@@ -2037,6 +2073,14 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     },
                     Effect::ReadMounts => app.set_mounts(mounts()),
                     Effect::ReadSlots => app.set_boot_slots(read_slots()),
+                    Effect::ReadAvb => app.set_avb(read_avb()),
+                    // Both checks are written across every vbmeta block the
+                    // slot keeps, and what they say afterwards is read again
+                    // so the page shows what the phone will act on.
+                    Effect::SetAvb(on) => {
+                        let outcome = set_avb(on);
+                        app.avb_written(outcome, read_avb(), now);
+                    }
                     Effect::SetSlot(slot) => app.slot_switched(set_slot(slot), now),
                     // The decrypt page shows meanwhile that the work is
                     // under way, and takes nothing more until it is done.
