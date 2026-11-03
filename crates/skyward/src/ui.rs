@@ -19,7 +19,7 @@ use skyward_block::{fstab, mount, probe};
 use skyward_config::{DeviceConfig, Service};
 use skyward_crypto::data::{Closed, Opened};
 use skyward_install::asked::{self, Needs};
-use skyward_install::{Detach, Installer, Options};
+use skyward_install::{Detach, Installer, Options, Refusal};
 use skyward_sys::bcb::{self, Work, REFORMATS};
 use skyward_sys::control::{Control, Request};
 use skyward_sys::Power;
@@ -30,13 +30,14 @@ use skyward_net::http::Servers;
 use skyward_net::release::{Installed, Release, Unanswered};
 use skyward_net::wlan::{Power as WlanPower, Wlan};
 use skyward_ui::app::{
-    App, AodStyle, Asked, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop, FileKind,
-    FileOp, FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop,
-    Place, RenameRefused, SavedSettings, Screen, Shot, State, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION, DOWNLOADS,
-    INSTALL_UNFINISHED, USB_DRIVE,
+    App, AodStyle, Asked, Asking, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop,
+    FileKind, FileOp, FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop,
+    Place, RenameRefused, SavedSettings, Screen, Shot, Starter, State, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION,
+    DOWNLOADS, INSTALL_UNFINISHED, USB_DRIVE,
 };
 use skyward_ui::surface::kms::KmsSurface;
 use skyward_ui::{Canvas, Fonts, Lang, Surface};
+use skyward_ui::tr;
 use skyward_vab::{Merge, Standing};
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
@@ -1037,6 +1038,38 @@ fn set_avb(on: bool) -> Result<Vec<skyward_vab::avb::Change>, String> {
         skyward_vab::avb::set_all(slot, flags, Path::new(avb_kept()))
     };
     write().map_err(|e| format!("{e:#}"))
+}
+
+/// What the bootloader message in misc asks for, in the shape the page that
+/// shows it reads. A command of its own that recovery knows nothing of is
+/// kept as it was written, so the page can say it rather than hide it.
+fn read_starter() -> Result<Starter, String> {
+    let read = || -> Result<Starter> {
+        let bcb = bcb::read(&bcb::misc())?;
+        let request = bcb.request();
+        let asks = match &request.work {
+            Work::Menu => Asking::Nothing,
+            Work::Fastboot => Asking::Fastboot,
+            Work::Update(update) => Asking::Update(update.package.clone()),
+            Work::WipeData { reformat } => Asking::WipeData { reformat: reformat.clone() },
+            Work::PromptWipeData => Asking::PromptWipeData,
+            Work::WipeCache { .. } => Asking::WipeCache,
+            Work::WipeAb { .. } => Asking::WipeAb,
+            Work::Sideload { .. } => Asking::Sideload,
+            Work::Rescue => Asking::Rescue,
+            Work::UnshareBlocks => Asking::Unshare,
+            Work::Exit => Asking::Exit,
+            Work::Unsupported(what) => Asking::Unsupported(what.clone()),
+        };
+        Ok(Starter { command: bcb.command, asks, reason: request.reason, args: bcb.args })
+    };
+    read().map_err(|e| format!("{e:#}"))
+}
+
+/// Take the bootloader message out of misc, leaving the fields beside it as
+/// they were.
+fn clear_starter() -> Result<(), String> {
+    bcb::clear(&bcb::misc()).map_err(|e| format!("{e:#}"))
 }
 
 /// Have the bootloader start `slot` next and give what the boot control
@@ -2087,6 +2120,14 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         let outcome = set_avb(on);
                         app.avb_written(outcome, read_avb(), now);
                     }
+                    // The bootloader message is read as the page opens, and
+                    // read again once it is taken away so the page shows
+                    // what the next start will see.
+                    Effect::ReadStarter => app.set_starter(read_starter()),
+                    Effect::ClearStarter => {
+                        let outcome = clear_starter();
+                        app.starter_cleared(outcome, read_starter(), now);
+                    }
                     Effect::SetSlot(slot) => app.slot_switched(set_slot(slot), now),
                     // The decrypt page shows meanwhile that the work is
                     // under way, and takes nothing more until it is done.
@@ -2195,6 +2236,31 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         if installer.is_some() {
                             app.report(app.state.lang.pick(INSTALL_UNFINISHED), now);
                             continue;
+                        }
+                        // A backup of the system partitions writes several
+                        // gigabytes and takes long enough for the battery to
+                        // run out part way through, which leaves a half made
+                        // backup and a phone that has just lost its power.
+                        // The same floor an install has applies here.
+                        if let Ok(Some(battery)) = skyward_info::battery_now() {
+                            if let Some(Refusal::Battery { level, charging }) = skyward_install::battery_refusal(&battery) {
+                                let said = match charging {
+                                    true => tr!(
+                                        app.state.lang,
+                                        "正在充电，但电量只有 {level}%，还不足以开始备份。请再充一会儿。",
+                                        "正在充電，但電量只有 {level}%，還不足以開始備份。請再充一會兒。",
+                                        "Charging, but at {level}% still short of what a backup needs. Give it a while longer."
+                                    ),
+                                    false => tr!(
+                                        app.state.lang,
+                                        "电量 {level}%，太低，无法开始备份。请先插上电源；插上后可以立即开始。",
+                                        "電量 {level}%，太低，無法開始備份。請先插上電源；插上後可以立即開始。",
+                                        "The battery is at {level}%, too low to start a backup. Plug the cable in; it can start at once then."
+                                    ),
+                                };
+                                app.report(&said, now);
+                                continue;
+                            }
                         }
                         let into = backups_in(place);
                         let there = into.ancestors().find(|p| p.exists()).context("the root is always there")?;

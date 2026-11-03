@@ -2,8 +2,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod bcb;
 pub mod clock;
@@ -160,9 +161,24 @@ pub fn power(target: Power) -> Result<()> {
 /// its own log there.
 pub const LOG: &str = "/tmp/recovery.log";
 
+/// The folder a session's lines are also kept in, once the data partition can
+/// be written to. [`LOG`] lives in a memory filesystem and goes with the next
+/// start, which is exactly when a session that ended badly is worth reading;
+/// this copy outlives it.
+pub const LOG_FOLDER: &str = "/sdcard/Skyward/logs";
+
 /// The file [`kmsg`] writes its lines to as well, once [`keep_log`] opened
 /// it.
 static KEPT: OnceLock<Mutex<File>> = OnceLock::new();
+
+/// The lasting copy's file, opened the first time the data partition is
+/// writable.
+static KEPT_LONG: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+
+/// The second past the start at which the lasting copy was last tried, so a
+/// phone whose data stays closed pays one attempt every few seconds rather
+/// than one per line.
+static TRIED_LONG: AtomicU64 = AtomicU64::new(0);
 
 /// Keep every line [`kmsg`] writes from now on in the file at `path` as
 /// well, after what an earlier run left there.
@@ -171,15 +187,48 @@ pub fn keep_log(path: &Path) -> Result<()> {
     KEPT.set(Mutex::new(file)).map_err(|_| anyhow!("the log is kept in a file already"))
 }
 
+/// The lasting copy, opened where it can be; `None` while the data partition
+/// is closed, or between the attempts to open it.
+fn lasting_log() -> Option<File> {
+    let held = KEPT_LONG.get_or_init(|| Mutex::new(None));
+    let mut held = held.lock().ok()?;
+    if held.is_none() {
+        let now = since_boot().map(|d| d.as_secs()).unwrap_or(0);
+        if now.saturating_sub(TRIED_LONG.load(Ordering::Relaxed)) < 5 {
+            return None;
+        }
+        TRIED_LONG.store(now, Ordering::Relaxed);
+        let folder = Path::new(LOG_FOLDER);
+        std::fs::create_dir_all(folder).ok()?;
+        let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let name = format!("session-{secs}.log");
+        let mut file = OpenOptions::new().create(true).append(true).open(folder.join(&name)).ok()?;
+        // The lines are stamped with the seconds since the phone started,
+        // which say nothing of the day; the day goes at the top.
+        writeln!(file, "session started at {secs}").ok()?;
+        *held = Some(file);
+    }
+    held.as_ref()?.try_clone().ok()
+}
+
 /// Append a line to the kernel log, where it survives until the next boot
-/// and shows in `dmesg`, and to the file [`keep_log`] opened, stamped with
-/// the seconds since the phone started as the kernel log stamps it.
+/// and shows in `dmesg`, to the file [`keep_log`] opened, and to the lasting
+/// copy once the data partition is writable, stamped with the seconds since
+/// the phone started as the kernel log stamps it.
 pub fn kmsg(line: &str) -> Result<()> {
     let mut f = OpenOptions::new().write(true).open("/dev/kmsg")?;
     f.write_all(format!("<6>skyward: {line}\n").as_bytes())?;
+    // The stamp is made once, so both files say the same thing. A clock that
+    // cannot be read leaves the kernel log alone rather than failing the
+    // call: what was written there is already written.
+    let Ok(secs) = since_boot().map(|d| d.as_secs_f64()) else { return Ok(()) };
+    let stamped = format!("[{secs:>12.6}] {line}\n");
     if let Some(kept) = KEPT.get() {
         let mut kept = kept.lock().expect("nothing panics while writing the log");
-        writeln!(kept, "[{:>12.6}] {line}", since_boot()?.as_secs_f64()).with_context(|| format!("write {LOG}"))?;
+        write!(kept, "{stamped}").with_context(|| format!("write {LOG}"))?;
+    }
+    if let Some(mut lasting) = lasting_log() {
+        write!(lasting, "{stamped}").with_context(|| format!("write {LOG_FOLDER}"))?;
     }
     Ok(())
 }

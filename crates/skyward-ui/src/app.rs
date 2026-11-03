@@ -75,6 +75,9 @@ pub enum Screen {
     /// what they start say now, and a way to turn both checks off or back
     /// on.
     Avb,
+    /// What the bootloader was told to start next: the message it left in
+    /// misc, what recovery makes of it, and a way to take it away.
+    Bcb,
     /// The partitions whose filesystems can be repaired or made afresh as
     /// another.
     Filesystems,
@@ -817,6 +820,9 @@ pub enum Confirm {
     /// Turn the two checks the vbmeta blocks name off, with `false`, or back
     /// on with `true`.
     Avb(bool),
+    /// Take the bootloader message out of misc, so the next start follows
+    /// the reason the bootloader itself has.
+    ClearStarter,
     /// Do to the partition the filesystem page shows what it chose.
     Filesystem,
 }
@@ -1541,6 +1547,60 @@ impl Frame {
     }
 }
 
+/// What the bootloader message in misc asks for, as the runtime read it for
+/// the page that shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Starter {
+    /// The command the bootloader acts on, such as `boot-recovery`. Empty
+    /// where nothing is pending.
+    pub command: String,
+    /// The one piece of work that command and its arguments add up to.
+    pub asks: Asking,
+    /// Why the system asked, in its own words, such as `fs_mgr_mount_all`.
+    pub reason: Option<String>,
+    /// The arguments as they were written, for reading in full.
+    pub args: Vec<String>,
+}
+
+impl Starter {
+    /// Whether misc holds anything for the bootloader to act on.
+    pub fn pending(&self) -> bool {
+        !self.command.is_empty()
+    }
+}
+
+/// The work a bootloader message asks for, named so the page can say it in
+/// the reader's own language.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Asking {
+    /// Nothing: recovery starts on its own pages.
+    #[default]
+    Nothing,
+    /// The recovery's userspace fastboot.
+    Fastboot,
+    /// Install the update package at this path.
+    Update(String),
+    /// Erase all user data, made afresh as this filesystem where one is
+    /// named.
+    WipeData { reformat: Option<String> },
+    /// Say that Android cannot start, and offer to erase all user data.
+    PromptWipeData,
+    /// Erase the cache partition.
+    WipeCache,
+    /// Erase the phone by the wipe package the system left behind.
+    WipeAb,
+    /// Wait for a package over `adb sideload`.
+    Sideload,
+    /// Wait for `adb rescue` on a computer.
+    Rescue,
+    /// Undo the sharing of blocks so the partitions can be written to.
+    Unshare,
+    /// Start the system at once.
+    Exit,
+    /// Work the recovery does not do, as it was asked.
+    Unsupported(String),
+}
+
 /// Choices the pages show and the user changes, and where installing
 /// stands.
 #[derive(Clone, Debug, PartialEq)]
@@ -1630,6 +1690,11 @@ pub struct State {
     /// The last change the AVB page made, block by block, or why it made
     /// none.
     pub avb_result: Option<Result<Vec<AvbChange>, String>>,
+    /// What the bootloader message in misc asks for, as the runtime last
+    /// read it for its page, or why it could not be read.
+    pub starter: Option<Result<Starter, String>>,
+    /// How taking that message away went, where the page was used to.
+    pub starter_cleared: Option<Result<(), String>>,
     /// The slot picked on the slot page to start next; with none picked,
     /// the page shows the one the boot control starts next.
     pub next_slot: Option<Slot>,
@@ -1758,6 +1823,8 @@ impl Default for State {
             avb: None,
             verity: None,
             avb_result: None,
+            starter: None,
+            starter_cleared: None,
             next_slot: None,
             data: Data::Closed,
             code: String::new(),
@@ -1920,6 +1987,12 @@ pub enum Effect {
     /// Turn both checks the vbmeta blocks name off, or back on, telling how
     /// it went with [`App::avb_written`].
     SetAvb(bool),
+    /// Read what the bootloader message in misc asks for, telling it with
+    /// [`App::set_starter`].
+    ReadStarter,
+    /// Take that message away so the next start follows the bootloader's own
+    /// reason, telling how it went with [`App::starter_cleared`].
+    ClearStarter,
     /// Have the bootloader start this slot next, telling how it went with
     /// [`App::slot_switched`].
     SetSlot(Slot),
@@ -3711,10 +3784,30 @@ impl App {
         self.refresh();
     }
 
+    /// What the bootloader message in misc asks for, as it was just read.
+    pub fn set_starter(&mut self, read: Result<Starter, String>) {
+        self.state.starter = Some(read);
+        self.refresh();
+    }
+
+    /// How taking the bootloader message away went, with what misc holds
+    /// then.
+    pub fn starter_cleared(&mut self, outcome: Result<(), String>, readings: Result<Starter, String>, now: u64) {
+        match &outcome {
+            Ok(()) => self.say(self.state.lang.pick(["启动指令已清除", "啟動指令已清除", "The bootloader message is gone"]), now),
+            Err(why) => {
+                let said = tr!(self.state.lang, "没有清除：{why}", "沒有清除：{why}", "Nothing was cleared: {why}");
+                self.say(&said, now);
+            }
+        }
+        self.state.starter_cleared = Some(outcome);
+        self.state.starter = Some(readings);
+        self.refresh();
+    }
+
     /// How switching the slot to start next went: what the boot control
     /// holds of the slots now, or why it did not switch.
-    pub fn slot_switched(&mut self, outcome: Result<BootSlots, String>, now: u64) {
-        match outcome {
+    pub fn slot_switched(&mut self, outcome: Result<BootSlots, String>, now: u64) {        match outcome {
             Ok(slots) => {
                 self.state.next_slot = None;
                 self.state.boot_slots = Some(Ok(slots));
@@ -4688,6 +4781,8 @@ impl App {
             // What the AVB page last did is not for the page to say again
             // once it is left.
             Screen::Avb => self.state.avb_result = None,
+            // Neither is what the bootloader page last did.
+            Screen::Bcb => self.state.starter_cleared = None,
             // A slot picked and not switched to is put down.
             Screen::Slot => self.state.next_slot = None,
             Screen::Files => {
@@ -4930,6 +5025,7 @@ impl App {
             // The tools page says beside its row whether the checks are on,
             // so it reads them as it opens; the AVB page reads them again.
             Screen::Advanced | Screen::Avb => vec![Effect::ReadAvb],
+            Screen::Bcb => vec![Effect::ReadStarter],
             Screen::Slot | Screen::Reboot => vec![Effect::ReadSlots],
             Screen::Restore => vec![self.find_backups()],
             Screen::Files => vec![Effect::ReadDir(self.state.files.path.clone())],
@@ -6343,6 +6439,10 @@ impl App {
             // phone's own start; turning them back on is safe only once the
             // phone's own partitions are back, which the page says.
             Confirm::Avb(on) => fx.push(Effect::SetAvb(on)),
+            // The message is what a phone that could not start leaves for
+            // the next start; taking it away is the whole of what this page
+            // changes, and misc holds nothing else.
+            Confirm::ClearStarter => fx.push(Effect::ClearStarter),
             // The data partition is reached through its own key whether or
             // not it is open, but not while it is being opened or erased.
             Confirm::Filesystem => {
@@ -6888,6 +6988,7 @@ mod tests {
             Screen::Restore,
             Screen::Advanced,
             Screen::Avb,
+            Screen::Bcb,
             Screen::Files,
             Screen::Terminal,
             Screen::Language,

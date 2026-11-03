@@ -58,6 +58,12 @@ pub const ENTRIES: &[Entry] = &[
         Screen::Avb,
         &["avb", "jiaoyan", "jy", "yanzheng", "yz", "verity", "verification", "vbmeta", "dmverity"],
     ),
+    entry(
+        ["启动指令", "啟動指令", "Boot message"],
+        ADVANCED,
+        Screen::Bcb,
+        &["qidongzhiling", "qdzl", "zhiling", "zl", "bcb", "misc", "bootloader", "recoveryloop", "xunhuan"],
+    ),
     entry(["导出日志", "匯出記錄", "Export logs"], ADVANCED, Screen::Logs, &["daochurizhi", "dcrz", "rizhi", "rz", "logs", "dmesg"]),
     entry(
         ["系统更新", "系統更新", "System update"],

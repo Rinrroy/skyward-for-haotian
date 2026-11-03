@@ -1,8 +1,8 @@
 use crate::app::{
-    Action, AodStyle, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop, Field,
-    FileKind, FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place,
-    Rows, Screen, Slider, Source, State, Switch, Target, UsbDrive, UsbLink, Wipe, ADDABLE, BACKUP_PARTS, DATA_ERASED, DATA_PARTITION,
-    DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES, USB_DRIVE_UNREADABLE, USB_DRIVE_WANTED, WIPES, installs,
+    Action, AodStyle, Asking, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop,
+    Field, FileKind, FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick,
+    Place, Rows, Screen, Slider, Source, State, Switch, Target, UsbDrive, UsbLink, Wipe, ADDABLE, BACKUP_PARTS, DATA_ERASED,
+    DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES, USB_DRIVE_UNREADABLE, USB_DRIVE_WANTED, WIPES, installs,
 };
 use crate::canvas::Canvas;
 use crate::color::Rgba;
@@ -85,6 +85,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::Terminal => terminal(cx),
         Screen::Relabel => relabel(cx),
         Screen::Avb => avb(cx),
+        Screen::Bcb => bcb(cx),
         Screen::Filesystems => filesystems(cx),
         Screen::Filesystem => filesystem(cx),
         Screen::PartWork => part_work(cx),
@@ -133,6 +134,7 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
         Confirm::Relabel => (["滑动以修复", "滑動以修復", "Slide to fix"], true),
         Confirm::Avb(false) => (["滑动以关闭校验", "滑動以關閉校驗", "Slide to turn checks off"], true),
         Confirm::Avb(true) => (["滑动以打开校验", "滑動以開啟校驗", "Slide to turn checks on"], true),
+        Confirm::ClearStarter => (["滑动以清除这条指令", "滑動以清除這條指令", "Slide to take the message away"], true),
     };
     (s.lang.pick(label), danger)
 }
@@ -2067,6 +2069,7 @@ pub fn advanced(cx: &Ctx) -> Frame {
         Row::new(l.pick(TERMINAL)).icon(SLATE, Icon::Terminal),
         Row::new(l.pick(RELABEL)).icon(PURPLE, Icon::Shield),
         Row::new(l.pick(AVB)).icon(SLATE, Icon::Lock).trail(Trail::Value(avb_value(cx))),
+        Row::new(l.pick(BCB)).icon(BLUE, Icon::Restore).trail(Trail::Value(bcb_value(cx))),
         Row::new(l.pick(FILESYSTEMS)).icon(RED, Icon::Mount),
         Row::new(l.pick(LOGS)).icon(ORANGE, Icon::Log),
         Row::new(l.pick(UPDATE)).icon(GREEN, Icon::Layers).trail(Trail::Value(update_value(cx))),
@@ -2076,6 +2079,7 @@ pub fn advanced(cx: &Ctx) -> Frame {
         Action::Open(Screen::Terminal),
         Action::Open(Screen::Relabel),
         Action::Open(Screen::Avb),
+        Action::Open(Screen::Bcb),
         Action::Open(Screen::Filesystems),
         Action::Open(Screen::Logs),
         Action::Open(Screen::Update),
@@ -2170,6 +2174,49 @@ const AVB_UNKNOWN: Text = ["未知", "未知", "Unknown"];
 const AVB_READING: Text = ["正在读取 vbmeta", "正在讀取 vbmeta", "Reading the vbmeta blocks"];
 const AVB_NONE: Text = ["这个槽位没有 vbmeta 分区", "這個槽位沒有 vbmeta 分割區", "This slot keeps no vbmeta partition"];
 const AVB_UNREADABLE: Text = ["无法读取 vbmeta", "無法讀取 vbmeta", "Couldn't read the vbmeta blocks"];
+
+const BCB: Text = ["启动指令", "啟動指令", "Boot message"];
+const BCB_NONE: Text = ["这条指令是空的", "這條指令是空的", "Nothing is waiting there"];
+const BCB_NONE_VALUE: Text = ["无", "無", "None"];
+const BCB_PENDING_VALUE: Text = ["待执行", "待執行", "Waiting"];
+const BCB_UNKNOWN: Text = ["未知", "未知", "Unknown"];
+const BCB_READING: Text = ["正在读取 misc", "正在讀取 misc", "Reading the bootloader message"];
+const BCB_UNREADABLE: Text = ["无法读取 misc", "無法讀取 misc", "Couldn't read the bootloader message"];
+const BCB_COMMAND: Text = ["命令", "命令", "Command"];
+const BCB_ASKS: Text = ["它要求 recovery 做的事", "它要求 recovery 做的事", "What it asks of recovery"];
+const BCB_BECAUSE: Text = ["系统给出的原因", "系統給出的原因", "Why the system asked"];
+const BCB_ARGUMENTS: Text = ["参数原文", "參數原文", "The arguments as written"];
+
+/// What a bootloader message asks for, said in the reader's language.
+fn asking(l: Lang, asks: &Asking) -> String {
+    match asks {
+        Asking::Nothing => l.pick(["什么都不做，recovery 显示自己的页面", "什麼都不做，recovery 顯示自己的頁面", "Nothing; recovery shows its own pages"]).to_string(),
+        Asking::Fastboot => l.pick(["进入 fastboot", "進入 fastboot", "Go to fastboot"]).to_string(),
+        Asking::Update(package) => tr!(l, "安装更新包 {package}", "安裝更新包 {package}", "Install the update at {package}"),
+        Asking::WipeData { reformat } => match reformat {
+            Some(fs) => tr!(l, "擦除全部数据，并格式化为 {fs}", "擦除全部資料，並格式化為 {fs}", "Erase all data, made afresh as {fs}"),
+            None => l.pick(["擦除全部数据", "擦除全部資料", "Erase all user data"]).to_string(),
+        },
+        Asking::PromptWipeData => l.pick(["说系统无法启动，并询问是否擦除全部数据", "說系統無法啟動，並詢問是否擦除全部資料", "Say Android cannot start, and offer to erase all data"]).to_string(),
+        Asking::WipeCache => l.pick(["擦除 cache 分区", "擦除 cache 分割區", "Erase the cache partition"]).to_string(),
+        Asking::WipeAb => l.pick(["按系统留下的擦除包擦除手机", "按系統留下的擦除包擦除手機", "Erase the phone by the package the system left"]).to_string(),
+        Asking::Sideload => l.pick(["等待 adb sideload 送来的包", "等待 adb sideload 送來的包", "Wait for a package over adb sideload"]).to_string(),
+        Asking::Rescue => l.pick(["等待电脑上的 adb rescue", "等待電腦上的 adb rescue", "Wait for adb rescue on a computer"]).to_string(),
+        Asking::Unshare => l.pick(["撤销共享块，使分区可以写入", "撤銷共享區塊，使分割區可以寫入", "Undo the sharing of blocks so the partitions can be written"]).to_string(),
+        Asking::Exit => l.pick(["立刻启动系统", "立刻啟動系統", "Start the system at once"]).to_string(),
+        Asking::Unsupported(what) => tr!(l, "recovery 不做的活：{what}", "recovery 不做的活：{what}", "Work recovery does not do: {what}"),
+    }
+}
+
+/// What the bootloader page's row says beside itself on the tools page.
+fn bcb_value(cx: &Ctx) -> &'static str {
+    let l = cx.state.lang;
+    match &cx.state.starter {
+        Some(Ok(starter)) if starter.pending() => l.pick(BCB_PENDING_VALUE),
+        Some(Ok(_)) => l.pick(BCB_NONE_VALUE),
+        _ => l.pick(BCB_UNKNOWN),
+    }
+}
 const AVB_MODE_UNKNOWN: Text = ["未知", "未知", "unknown"];
 
 /// The AVB row's trailing word: whether the checks the phone's vbmeta blocks
@@ -2280,19 +2327,46 @@ pub fn avb(cx: &Ctx) -> Frame {
     };
     y = widgets::danger_card(&mut c, t, f, y + t.m.card_gap, heading, detail);
 
-    // How the last change went.
+    // How the last change went, and where what was there before it is kept:
+    // a change to these flags is the one thing on this page that can leave a
+    // phone unable to start, so the way back belongs beside the record of
+    // what was done.
     if let Some(result) = &s.avb_result {
         let note = match result {
             Ok(changes) => {
                 let changed = changes.iter().filter(|c| c.kept.is_some()).count();
+                let kept = changes
+                    .iter()
+                    .find_map(|c| c.kept.as_deref())
+                    .and_then(|p| p.parent())
+                    .map(|p| p.display().to_string());
                 match changed {
                     0 => l.pick(["没有区块需要改动。", "沒有區塊需要改動。", "No block needed changing."]).to_string(),
-                    _ => tr!(
-                        l,
-                        "已改动 {changed} 个区块，改动前的原样已备份。",
-                        "已改動 {changed} 個區塊，改動前的原樣已備份。",
-                        "{changed} blocks changed, each kept as it was before."
-                    ),
+                    _ => match kept {
+                        Some(dir) => {
+                            let off = changes.iter().any(|c| c.after != 0);
+                            match off {
+                                true => tr!(
+                                    l,
+                                    "已关闭 {changed} 个区块。改动前的原样存在 {dir}，可以整个目录拷到电脑留存。要恢复，把这个开关滑回「打开」即可。",
+                                    "已關閉 {changed} 個區塊。改動前的原樣存在 {dir}，可以整個目錄拷到電腦留存。要恢復，把這個開關滑回「開啟」即可。",
+                                    "{changed} blocks turned off. What they said before is kept in {dir}; copy that folder off the phone if you want it to outlast it. To undo, slide the switch back on."
+                                ),
+                                false => tr!(
+                                    l,
+                                    "已打开 {changed} 个区块。关闭状态下的副本存在 {dir}。",
+                                    "已開啟 {changed} 個區塊。關閉狀態下的副本存在 {dir}。",
+                                    "{changed} blocks turned back on. The copy taken while they were off is in {dir}."
+                                ),
+                            }
+                        }
+                        None => tr!(
+                            l,
+                            "已改动 {changed} 个区块，改动前的原样已备份。",
+                            "已改動 {changed} 個區塊，改動前的原樣已備份。",
+                            "{changed} blocks changed, each kept as it was before."
+                        ),
+                    },
                 }
             }
             Err(why) => tr!(l, "未能改动：{why}", "未能改動：{why}", "Nothing was changed: {why}"),
@@ -2306,6 +2380,99 @@ pub fn avb(cx: &Ctx) -> Frame {
     let mut bottom = y;
     if known {
         let which = Confirm::Avb(!on);
+        let (label, danger) = confirm_label(which, s);
+        let track = widgets::confirm(&mut c, t, f, y + t.m.card_gap, label, danger, s.confirm);
+        out.push(Hit { rect: track, action: Action::Confirm(which) });
+        bottom = track.y + track.h;
+    }
+    Frame::new(t, fit(c, t, bottom), out, title, top)
+}
+
+/// What the bootloader was told to start next: the message it left in misc,
+/// what recovery makes of it, and a swipe to take it away.
+///
+/// A phone whose system could not start leaves one of these behind, which is
+/// why the next start comes back to the recovery instead of the system. The
+/// page exists so that is something to read rather than guess at, and so the
+/// message can be taken away without erasing anything.
+pub fn bcb(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let mut c = long_page(cx);
+    let mut out = Vec::new();
+    let top = t.m.content_top;
+    let title = l.pick(BCB);
+
+    // What misc holds, or why it could not be read.
+    let mut y = top;
+    let mut pending = false;
+    let mut wiping = false;
+    match &s.starter {
+        None => y = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(BCB_READING)).trail(Trail::None)]).bottom,
+        Some(Err(why)) => {
+            y = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(BCB_UNREADABLE)).trail(Trail::None)]).bottom;
+            y = widgets::footnote(&mut c, t, f, y, why);
+        }
+        Some(Ok(starter)) if !starter.pending() => {
+            y = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(BCB_NONE)).trail(Trail::Value(l.pick(BCB_NONE_VALUE)))]).bottom;
+        }
+        Some(Ok(starter)) => {
+            pending = true;
+            wiping = matches!(&starter.asks, Asking::WipeData { .. } | Asking::PromptWipeData | Asking::WipeAb);
+            let mut facts: Vec<(&'static str, String)> = vec![
+                (l.pick(BCB_COMMAND), starter.command.clone()),
+                (l.pick(BCB_ASKS), asking(l, &starter.asks)),
+            ];
+            if let Some(reason) = &starter.reason {
+                facts.push((l.pick(BCB_BECAUSE), reason.clone()));
+            }
+            y = widgets::info_card(&mut c, t, f, y, &facts);
+            if !starter.args.is_empty() {
+                let written = format!("{}: {}", l.pick(BCB_ARGUMENTS), starter.args.join(" "));
+                y = widgets::footnote(&mut c, t, f, y + t.m.card_gap, &written);
+            }
+        }
+    }
+
+    let what = l.pick([
+        "开机时，bootloader 读 misc 开头这张便条，决定下一步：正常启动系统、进入 recovery，或者让 recovery 做某件事。系统没能启动时，它会把「进入 recovery、并提示擦除数据」这样的要求留在这里——这就是「一开机总是进 recovery」的原因。\n\n清除只是把这张便条拿掉，不会擦除任何数据。但如果它要求的是安装更新，清除之后那次更新会被取消，需要重新发起。",
+        "開機時，bootloader 讀 misc 開頭這張便條，決定下一步：正常啟動系統、進入 recovery，或者讓 recovery 做某件事。系統沒能啟動時，它會把「進入 recovery、並提示擦除資料」這樣的要求留在這裡——這就是「一開機總是進 recovery」的原因。\n\n清除只是把這張便條拿掉，不會擦除任何資料。但如果它要求的是安裝更新，清除之後那次更新會被取消，需要重新發起。",
+        "At each start the bootloader reads this note at the top of misc to decide what comes next: the system, the recovery, or a piece of work for the recovery to do. A system that could not start leaves one here — an order to enter the recovery and offer to erase data — which is why every start then comes back to the recovery.\n\nTaking it away erases nothing. Where it asks for an update to be installed, though, taking it away cancels that update, which then has to be started again.",
+    ]);
+    y = widgets::paragraph(&mut c, t, f, y + t.m.card_gap, what);
+
+    // A message asking for the data to be erased is the one worth saying
+    // plainly: it is a request, and nothing has been erased by it yet.
+    if wiping {
+        let (heading, detail) = (
+            l.pick(["系统要求擦除数据，但还没有擦", "系統要求擦除資料，但還沒有擦", "The system asked for the data to be erased; nothing has been"]),
+            l.pick([
+                "这是一条要求，不是已经发生的事——数据仍然完好。如果系统本来能启动，清除这条指令不会有任何数据丢失。确实要恢复出厂设置时，请到「清除」页自己操作。",
+                "這是一條要求，不是已經發生的事——資料仍然完好。如果系統本來能啟動，清除這條指令不會有任何資料遺失。確實要恢復原廠設定時，請到「清除」頁自己操作。",
+                "This is what the phone asked for, not what happened: the data is still there. Where the system would have started anyway, taking the message away loses nothing. To erase the phone for real, use the wipe page.",
+            ]),
+        );
+        y = widgets::danger_card(&mut c, t, f, y + t.m.card_gap, heading, detail);
+    }
+
+    // How the last clearing went.
+    if let Some(result) = &s.starter_cleared {
+        let note = match result {
+            Ok(()) => l
+                .pick([
+                    "已清除。下次启动将按 bootloader 自己的判断进行。",
+                    "已清除。下次啟動將按 bootloader 自己的判斷進行。",
+                    "Taken away. The next start follows the bootloader's own reason.",
+                ])
+                .to_string(),
+            Err(why) => format!("{} {why}", l.pick(["未能清除：", "未能清除：", "It could not be taken away:"])),
+        };
+        y = widgets::footnote(&mut c, t, f, y + t.m.card_gap, &note);
+    }
+
+    // The swipe, offered only where there is something to take away.
+    let mut bottom = y;
+    if pending {
+        let which = Confirm::ClearStarter;
         let (label, danger) = confirm_label(which, s);
         let track = widgets::confirm(&mut c, t, f, y + t.m.card_gap, label, danger, s.confirm);
         out.push(Hit { rect: track, action: Action::Confirm(which) });

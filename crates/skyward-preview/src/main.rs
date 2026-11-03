@@ -8,9 +8,9 @@ use skyward_net::release::{Release, Unanswered};
 use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Bands, Joined, Link, Network, Power, Stage as Joining, Traffic, Wlan};
 use skyward_ui::app::{
-    Action, Adding, App, Asked, BackupAt, BackupEnd, BackupEntry, BackupJob, BackupRefusal, Choice, Clip, Damage, Data, DownloadEnd,
+    Action, Adding, App, Asked, Asking, BackupAt, BackupEnd, BackupEntry, BackupJob, BackupRefusal, Choice, Clip, Damage, Data, DownloadEnd,
     DownloadJob, EraseStop, Field, FileKind, FileOp, FileRow, FileTask, FsAction, FsRow, Have, Held, Install, ItemEnd, JobEnd, Key, Keys,
-    MountFailure, MountRow, Part, PartKind, PartStop, Pick, Place, Screen, Source, TermEnd, Touch, UsbDrive, UsbLink, SCREEN_OFF,
+    MountFailure, MountRow, Part, PartKind, PartStop, Pick, Place, Screen, Source, Starter, TermEnd, Touch, UsbDrive, UsbLink, SCREEN_OFF,
 };
 use skyward_ui::widgets::{self, Bar, Bolt, Cap, Layer};
 use skyward_ui::{editor, fmt, pages, Canvas, Ctx, Fonts, Lang, Theme};
@@ -374,7 +374,7 @@ fn main() -> Result<()> {
     let adding = |app: &mut App, name: &str, security: Security, field: Field, choosing: bool| {
         app.state.adding = Some(Adding { name: name.into(), security, field, choosing });
     };
-    let pages: [PageShot; 162] = [
+    let pages: [PageShot; 164] = [
         ("11-install-light-locked", Screen::Install, false, &|app| {
             app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false };
         }),
@@ -528,6 +528,15 @@ fn main() -> Result<()> {
                 AvbChange { name: "vbmeta_system".into(), before: 0, after: 3, kept: Some("/tmp/avb/vbmeta_system-0x00000000-1793681979.img".into()) },
             ]));
         }),
+        ("49-bcb-light", Screen::Bcb, false, &|app| {
+            app.set_starter(Ok(Starter {
+                command: "boot-recovery".into(),
+                asks: Asking::PromptWipeData,
+                reason: Some("fs_mgr_mount_all".into()),
+                args: vec!["--prompt_and_wipe_data".into(), "--reason=fs_mgr_mount_all".into()],
+            }))
+        }),
+        ("49-bcb-dark-empty", Screen::Bcb, true, &|app| app.set_starter(Ok(Starter::default()))),
         ("50-files-light", Screen::Files, false, &|app| app.set_files("/".into(), Ok(sample_root()), LISTED)),
         ("51-files-dark", Screen::Files, true, &|app| app.set_files("/".into(), Ok(sample_root()), LISTED)),
         ("52-file-info-light", Screen::FileInfo, false, &|app| app.state.file = sample_root().into_iter().find(|e| e.name == "init.environ.rc")),
