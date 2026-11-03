@@ -76,14 +76,16 @@ bootloader 每次启动读 `misc` 前 2048 字节（bootloader message）：`com
 **看它**：
 
 ```bash
-skyward bcb          # command / args / 解析出的请求
+/system/bin/recovery bcb          # command / args / 解析出的请求
 ```
 
 **清它**（只清指令区，不碰数据）：
 
 ```bash
-skyward bcb --clear  # 或界面：高级 → 启动指令 → 滑动清除
+/system/bin/recovery bcb --clear  # 或界面：高级 → 启动指令 → 滑动清除
 ```
+
+注意：这台机器上没有叫 `skyward` 的命令，程序本体就是 `/system/bin/recovery`。而且**带参数调用才算命令**——不带参数时它直接进 recovery 界面（早期版本不看参数就进界面，会启动第二个实例抢走屏幕和 USB）。
 
 `--prompt_and_wipe_data` 是**请求**，不是已经发生的事。清掉它不会丢数据。
 
@@ -163,7 +165,28 @@ cargo build --release --target aarch64-linux-android -p skyward
 
 ---
 
-## 9. 两个页面行为值得知道
+## 9. 日志在哪，以及为什么在那里
+
+三处，按可靠性排序：
+
+| 位置 | 何时写 | 重启后 |
+|---|---|---|
+| `/mnt/logfs/skyward/session-<开机秒数>.log` | **总能写** | **在** |
+| `/tmp/recovery.log` | 总能写 | 没了（内存盘） |
+| `/sdcard/Skyward/logs/` | 仅当 logfs 挂不上、且 data 已挂载 | 在 |
+
+`logfs` 是 bootloader 写自己日志用的 8 MB FAT 分区（`/dev/block/by-name/logfs`），不加密、独立于系统。**data 锁着的时候它是唯一能持久写的地方**——而「会话结束时设备重启了」恰恰是 data 锁着的时候。只保留最近 20 个会话。
+
+Skyward 只在里面加一个 `skyward/` 子目录，不动 `UefiLog0..4.txt`。
+
+```bash
+adb pull /mnt/logfs/skyward/          # 取全部
+adb shell cat /mnt/logfs/skyward/session-*.log   # 或直接看
+```
+
+**一条踩过的坑**：`mount(2)` 的 `data` 参数是给文件系统驱动自己的，不是 `mount(8)` 读的选项。`"rw,noatime"` 交给 vfat 会得到 `EINVAL`——`rw` 靠不设 `MS_RDONLY` 表达，`noatime` 是 `MS_NOATIME` 标志位。照抄命令行写法会挂不上。
+
+## 10. 两个页面行为值得知道
 
 - **「无法启动系统」页**（系统请求擦除数据时出现）：页面上的擦除是**请求**，滑动才会执行。先选「重试」或「进入恢复模式」，两者都不动数据。
 - **「启动指令」页**（高级 → 启动指令）：显示 `misc` 里的便条及其解析结果。系统正常启动时这里是空的——一次性指令（如 `bootonce-bootloader`）在启动读完就被清掉了，只有持续性的请求（擦除、装更新、sideload）才会一直留着。

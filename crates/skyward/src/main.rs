@@ -228,9 +228,13 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    // init starts the recovery service by path with no arguments.
+    // init starts the recovery service by path with no arguments. Arguments
+    // mean a command was asked for, even where the program is the recovery
+    // itself: a second copy started to read what misc holds would take the
+    // port and the screen with it.
     let started_as = std::env::args().next().unwrap_or_default();
-    if Path::new(&started_as).file_name().is_some_and(|n| n == "recovery") {
+    let asked_for_a_command = std::env::args().nth(1).is_some();
+    if !asked_for_a_command && Path::new(&started_as).file_name().is_some_and(|n| n == "recovery") {
         return recovery();
     }
     match Cli::parse().cmd {

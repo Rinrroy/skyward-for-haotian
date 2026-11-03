@@ -1180,6 +1180,10 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     if cfg.display.density == 0 {
         return Err(anyhow!("{}: [display] density is required to lay out the UI", cfg.device.codename));
     }
+    // The pages are drawn once the partitions are mounted, so this line makes
+    // the first attempt to keep the log somewhere lasting land after the
+    // block devices are known, rather than before them.
+    let _ = skyward_sys::kmsg("the pages are ready");
     let mut info = skyward_info::collect(cfg)?;
     let fonts = Fonts::load(font, 0, mono)?;
     let mut surface = KmsSurface::open("/dev/dri/card0")?;

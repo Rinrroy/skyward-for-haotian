@@ -1,10 +1,10 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 pub mod bcb;
 pub mod clock;
@@ -167,6 +167,17 @@ pub const LOG: &str = "/tmp/recovery.log";
 /// this copy outlives it.
 pub const LOG_FOLDER: &str = "/sdcard/Skyward/logs";
 
+/// The small unencrypted FAT partition the bootloader writes its own logs to.
+/// While the data partition is still closed there is no other place a
+/// session's lines can outlast a restart, and a restart is what a session
+/// that ended badly leaves behind.
+const LOG_DISK: &str = "/dev/block/by-name/logfs";
+const LOG_DISK_AT: &str = "/mnt/logfs";
+const LOG_DISK_FOLDER: &str = "/mnt/logfs/skyward";
+
+/// How many sessions are kept where they outlast the start.
+const SESSIONS_KEPT: usize = 20;
+
 /// The file [`kmsg`] writes its lines to as well, once [`keep_log`] opened
 /// it.
 static KEPT: OnceLock<Mutex<File>> = OnceLock::new();
@@ -176,8 +187,8 @@ static KEPT: OnceLock<Mutex<File>> = OnceLock::new();
 static KEPT_LONG: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 
 /// The second past the start at which the lasting copy was last tried, so a
-/// phone whose data stays closed pays one attempt every few seconds rather
-/// than one per line.
+/// phone whose data stays closed pays one attempt a second rather than one
+/// per line.
 static TRIED_LONG: AtomicU64 = AtomicU64::new(0);
 
 /// Keep every line [`kmsg`] writes from now on in the file at `path` as
@@ -187,28 +198,131 @@ pub fn keep_log(path: &Path) -> Result<()> {
     KEPT.set(Mutex::new(file)).map_err(|_| anyhow!("the log is kept in a file already"))
 }
 
-/// The lasting copy, opened where it can be; `None` while the data partition
-/// is closed, or between the attempts to open it.
+/// The lasting copy, opened where it can be; `None` while neither the data
+/// partition nor the bootloader's log disk can be written to, or between the
+/// attempts to open one.
 fn lasting_log() -> Option<File> {
     let held = KEPT_LONG.get_or_init(|| Mutex::new(None));
     let mut held = held.lock().ok()?;
     if held.is_none() {
         let now = since_boot().map(|d| d.as_secs()).unwrap_or(0);
-        if now.saturating_sub(TRIED_LONG.load(Ordering::Relaxed)) < 5 {
+        if now.saturating_sub(TRIED_LONG.load(Ordering::Relaxed)) < 1 {
             return None;
         }
         TRIED_LONG.store(now, Ordering::Relaxed);
-        let folder = Path::new(LOG_FOLDER);
-        std::fs::create_dir_all(folder).ok()?;
-        let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let name = format!("session-{secs}.log");
-        let mut file = OpenOptions::new().create(true).append(true).open(folder.join(&name)).ok()?;
-        // The lines are stamped with the seconds since the phone started,
-        // which say nothing of the day; the day goes at the top.
-        writeln!(file, "session started at {secs}").ok()?;
+        // The bootloader's own disk first: it holds whether or not the data
+        // partition is open, and a session that ended badly is worth reading
+        // precisely when that partition is closed. Internal storage is the
+        // fallback, for a phone whose log disk will not mount.
+        let file = match mount_log_disk() {
+            Some(_) => session_in(Path::new(LOG_DISK_FOLDER)),
+            None if internal_storage_ready() => session_in(Path::new(LOG_FOLDER)),
+            None => None,
+        }?;
         *held = Some(file);
     }
     held.as_ref()?.try_clone().ok()
+}
+
+/// A file for this session in `folder`, opened after what earlier sessions
+/// left there and named by how long the phone had been up when it started,
+/// which is all the clock says before the system sets it from the RTC.
+fn session_in(folder: &Path) -> Option<File> {
+    std::fs::create_dir_all(folder).ok()?;
+    let at = since_boot().map(|d| d.as_secs()).unwrap_or(0);
+    let name = format!("session-{at}.log");
+    let mut file = OpenOptions::new().create(true).append(true).open(folder.join(name)).ok()?;
+    // The lines are stamped with the same clock, which says nothing of the
+    // day; how long the phone had been up when they started does.
+    writeln!(file, "session started {at} s after the phone started").ok()?;
+    forget_older_sessions(folder);
+    Some(file)
+}
+
+/// Leave the newest few sessions in `folder` and take the rest away, so a
+/// small partition does not fill with them.
+fn forget_older_sessions(folder: &Path) {
+    let Ok(entries) = std::fs::read_dir(folder) else { return };
+    let mut sessions: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("session-")))
+        .collect();
+    sessions.sort();
+    let extra = sessions.len().saturating_sub(SESSIONS_KEPT);
+    for old in sessions.into_iter().take(extra) {
+        let _ = std::fs::remove_file(old);
+    }
+}
+
+/// Whether internal storage is the data partition's own, rather than the
+/// empty folder the ramdisk leaves where it is to be mounted. Writing into
+/// that one succeeds and goes with the next start, which is the same as
+/// writing to [`LOG`]; only a mounted data partition is worth a file.
+fn internal_storage_ready() -> bool {
+    std::fs::read_to_string("/proc/mounts")
+        .map(|mounts| {
+            mounts.lines().any(|line| {
+                let mut fields = line.split_whitespace();
+                let _device = fields.next();
+                matches!(fields.next(), Some("/data") | Some("/sdcard"))
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Write a line straight to the kernel log, without going through [`kmsg`],
+/// which would come back to the code that is writing this.
+fn note(text: &str) {
+    if let Ok(mut log) = OpenOptions::new().write(true).open("/dev/kmsg") {
+        let _ = log.write_all(format!("<6>skyward: {text}\n").as_bytes());
+    }
+}
+
+/// The first few attempts to reach the log disk are worth a line each, so a
+/// phone where it will not mount says why rather than staying quiet.
+static NOTED_DISK: AtomicU64 = AtomicU64::new(0);
+
+fn note_disk(text: &str) {
+    if NOTED_DISK.fetch_add(1, Ordering::Relaxed) < 3 {
+        note(text);
+    }
+}
+
+/// Mount the bootloader's log disk where this session's lines can be written
+/// to it, unless it is mounted already. It is a small FAT partition this
+/// recovery only ever adds a folder to; failing to mount it costs nothing.
+fn mount_log_disk() -> Option<PathBuf> {
+    let at = Path::new(LOG_DISK_AT);
+    if !Path::new(LOG_DISK).exists() {
+        note_disk("the log disk is not there yet");
+        return None;
+    }
+    if std::fs::create_dir_all(at).is_err() {
+        note_disk("the log disk has nowhere to be mounted");
+        return None;
+    }
+    let mounted = std::fs::read_to_string("/proc/mounts")
+        .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some(LOG_DISK_AT)))
+        .unwrap_or(false);
+    if mounted {
+        return Some(at.to_path_buf());
+    }
+    let (source, target) = (std::ffi::CString::new(LOG_DISK).ok()?, std::ffi::CString::new(LOG_DISK_AT).ok()?);
+    let kind = std::ffi::CString::new("vfat").ok()?;
+    // The data mount(2) takes is for the filesystem's own driver, not the
+    // options mount(8) reads: "rw" and "noatime" belong in the flags, and
+    // handing them to vfat is what EINVAL means here. Read-write is what not
+    // asking for MS_RDONLY already gives.
+    let mounted = unsafe {
+        libc::mount(source.as_ptr(), target.as_ptr(), kind.as_ptr(), libc::MS_NOATIME as libc::c_ulong, std::ptr::null())
+    };
+    if mounted != 0 {
+        note_disk(&format!("the log disk would not mount: {}", std::io::Error::last_os_error()));
+        return None;
+    }
+    note_disk("the log disk is mounted for this session's lines");
+    Some(at.to_path_buf())
 }
 
 /// Append a line to the kernel log, where it survives until the next boot
