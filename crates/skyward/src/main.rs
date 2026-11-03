@@ -90,8 +90,14 @@ enum Cmd {
         #[arg(value_enum, default_value_t = AvbAction::Status)]
         action: AvbAction,
     },
-    /// Print the bootloader control block in misc.
-    Bcb,
+    /// Print the bootloader control block in misc, or take it away so the
+    /// next start follows the bootloader's own reason instead of a pending
+    /// command.
+    Bcb {
+        /// Take the message away instead of printing it.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Print the logical partition metadata in super.
     Lp {
         /// The super partition, or an image of its start.
@@ -245,11 +251,21 @@ fn main() -> Result<()> {
             skyward_sys::power(p)
         }
         Cmd::Avb { action } => avb(action),
-        Cmd::Bcb => {
-            let b = bcb::read(&bcb::misc())?;
-            println!("command = {:?}", b.command);
-            println!("args    = {:?}", b.args);
-            println!("request = {:?}", b.request());
+        Cmd::Bcb { clear } => {
+            let misc = bcb::misc();
+            if clear {
+                let was = bcb::read(&misc).map(|b| b.command).unwrap_or_default();
+                bcb::clear(&misc)?;
+                match was.is_empty() {
+                    true => println!("misc held nothing to take away"),
+                    false => println!("took {was:?} out of misc"),
+                }
+            } else {
+                let b = bcb::read(&misc)?;
+                println!("command = {:?}", b.command);
+                println!("args    = {:?}", b.args);
+                println!("request = {:?}", b.request());
+            }
             Ok(())
         }
         #[cfg(target_os = "android")]
@@ -713,6 +729,17 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
 fn recovery() -> Result<()> {
     let run = || -> Result<()> {
         skyward_sys::keep_log(Path::new(skyward_sys::LOG))?;
+        // This recovery is a program swapped into the phone's own ramdisk, so
+        // what it can do rests on files that ramdisk brings. Where a maker
+        // moves one of them the failure comes somewhere deep and quiet, so
+        // each start says whether they are all still there.
+        let round = ["/system/etc/recovery.fstab", "/init.recovery.qcom.rc", "/system/bin/recovery"];
+        let missing: Vec<&str> = round.iter().copied().filter(|p| !Path::new(p).exists()).collect();
+        let there = match missing.is_empty() {
+            true => "the files this recovery is built on are all there".to_string(),
+            false => format!("missing from this recovery's own ramdisk: {}", missing.join(", ")),
+        };
+        skyward_sys::kmsg(&there)?;
         // A recovery that ended with a function of its own in the port took
         // the port with it; going through "none" takes that function off.
         if skyward_sys::prop("sys.usb.state").is_some_and(|s| s != "adb") {

@@ -827,6 +827,17 @@ pub enum Confirm {
     Filesystem,
 }
 
+/// Whether a swipe-to-confirm control has to be slid twice.
+///
+/// These are the two actions that can leave a phone in a state its owner did
+/// not expect: the checks off leaves the phone's own system unable to start,
+/// which was measured on this phone rather than feared, and a factory reset
+/// takes data that cannot be brought back. Everything else is slid once, as
+/// before.
+fn arms(which: Confirm) -> bool {
+    matches!(which, Confirm::Avb(false) | Confirm::FactoryReset)
+}
+
 /// What the wipe page erases: everything a factory reset erases, or any of
 /// the parts after it on their own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1637,6 +1648,10 @@ pub struct State {
     pub pattern: Vec<usize>,
     /// How far the swipe-to-confirm knob is dragged, 0 to 1.
     pub confirm: f32,
+    /// The slide that asked what it was about to do, and whose second slide
+    /// does it. Only the actions that can leave the phone unable to start, or
+    /// take data that cannot come back, are slid twice.
+    pub armed: Option<Confirm>,
     pub install: Install,
     /// Where the package being installed comes from.
     pub source: Source,
@@ -1800,6 +1815,7 @@ impl Default for State {
             phone_logs: 0,
             pattern: Vec::new(),
             confirm: 0.0,
+            armed: None,
             install: Install::Idle,
             source: Source::Computer,
             package_name: None,
@@ -5019,6 +5035,9 @@ impl App {
     /// started. The decrypt page opens the data partition, which is also
     /// how it learns which control a user's screen lock is answered with.
     fn arrive_at(&mut self, s: Screen) -> Vec<Effect> {
+        // A slide that asked what it was about to do is answered on the page
+        // it was made on; leaving that page puts the question down.
+        self.state.armed = None;
         match s {
             Screen::Mount => vec![Effect::ReadMounts],
             Screen::Filesystems => vec![Effect::ReadFilesystems],
@@ -6345,7 +6364,19 @@ impl App {
     }
 
     /// What a swipe-to-confirm control slid to its end does.
+    ///
+    /// Two of them are slid twice. Turning the checks the vbmeta blocks name
+    /// off leaves the phone's own system unable to start, which was measured
+    /// rather than feared; erasing all user data cannot be undone. One slide
+    /// is too little for either, so the first only asks the page to say what
+    /// the second would do.
     fn confirmed(&mut self, which: Confirm, now: u64) -> Vec<Effect> {
+        if arms(which) && self.state.armed != Some(which) {
+            self.state.armed = Some(which);
+            self.dirty = true;
+            return Vec::new();
+        }
+        self.state.armed = None;
         let (l, mut fx) = (self.state.lang, Vec::new());
         match which {
             Confirm::Reboot => fx.push(Effect::Reboot(TARGETS[self.state.reboot])),
@@ -8971,7 +9002,8 @@ mod tests {
         let mut app = App::new(Screen::CantStart, W, H, PPD);
         app.set_asked(Asked { reason: Some("RescueParty".into()), ..Asked::default() });
         assert_eq!(tap(&mut app, &f, &i, Action::RebootTo(Target::System)), vec![Effect::Reboot(Target::System)]);
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::FactoryReset), vec![Effect::FactoryReset]);
+        assert!(swipe(&mut app, &f, &i, Confirm::FactoryReset).is_empty(), "the first slide only asks what the second would do");
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::FactoryReset), vec![Effect::FactoryReset], "the second does it");
         assert_eq!(tap(&mut app, &f, &i, Action::Dismiss), vec![Effect::Dismiss]);
         assert_eq!(app.screen(), Screen::Home);
         app.key(Key::Back, 0);

@@ -114,6 +114,24 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
 /// page's as `s` says what it is to do.
 pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
     const INSTALL: Text = ["滑动以安装", "滑動以安裝", "Slide to install"];
+    // A control already slid once says what the second slide would do, in
+    // place of what it does: the first slide is the question, not the act.
+    if s.armed == Some(which) {
+        let again: Text = match which {
+            Confirm::Avb(false) => [
+                "再滑一次：关闭后官方系统将无法启动",
+                "再滑一次：關閉後官方系統將無法啟動",
+                "Slide again: the phone's own system will not start",
+            ],
+            Confirm::FactoryReset => [
+                "再滑一次：数据将被清除，且无法恢复",
+                "再滑一次：資料將被清除，且無法復原",
+                "Slide again: the data will be gone for good",
+            ],
+            _ => ["再滑一次以确认", "再滑一次以確認", "Slide again to confirm"],
+        };
+        return (s.lang.pick(again), true);
+    }
     let (label, danger) = match which {
         Confirm::Filesystem => match s.fs_action {
             FsAction::Repair => (["滑动以修复", "滑動以修復", "Slide to repair"], true),
