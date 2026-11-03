@@ -1,7 +1,7 @@
 //! Backing up and restoring on a thread of its own, telling the screen how
 //! far it has come.
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use skyward_backup::archive::{self, Skipped};
 use skyward_backup::store::{self, Reader, Stored, Writer};
 use skyward_backup::{Item, Manifest, Part, FORMAT};
@@ -39,6 +39,26 @@ const ENTRY_BYTES: u64 = 2048;
 /// The slot's partitions that start the phone and check what it starts, in
 /// the order a backup takes them: those the phone has.
 const BOOT: [&str; 8] = ["boot", "init_boot", "vendor_boot", "dtbo", "vbmeta", "vbmeta_system", "vbmeta_vendor", "recovery"];
+
+/// The partitions the bootloader chain lives in, in both slots, which
+/// [`Part::Firmware`] keeps and nothing here writes back. They are the
+/// phone's own copy of what starts it before any of the above: a phone that
+/// will not start at all is reached with fastboot or an EDL tool, not from
+/// here.
+pub const FIRMWARE: [&str; 23] = [
+    "xbl", "xbl_config", "abl", "tz", "hyp", "devcfg", "qupfw", "uefi", "uefisecapp", "aop", "aop_config", "cpucp", "cpucp_dtb", "shrm",
+    "xbl_ramdump", "pvmfw", "multiimgoem", "multiimgqti", "spuservice", "qweslicstore", "imagefv", "vm-bootsys", "featenabler",
+];
+
+/// Each of [`FIRMWARE`] on both slots, by the name the block device has,
+/// those the phone has.
+pub fn firmware_partitions() -> Vec<String> {
+    FIRMWARE
+        .iter()
+        .flat_map(|base| ["_a", "_b"].map(|suffix| format!("{base}{suffix}")))
+        .filter(|name| partition(name).exists())
+        .collect()
+}
 
 /// The order a restore writes the parts in: what starts the phone and what
 /// it starts, then the baseband's, then the data partition's files, which
@@ -82,7 +102,7 @@ pub fn data_skipped(phone: &[String]) -> Vec<String> {
 
 pub struct BackupTask {
     /// Which of [`Part::ALL`] to take.
-    pub parts: [bool; 4],
+    pub parts: [bool; 5],
     /// The folder of backups at the place chosen; this one goes into a
     /// folder of its own there, called `stamp`.
     pub into: PathBuf,
@@ -107,7 +127,7 @@ pub struct BackupTask {
 pub struct RestoreTask {
     pub folder: PathBuf,
     /// Which of [`Part::ALL`] to restore.
-    pub parts: [bool; 4],
+    pub parts: [bool; 5],
     pub device: String,
     pub skipped: Vec<String>,
     /// What has to happen before the slot's partitions in super are written
@@ -344,7 +364,7 @@ fn no_update() -> Result<()> {
 
 fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<PathBuf> {
     let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-    let [boot, system, data, efs] = t.parts;
+    let [boot, system, data, efs, firmware] = t.parts;
     if system {
         no_update()?;
     }
@@ -379,6 +399,15 @@ fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<Pa
             ensure!(device.exists(), "the phone has no partition {name}");
             let size = skyward_block::size_bytes(&device)?;
             plan.push((Part::Efs, name.clone(), Source::Block(device), size));
+        }
+    }
+    if firmware {
+        // Both slots, since which one starts the phone has changed before
+        // and can be changed back.
+        for name in firmware_partitions() {
+            let device = partition(&name);
+            let size = skyward_block::size_bytes(&device)?;
+            plan.push((Part::Firmware, name, Source::Block(device), size));
         }
     }
     // Compressed, what the files take is not known until they are written.
@@ -492,7 +521,7 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
         return Err(Refusal::OtherPhone(manifest.device).into());
     }
     let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-    let mut items: Vec<&Item> = manifest.items.iter().filter(|i| t.parts[index(i.part)]).collect();
+    let mut items: Vec<&Item> = manifest.items.iter().filter(|i| t.parts[index(i.part)] && i.part.restorable()).collect();
     ensure!(!items.is_empty(), "nothing chosen to restore is in the backup");
     items.sort_by_key(|i| RESTORE_ORDER.iter().position(|&p| p == i.part));
     // All that can be seen before anything is written.
@@ -520,6 +549,7 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
                     return Err(Refusal::DataReset.into());
                 }
             }
+            Part::Firmware => bail!("the bootloader chain is kept, never put back"),
         }
     }
     tell(Event::Plan(items.iter().map(|i| (i.name.clone(), i.stored.size)).collect()));
@@ -565,6 +595,7 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
                 reader.check(&item.stored)?;
                 unmade = unpacked.unmade.iter().map(|u| Path::new(DATA).join(u)).collect();
             }
+            Part::Firmware => bail!("the bootloader chain is kept, never put back"),
         }
         skyward_sys::kmsg(&format!("restored {}", item.name))?;
     }
@@ -575,7 +606,10 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
 /// The partition a part of a backup goes back to.
 fn target(item: &Item, slot: Slot) -> PathBuf {
     match item.part {
-        Part::Efs => partition(&item.name),
+        // The name is the whole device name for both: the baseband's
+        // partitions carry no slot, and a kept bootloader partition carries
+        // its own.
+        Part::Efs | Part::Firmware => partition(&item.name),
         _ => partition(&format!("{}{}", item.name, slot.suffix())),
     }
 }

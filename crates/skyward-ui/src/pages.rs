@@ -1,7 +1,7 @@
 use crate::app::{
     Action, AodStyle, Asking, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop,
     Field, FileKind, FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick,
-    Place, Rows, Screen, Slider, Source, State, Switch, Target, UsbDrive, UsbLink, Wipe, ADDABLE, BACKUP_PARTS, DATA_ERASED,
+    Place, Rows, Screen, Slider, Source, State, Switch, Target, UsbDrive, UsbLink, Wipe, ADDABLE, BACKUP_PARTS, BACKUP_RESTORABLE, DATA_ERASED,
     DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES, USB_DRIVE_UNREADABLE, USB_DRIVE_WANTED, WIPES, installs,
 };
 use crate::canvas::Canvas;
@@ -1758,7 +1758,12 @@ pub fn backup(cx: &Ctx) -> Frame {
     });
     let boot = l.pick(["boot、init_boot、vendor_boot、dtbo、vbmeta 和 recovery", "boot、init_boot、vendor_boot、dtbo、vbmeta 和 recovery", "boot, init_boot, vendor_boot, dtbo, vbmeta and recovery"]);
     let modem = l.pick(["IMEI、基带设置和传感器校准数据", "IMEI、基頻設定和感應器校正資料", "IMEI, modem settings and sensor calibration"]);
-    let subs = [boot, system, data, modem];
+    let chain = l.pick([
+        "xbl、abl、tz、hyp、uefi 等 23 个分区，两个槽位，约 220 MB。只作留存，不能写回",
+        "xbl、abl、tz、hyp、uefi 等 23 個分割區，兩個槽位，約 220 MB。只作留存，不能寫回",
+        "xbl, abl, tz, hyp, uefi and 19 more, both slots, about 220 MB. Kept only, never written back",
+    ]);
+    let subs = [boot, system, data, modem, chain];
     let rows: Vec<Row> = BACKUP_PARTS
         .iter()
         .zip(subs)
@@ -1766,7 +1771,7 @@ pub fn backup(cx: &Ctx) -> Frame {
         .map(|(k, (name, sub))| Row::new(l.pick(*name)).subtitle(sub).trail(Trail::Check(s.backup[k])))
         .collect();
     let parts = widgets::list(&mut c, t, f, y, &rows);
-    out.extend(hits(&parts.rows, &[0, 1, 2, 3].map(Action::BackupPart)));
+    out.extend(hits(&parts.rows, &[0, 1, 2, 3, 4].map(Action::BackupPart)));
     let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(["存放位置", "存放位置", "Save to"]));
     let storage = match (s.data.storage_open(), i.storage.free.map(fmt::gb)) {
         (true, Some(free)) => tr!(l, "剩余 {free}", "剩餘 {free}", "{free} free"),
@@ -1881,12 +1886,20 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
                 widgets::footnote(&mut c, t, f, y, &note)
             } else {
                 let y = widgets::section(&mut c, t, f, y, l.pick(["恢复内容", "還原內容", "Contents"]));
-                let kept: Vec<usize> = (0..BACKUP_PARTS.len()).filter(|&k| held.parts[k]).collect();
+                let kept: Vec<usize> = (0..BACKUP_PARTS.len()).filter(|&k| held.parts[k] && BACKUP_RESTORABLE[k]).collect();
                 let rows: Vec<Row> = kept.iter().map(|&k| Row::new(l.pick(BACKUP_PARTS[k])).trail(Trail::Check(chosen[k]))).collect();
                 let list = widgets::list(&mut c, t, f, y, &rows);
                 out.extend(list.rows.iter().zip(&kept).map(|(&rect, &k)| Hit { rect, action: Action::RestorePart(k) }));
                 let note = l.pick(["恢复后，所选内容的现有数据将被备份覆盖。", "還原後，所選內容的現有資料將被備份覆寫。", "Restoring writes the backup over what the parts chosen hold now."]);
                 let mut y = widgets::footnote(&mut c, t, f, list.bottom, note);
+                if held.parts[4] {
+                    let note = l.pick([
+                        "这份备份里还有 bootloader 链（xbl、abl、tz 等 46 个分区）。它只作留存：写回需要 fastboot 或 EDL 工具，Skyward 不会写。",
+                        "這份備份裡還有 bootloader 鏈（xbl、abl、tz 等 46 個分割區）。它只作留存：寫回需要 fastboot 或 EDL 工具，Skyward 不會寫。",
+                        "This backup also holds the bootloader chain, 46 partitions such as xbl, abl and tz. They are kept only: putting one back needs fastboot or an EDL tool, and nothing here writes them.",
+                    ]);
+                    y = widgets::footnote(&mut c, t, f, y, note);
+                }
                 if chosen[2] {
                     let note = l.pick([
                         "data 分区将恢复应用、账户和设置，内部存储、锁屏密码和指纹保持不变。恢复出厂设置后，无法再恢复此前的 data 分区备份。",

@@ -461,40 +461,28 @@ fn booted_slot() -> Result<skyward_vab::Slot> {
     skyward_vab::current_slot()?.context("not an A/B device")
 }
 
-/// The partitions the bootloader chain lives in, by base name: the two slots
-/// of each are written where the phone has them.
-const FIRMWARE: [&str; 23] = [
-    "xbl", "xbl_config", "abl", "tz", "hyp", "devcfg", "qupfw", "uefi", "uefisecapp", "aop", "aop_config", "cpucp", "cpucp_dtb", "shrm",
-    "xbl_ramdump", "pvmfw", "multiimgoem", "multiimgqti", "spuservice", "qweslicstore", "imagefv", "vm-bootsys", "featenabler",
-];
-
-/// Write those partitions to `out` as files, with a note saying what they are
-/// and that nothing here puts them back.
+/// Write the partitions of [`backup::FIRMWARE`] to `out` as files, with a
+/// note saying what they are and that nothing here puts them back.
 ///
 /// They are worth keeping as they were at a moment that worked, but the phone
 /// has a better copy already: its own fastboot ROM carries the same
 /// partitions with the checksums and the addresses to write them at, and a
-/// tool that writes without checking is worse than no tool.
+/// tool that writes without checking is worse than no tool. The backup page
+/// keeps the same partitions, with a manifest beside them.
 fn firmware(out: &Path) -> Result<()> {
     std::fs::create_dir_all(out).with_context(|| format!("make {}", out.display()))?;
     let slot = skyward_vab::current_slot()?.map(|s| s.suffix().to_string()).unwrap_or_default();
     let mut written = 0u64;
     let mut kept = Vec::new();
-    for base in FIRMWARE {
-        for suffix in ["_a", "_b"] {
-            let name = format!("{base}{suffix}");
-            let device = Path::new(skyward_block::BY_NAME).join(&name);
-            if !device.exists() {
-                continue;
-            }
-            let mut from = std::fs::File::open(&device).with_context(|| format!("open {}", device.display()))?;
-            let path = out.join(format!("{name}.img"));
-            let mut to = std::fs::File::create(&path).with_context(|| format!("make {}", path.display()))?;
-            let size = std::io::copy(&mut from, &mut to).with_context(|| format!("copy {name}"))?;
-            written += size;
-            kept.push(format!("{name} {size}"));
-            println!("{name:<20} {size:>12}");
-        }
+    for name in backup::firmware_partitions() {
+        let device = Path::new(skyward_block::BY_NAME).join(&name);
+        let mut from = std::fs::File::open(&device).with_context(|| format!("open {}", device.display()))?;
+        let path = out.join(format!("{name}.img"));
+        let mut to = std::fs::File::create(&path).with_context(|| format!("make {}", path.display()))?;
+        let size = std::io::copy(&mut from, &mut to).with_context(|| format!("copy {name}"))?;
+        written += size;
+        kept.push(format!("{name} {size}"));
+        println!("{name:<20} {size:>12}");
     }
     let note = format!(
         "These are the partitions the bootloader chain lives in, read from /dev/block/by-name with the phone\n\

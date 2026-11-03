@@ -511,12 +511,19 @@ pub enum Switch {
     ShowPassword,
 }
 /// What a backup can take, in the order the backup page lists it.
-pub const BACKUP_PARTS: [Text; 4] = [
+pub const BACKUP_PARTS: [Text; 5] = [
     ["启动分区", "啟動分割區", "Boot partitions"],
     ["系统分区", "系統分割區", "System partitions"],
     ["data 分区", "data 分割區", "data partition"],
     ["基带与 EFS", "基頻與 EFS", "Modem and EFS"],
+    ["bootloader 链", "bootloader 鏈", "Bootloader chain"],
 ];
+
+/// Which of [`BACKUP_PARTS`] can be written back from here. The bootloader
+/// chain is kept and never put back: writing one of those partitions needs
+/// fastboot or an EDL tool, where a mistake is not something a recovery can
+/// undo.
+pub const BACKUP_RESTORABLE: [bool; 5] = [true, true, true, true, false];
 
 /// A backup found in a place's Skyward/backups folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -537,7 +544,7 @@ pub struct Held {
     /// The bytes its files take.
     pub size: u64,
     /// Which of [`BACKUP_PARTS`] it holds.
-    pub parts: [bool; 4],
+    pub parts: [bool; 5],
     /// The phone it was made on, by its codename, the system it ran, as
     /// its version reads, and the slot it was made from.
     pub device: String,
@@ -1705,7 +1712,7 @@ pub struct State {
     pub mounts: Result<Vec<MountRow>, String>,
     pub mount_failure: Option<MountFailure>,
     /// Which of [`BACKUP_PARTS`] a backup takes.
-    pub backup: [bool; 4],
+    pub backup: [bool; 5],
     /// Where a backup goes.
     pub backup_to: Place,
     pub compress: bool,
@@ -1714,7 +1721,7 @@ pub struct State {
     pub backups: Vec<BackupEntry>,
     /// The backup the restore page shows, as it was found, and which of its
     /// parts to restore.
-    pub restore: Option<(BackupEntry, [bool; 4])>,
+    pub restore: Option<(BackupEntry, [bool; 5])>,
     /// Backing up or restoring under way, or how it last ended.
     pub backup_job: Option<BackupJob>,
     /// Which logs to export: the recovery's, the kernel's.
@@ -1858,7 +1865,7 @@ impl Default for State {
             reflash: None,
             mounts: Ok(Vec::new()),
             mount_failure: None,
-            backup: [true, true, false, true],
+            backup: [true, true, false, true, false],
             backup_to: Place::Storage,
             compress: false,
             verify: true,
@@ -2132,10 +2139,10 @@ pub enum Effect {
     /// a folder of their own in `place`, telling how it goes with
     /// [`App::backup_started`], [`App::backup_plan`], [`App::backup_at`]
     /// and [`App::backup_ended`].
-    Backup { parts: [bool; 4], place: Place, compress: bool, verify: bool },
+    Backup { parts: [bool; 5], place: Place, compress: bool, verify: bool },
     /// Restore the parts ticked of the backup in the folder `name` of
     /// `place`, telling how it goes as a backup does.
-    Restore { place: Place, name: String, parts: [bool; 4] },
+    Restore { place: Place, name: String, parts: [bool; 5] },
     /// Look for backups in the places that can be read, telling what is
     /// found with [`App::set_backups`].
     FindBackups { storage: bool, usb: bool },
@@ -5430,10 +5437,14 @@ impl App {
                 self.state.backup_to = place;
                 self.refresh();
             }
-            // All a backup holds is ticked to restore at first.
+            // All a backup holds is ticked to restore at first, but only
+            // what can be put back: a kept bootloader chain is not one.
             Action::OpenBackup(i) => {
                 let entry = self.state.backups[i].clone();
-                let parts = entry.held.as_ref().map_or([false; 4], |h| h.parts);
+                let mut parts = entry.held.as_ref().map_or([false; 5], |h| h.parts);
+                for (tick, can) in parts.iter_mut().zip(BACKUP_RESTORABLE) {
+                    *tick &= can;
+                }
                 self.state.restore = Some((entry, parts));
                 self.state.asking_delete = false;
                 self.open(Screen::RestoreBackup);
@@ -6202,6 +6213,12 @@ impl App {
                 Drag::Press { action: Some(a), .. } => {
                     if let Some(p) = &mut self.row_press {
                         p.lift(now);
+                    }
+                    // A key of the keyboard, or one of the editor's and the
+                    // terminal's own row, taps the motor as the system's own
+                    // keyboard does.
+                    if self.state.vibrate && matches!(a, Action::Type(_) | Action::TermKey(_)) {
+                        fx.push(Effect::Haptic);
                     }
                     fx.extend(self.act(a, now));
                 }
@@ -9495,33 +9512,33 @@ mod tests {
     fn a_backup_takes_what_is_ticked_to_where_it_is_sent() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Backup, &f, &i);
-        assert_eq!(app.state.backup, [true, true, false, true]);
+        assert_eq!(app.state.backup, [true, true, false, true, false]);
         assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "internal storage waits for the data partition");
         assert_eq!(app.deadline(0), Some(TOAST_MS), "and says so");
         // The owner's files open first; another user's still wait.
         app.data_waiting(Some((10, Keys::Digits)));
-        let first = Effect::Backup { parts: [true, true, false, true], place: Place::Storage, compress: false, verify: true };
+        let first = Effect::Backup { parts: [true, true, false, true, false], place: Place::Storage, compress: false, verify: true };
         assert_eq!(swipe(&mut app, &f, &i, Confirm::Backup), vec![first]);
         tap(&mut app, &f, &i, Action::BackupPart(2));
         assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "the data partition is backed up only with every user's files open");
         app.data_waiting(None);
         tap(&mut app, &f, &i, Action::BackupPart(0));
-        assert_eq!(app.state.backup, [false, true, true, true]);
+        assert_eq!(app.state.backup, [false, true, true, true, false]);
         tap(&mut app, &f, &i, Action::BackupTo(Place::UsbDrive));
         tap(&mut app, &f, &i, Action::Toggle(Switch::Compress));
         tap(&mut app, &f, &i, Action::Toggle(Switch::Verify));
         assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "no drive is plugged in");
         app.set_usb_drive(Some(UsbDrive::Shown));
-        let second = Effect::Backup { parts: [false, true, true, true], place: Place::UsbDrive, compress: true, verify: false };
+        let second = Effect::Backup { parts: [false, true, true, true, false], place: Place::UsbDrive, compress: true, verify: false };
         assert_eq!(swipe(&mut app, &f, &i, Confirm::Backup), vec![second]);
-        for k in 1..4 {
+        for k in 1..5 {
             tap(&mut app, &f, &i, Action::BackupPart(k));
         }
         assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "nothing ticked, nothing backed up");
     }
 
     /// A backup found in `place`, made at `made`, holding `parts`.
-    fn found(place: Place, made: i64, parts: [bool; 4]) -> BackupEntry {
+    fn found(place: Place, made: i64, parts: [bool; 5]) -> BackupEntry {
         let held = Held {
             made,
             size: 6_200_000_000,
@@ -9539,7 +9556,7 @@ mod tests {
         let mut app = App::new(Screen::Home, W, H, PPD);
         assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Restore)), vec![Effect::FindBackups { storage: false, usb: false }]);
         let unread = BackupEntry { place: Place::Storage, name: "20261021-150000".into(), held: Err("read backup.toml: not found".into()) };
-        let (old, new) = (found(Place::UsbDrive, 1_792_000_000, [true; 4]), found(Place::Storage, 1_792_348_260, [true; 4]));
+        let (old, new) = (found(Place::UsbDrive, 1_792_000_000, [true; 5]), found(Place::Storage, 1_792_348_260, [true; 5]));
         app.set_backups(vec![unread.clone(), old.clone(), new.clone()]);
         assert_eq!(app.state.backups, [new, old, unread]);
         let opens = app.frame(&f, &i).hits.iter().filter(|h| matches!(h.action, Action::OpenBackup(_))).count();
@@ -9551,19 +9568,19 @@ mod tests {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Restore, &f, &i);
         assert!(app.frame(&f, &i).hits.is_empty(), "nothing found, nothing to open");
-        app.set_backups(vec![found(Place::Storage, 1_792_348_260, [true, true, false, true])]);
+        app.set_backups(vec![found(Place::Storage, 1_792_348_260, [true, true, false, true, false])]);
         tap(&mut app, &f, &i, Action::OpenBackup(0));
         assert_eq!(app.screen(), Screen::RestoreBackup);
         let parts: Vec<Action> =
             app.frame(&f, &i).hits.iter().map(|h| h.action).filter(|a| matches!(a, Action::RestorePart(_))).collect();
         assert_eq!(parts, [Action::RestorePart(0), Action::RestorePart(1), Action::RestorePart(3)], "only what the backup holds");
         tap(&mut app, &f, &i, Action::RestorePart(1));
-        assert_eq!(app.state.restore.as_ref().map(|r| r.1), Some([true, false, false, true]));
+        assert_eq!(app.state.restore.as_ref().map(|r| r.1), Some([true, false, false, true, false]));
         let name = fmt::stamp(1_792_348_260, 0);
         assert_eq!(swipe(&mut app, &f, &i, Confirm::Restore), vec![Effect::Restore {
             place: Place::Storage,
             name: name.clone(),
-            parts: [true, false, false, true]
+            parts: [true, false, false, true, false]
         }]);
         for k in [0, 3] {
             tap(&mut app, &f, &i, Action::RestorePart(k));
@@ -9577,20 +9594,20 @@ mod tests {
     fn a_data_backup_is_restored_only_with_every_users_files_open() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Restore, &f, &i);
-        app.set_backups(vec![found(Place::Storage, 1_792_348_260, [false, false, true, false])]);
+        app.set_backups(vec![found(Place::Storage, 1_792_348_260, [false, false, true, false, false])]);
         tap(&mut app, &f, &i, Action::OpenBackup(0));
         assert!(swipe(&mut app, &f, &i, Confirm::Restore).is_empty());
         assert_eq!(app.deadline(0), Some(TOAST_MS), "the page says to decrypt first");
         app.data_waiting(None);
         let fx = swipe(&mut app, &f, &i, Confirm::Restore);
-        assert!(matches!(&fx[..], [Effect::Restore { parts: [false, false, true, false], .. }]), "{fx:?}");
+        assert!(matches!(&fx[..], [Effect::Restore { parts: [false, false, true, false, false], .. }]), "{fx:?}");
     }
 
     #[test]
     fn a_backup_made_on_another_phone_is_not_restored_here() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Restore, &f, &i);
-        let mut other = found(Place::Storage, 1_792_348_260, [true; 4]);
+        let mut other = found(Place::Storage, 1_792_348_260, [true; 5]);
         other.held.as_mut().unwrap().device = "aurora".into();
         let unread = BackupEntry { place: Place::Storage, name: "20261021-150000".into(), held: Err("read backup.toml: not found".into()) };
         app.set_backups(vec![other, unread]);
@@ -9607,7 +9624,7 @@ mod tests {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Restore, &f, &i);
         app.data_waiting(None);
-        let entry = found(Place::Storage, 1_792_348_260, [true; 4]);
+        let entry = found(Place::Storage, 1_792_348_260, [true; 5]);
         app.set_backups(vec![entry.clone()]);
         tap(&mut app, &f, &i, Action::OpenBackup(0));
         assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::Confirm(Confirm::DeleteBackup)), "asked for first");
@@ -9625,7 +9642,7 @@ mod tests {
         let mut app = App::new(Screen::Home, W, H, PPD);
         app.set_usb_drive(Some(UsbDrive::Shown));
         assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Restore)), vec![Effect::FindBackups { storage: false, usb: true }]);
-        app.set_backups(vec![found(Place::UsbDrive, 1_792_348_260, [true; 4])]);
+        app.set_backups(vec![found(Place::UsbDrive, 1_792_348_260, [true; 5])]);
         tap(&mut app, &f, &i, Action::OpenBackup(0));
         assert_eq!(app.set_usb_drive(None), vec![Effect::FindBackups { storage: false, usb: false }]);
         assert_eq!((app.screen(), app.state.restore.clone()), (Screen::Restore, None));
@@ -9655,7 +9672,7 @@ mod tests {
     fn a_restore_checks_its_backup_first_and_goes_on_to_its_end_once_writing() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Restore, &f, &i);
-        app.set_backups(vec![found(Place::Storage, 1_792_348_260, [true; 4])]);
+        app.set_backups(vec![found(Place::Storage, 1_792_348_260, [true; 5])]);
         tap(&mut app, &f, &i, Action::OpenBackup(0));
         app.backup_started(true, Place::Storage, true);
         app.backup_plan(vec![("boot".into(), 200), ("data".into(), 800)]);
@@ -9863,6 +9880,17 @@ mod tests {
     }
 
     #[test]
+    fn a_key_taps_the_motor_and_a_list_row_does_not() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Search, &f, &i);
+        assert_eq!(tap(&mut app, &f, &i, Action::Type(Cap::Char('b'))), vec![Effect::Haptic]);
+        app.state.vibrate = false;
+        assert!(tap(&mut app, &f, &i, Action::Type(Cap::Char('c'))).is_empty(), "turned off, a key is not felt");
+        let mut rows = opened(Screen::Backup, &f, &i);
+        assert!(tap(&mut rows, &f, &i, Action::BackupTo(Place::UsbDrive)).is_empty(), "a row is not a key");
+    }
+
+    #[test]
     fn the_terminal_sends_every_key_to_its_shell() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Settings, W, H, PPD);
@@ -9870,6 +9898,9 @@ mod tests {
         let (rows, cols) = app.term_size(&f);
         assert!(rows >= 20 && cols >= 40, "a screen of {rows} rows by {cols}");
         app.term_started(rows, cols);
+        // The motor's tap on a key is told apart on its own; here it would
+        // only sit in front of what the shell is sent.
+        app.state.vibrate = false;
         assert_eq!(tap(&mut app, &f, &i, Action::Type(Cap::Char('l'))), vec![Effect::TermInput(b"l".to_vec())]);
         assert_eq!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)), vec![Effect::TermInput(b"\r".to_vec())]);
         assert!(tap(&mut app, &f, &i, Action::TermKey(TermKey::Ctrl)).is_empty());

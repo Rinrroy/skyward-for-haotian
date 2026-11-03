@@ -892,7 +892,7 @@ pub fn file_line(l: Lang, f: &FileRow, now: i64, zone: usize) -> String {
 }
 
 /// The parts a backup holds: `启动分区、系统分区`.
-pub fn parts(l: Lang, held: &[bool; 4]) -> String {
+pub fn parts(l: Lang, held: &[bool; 5]) -> String {
     list(l, BACKUP_PARTS.iter().zip(held).filter(|(_, &on)| on).map(|(name, _)| l.pick(*name)))
 }
 
@@ -1660,9 +1660,9 @@ mod tests {
 
     #[test]
     fn a_backup_lists_its_parts() {
-        assert_eq!(parts(HANS, &[true, true, false, true]), "启动分区、系统分区、基带与 EFS");
-        assert_eq!(parts(Lang::Hant, &[true, true, false, true]), "啟動分割區、系統分割區、基頻與 EFS");
-        assert_eq!(parts(Lang::En, &[true, true, true, true]), "Boot partitions, system partitions, data partition, modem and EFS");
+        assert_eq!(parts(HANS, &[true, true, false, true, false]), "启动分区、系统分区、基带与 EFS");
+        assert_eq!(parts(Lang::Hant, &[true, true, false, true, false]), "啟動分割區、系統分割區、基頻與 EFS");
+        assert_eq!(parts(Lang::En, &[true, true, true, true, false]), "Boot partitions, system partitions, data partition, modem and EFS");
     }
 
     #[test]

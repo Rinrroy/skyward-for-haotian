@@ -34,10 +34,20 @@ pub enum Part {
     /// The baseband's settings with the phone's own identity, and the
     /// sensors' calibration.
     Efs,
+    /// The partitions the bootloader chain lives in, both slots: kept as
+    /// they were at a moment that worked, and never written back. Putting
+    /// one back needs fastboot or an EDL tool, where a mistake is not
+    /// something a recovery can undo.
+    Firmware,
 }
 
 impl Part {
-    pub const ALL: [Part; 4] = [Part::Boot, Part::System, Part::Data, Part::Efs];
+    pub const ALL: [Part; 5] = [Part::Boot, Part::System, Part::Data, Part::Efs, Part::Firmware];
+
+    /// Whether a backup of it can be written back from here.
+    pub fn restorable(self) -> bool {
+        self != Part::Firmware
+    }
 }
 
 /// What a backup holds.
@@ -90,7 +100,7 @@ impl Manifest {
     }
 
     /// Which of [`Part::ALL`] it holds.
-    pub fn parts(&self) -> [bool; 4] {
+    pub fn parts(&self) -> [bool; 5] {
         Part::ALL.map(|p| self.items.iter().any(|i| i.part == p))
     }
 
