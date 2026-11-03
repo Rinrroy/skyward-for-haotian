@@ -1885,46 +1885,61 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
                 );
                 widgets::footnote(&mut c, t, f, y, &note)
             } else {
-                let y = widgets::section(&mut c, t, f, y, l.pick(["恢复内容", "還原內容", "Contents"]));
                 let kept: Vec<usize> = (0..BACKUP_PARTS.len()).filter(|&k| held.parts[k] && BACKUP_RESTORABLE[k]).collect();
-                let rows: Vec<Row> = kept.iter().map(|&k| Row::new(l.pick(BACKUP_PARTS[k])).trail(Trail::Check(chosen[k]))).collect();
-                let list = widgets::list(&mut c, t, f, y, &rows);
-                out.extend(list.rows.iter().zip(&kept).map(|(&rect, &k)| Hit { rect, action: Action::RestorePart(k) }));
-                let note = l.pick(["恢复后，所选内容的现有数据将被备份覆盖。", "還原後，所選內容的現有資料將被備份覆寫。", "Restoring writes the backup over what the parts chosen hold now."]);
-                let mut y = widgets::footnote(&mut c, t, f, list.bottom, note);
-                if held.parts[4] {
+                // A backup of the bootloader chain and nothing else has
+                // nothing to put back, so the page says what it is for
+                // rather than offering a slide that would write nothing.
+                if kept.is_empty() {
+                    // A backup of the bootloader chain and nothing else has
+                    // nothing to put back, so the page says what it is for
+                    // rather than offering a slide that would write nothing.
                     let note = l.pick([
-                        "这份备份里还有 bootloader 链（xbl、abl、tz 等 46 个分区）。它只作留存：写回需要 fastboot 或 EDL 工具，Skyward 不会写。",
-                        "這份備份裡還有 bootloader 鏈（xbl、abl、tz 等 46 個分割區）。它只作留存：寫回需要 fastboot 或 EDL 工具，Skyward 不會寫。",
-                        "This backup also holds the bootloader chain, 46 partitions such as xbl, abl and tz. They are kept only: putting one back needs fastboot or an EDL tool, and nothing here writes them.",
+                        "这份备份只含 bootloader 链，它只作留存，不能写回。写回那些分区需要 fastboot 或 EDL 工具。",
+                        "這份備份只含 bootloader 鏈，它只作留存，不能寫回。寫回那些分割區需要 fastboot 或 EDL 工具。",
+                        "This backup holds the bootloader chain alone, which is kept and never written back. Putting one of those partitions back needs fastboot or an EDL tool.",
                     ]);
-                    y = widgets::footnote(&mut c, t, f, y, note);
-                }
-                if chosen[2] {
-                    let note = l.pick([
-                        "data 分区将恢复应用、账户和设置，内部存储、锁屏密码和指纹保持不变。恢复出厂设置后，无法再恢复此前的 data 分区备份。",
-                        "data 分割區將還原應用程式、帳戶和設定，內部儲存空間、螢幕鎖定密碼和指紋保持不變。恢復原廠設定後，無法再還原此前的 data 分割區備份。",
-                        "The data partition gets its apps, accounts and settings back, and internal storage, the screen lock and fingerprints stay as they are. After a factory reset, an earlier backup of the data partition can't be restored.",
-                    ]);
-                    y = widgets::footnote(&mut c, t, f, y, note);
-                }
-                // The boot partitions' vbmeta checks the system's: one of
-                // another version without the other may not start.
-                if let (Some(was), Some(now)) = (&held.system, &i.os_version) {
-                    if was != now && chosen[0] != chosen[1] {
-                        let warn = tr!(
-                            l,
-                            "该备份来自 {was}，本机当前为 {now}。仅恢复启动分区或系统分区中的一项，可能导致无法开机。",
-                            "這份備份來自 {was}，本機目前為 {now}。僅還原啟動分割區或系統分割區中的一項，可能導致無法開機。",
-                            "This backup is from {was}, and this phone runs {now}. Restoring only one of the boot and system partitions may keep the phone from starting."
-                        );
-                        y = widgets::footnote(&mut c, t, f, y, &warn);
+                    widgets::footnote(&mut c, t, f, y, note)
+                } else {
+                    let y = widgets::section(&mut c, t, f, y, l.pick(["恢复内容", "還原內容", "Contents"]));
+                    let rows: Vec<Row> = kept.iter().map(|&k| Row::new(l.pick(BACKUP_PARTS[k])).trail(Trail::Check(chosen[k]))).collect();
+                    let list = widgets::list(&mut c, t, f, y, &rows);
+                    out.extend(list.rows.iter().zip(&kept).map(|(&rect, &k)| Hit { rect, action: Action::RestorePart(k) }));
+                    let note = l.pick(["恢复后，所选内容的现有数据将被备份覆盖。", "還原後，所選內容的現有資料將被備份覆寫。", "Restoring writes the backup over what the parts chosen hold now."]);
+                    let mut y = widgets::footnote(&mut c, t, f, list.bottom, note);
+                    if held.parts[4] {
+                        let note = l.pick([
+                            "这份备份里还有 bootloader 链（xbl、abl、tz 等 46 个分区）。它只作留存：写回需要 fastboot 或 EDL 工具，Skyward 不会写。",
+                            "這份備份裡還有 bootloader 鏈（xbl、abl、tz 等 46 個分割區）。它只作留存：寫回需要 fastboot 或 EDL 工具，Skyward 不會寫。",
+                            "This backup also holds the bootloader chain, 46 partitions such as xbl, abl and tz. They are kept only: putting one back needs fastboot or an EDL tool, and nothing here writes them.",
+                        ]);
+                        y = widgets::footnote(&mut c, t, f, y, note);
                     }
+                    if chosen[2] {
+                        let note = l.pick([
+                            "data 分区将恢复应用、账户和设置，内部存储、锁屏密码和指纹保持不变。恢复出厂设置后，无法再恢复此前的 data 分区备份。",
+                            "data 分割區將還原應用程式、帳戶和設定，內部儲存空間、螢幕鎖定密碼和指紋保持不變。恢復原廠設定後，無法再還原此前的 data 分割區備份。",
+                            "The data partition gets its apps, accounts and settings back, and internal storage, the screen lock and fingerprints stay as they are. After a factory reset, an earlier backup of the data partition can't be restored.",
+                        ]);
+                        y = widgets::footnote(&mut c, t, f, y, note);
+                    }
+                    // The boot partitions' vbmeta checks the system's: one of
+                    // another version without the other may not start.
+                    if let (Some(was), Some(now)) = (&held.system, &i.os_version) {
+                        if was != now && chosen[0] != chosen[1] {
+                            let warn = tr!(
+                                l,
+                                "该备份来自 {was}，本机当前为 {now}。仅恢复启动分区或系统分区中的一项，可能导致无法开机。",
+                                "這份備份來自 {was}，本機目前為 {now}。僅還原啟動分割區或系統分割區中的一項，可能導致無法開機。",
+                                "This backup is from {was}, and this phone runs {now}. Restoring only one of the boot and system partitions may keep the phone from starting."
+                            );
+                            y = widgets::footnote(&mut c, t, f, y, &warn);
+                        }
+                    }
+                    let (label, danger) = confirm_label(Confirm::Restore, cx.state);
+                    let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
+                    out.push(Hit { rect: track, action: Action::Confirm(Confirm::Restore) });
+                    track.y + track.h
                 }
-                let (label, danger) = confirm_label(Confirm::Restore, cx.state);
-                let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
-                out.push(Hit { rect: track, action: Action::Confirm(Confirm::Restore) });
-                track.y + track.h
             }
         }
     };

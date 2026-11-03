@@ -374,7 +374,7 @@ fn main() -> Result<()> {
     let adding = |app: &mut App, name: &str, security: Security, field: Field, choosing: bool| {
         app.state.adding = Some(Adding { name: name.into(), security, field, choosing });
     };
-    let pages: [PageShot; 164] = [
+    let pages: [PageShot; 165] = [
         ("11-install-light-locked", Screen::Install, false, &|app| {
             app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false };
         }),
@@ -487,6 +487,18 @@ fn main() -> Result<()> {
         }),
         ("48-restore-backup-light-unreadable", Screen::RestoreBackup, false, &|app| {
             app.state.restore = Some((backups[2].clone(), [false; 5]));
+        }),
+        ("48-restore-backup-light-chain-only", Screen::RestoreBackup, false, &|app| {
+            let held = Held {
+                made: 1_792_372_070,
+                size: 230_162_432,
+                parts: [false, false, false, false, true],
+                device: cfg.device.codename.clone(),
+                system: Some("OS3.0.308.0.WNACNXM".into()),
+                slot: Some(Slot::B),
+            };
+            let entry = BackupEntry { place: Place::Storage, name: "20261103-234430".into(), held: Ok(held) };
+            app.state.restore = Some((entry, [false; 5]));
         }),
         ("100-backup-job-light-measuring", Screen::BackupJob, false, &|app| app.state.backup_job = job(false, Vec::new(), None, None)),
         ("101-backup-job-light", Screen::BackupJob, false, &|app| {
