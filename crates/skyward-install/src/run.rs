@@ -59,6 +59,9 @@ const TOOLS: &str = "/sbin";
 /// Where the stand-in for 7-Zip goes when a package carries none.
 const SEVEN_ZIP: &str = "/sbin/7za";
 
+/// Where the answer to `getVolumeKey` goes.
+const VOLUME_KEY: &str = "/sbin/getVolumeKey";
+
 /// The largest file taken out of a package's `bin/`, so a package cannot
 /// fill the recovery's memory with what it calls a tool.
 const TOOL_LIMIT: u64 = 64 << 20;
@@ -819,6 +822,7 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
     extract_script()?;
     extract_tools()?;
     shim_7za()?;
+    shim_volume_key()?;
     shell_at_sbin()?;
     let kept = hold(ctx, slot)?;
     detach_for_script(ctx, slot)?;
@@ -918,6 +922,31 @@ fn extract_tools() -> Result<()> {
     Ok(())
 }
 
+/// Put the answer to `getVolumeKey` where a package's script looks for it.
+///
+/// TWRP hands its scripts a shell function of that name, and packages
+/// written for it ask "press + to go on" through it. This recovery has no
+/// such function, so the phone's own buttons answer: volume up is yes,
+/// volume down is no, and no key at all is no — a package that asks and is
+/// not answered does not go on to write.
+fn shim_volume_key() -> Result<()> {
+    let at = Path::new(VOLUME_KEY);
+    match fs::symlink_metadata(at) {
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("look at {VOLUME_KEY}")),
+    }
+    fs::create_dir_all(TOOLS).with_context(|| format!("make {TOOLS}"))?;
+    let script = r#"#!/system/bin/sh
+# What a package asks through TWRP's getVolumeKey: 0 for volume up, 1 for
+# volume down, 2 when neither came in time.
+exec /system/bin/recovery volume-key 60
+"#;
+    fs::write(at, script).with_context(|| format!("write {VOLUME_KEY}"))?;
+    fs::set_permissions(at, fs::Permissions::from_mode(0o755)).with_context(|| format!("make {VOLUME_KEY} runnable"))?;
+    Ok(())
+}
+
 /// Put a stand-in for 7-Zip where a package's script looks for it.
 ///
 /// The packages that write whole partitions open their super image with
@@ -946,7 +975,10 @@ if [ "$2" != -so ] || [ "$#" -ne 4 ]; then
     echo "7za: only 'e -so <zip> <entry>' is served here, not '$*'" >&2
     exit 2
 fi
-echo "skyward: 7za $1 -so $3 $4 was answered by unzip -p" > /dev/kmsg 2>/dev/null
+echo "skyward: 7za $1 -so $3 $4 was answered by this recovery's own reader" > /dev/kmsg 2>/dev/null
+if [ -x /system/bin/recovery ]; then
+    exec /system/bin/recovery unzip "$3" "$4"
+fi
 exec unzip -p "$3" "$4"
 "#;
     fs::write(at, script).with_context(|| format!("write {SEVEN_ZIP}"))?;

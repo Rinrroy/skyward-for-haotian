@@ -280,3 +280,30 @@ metadata_encryption=aes-256-xts:wrappedkey_v0
 **两份包内置的 recovery**：Durex 里是 **TWRP**（`system/bin/twrp`，3,964 个条目、无 `skyward/device.toml`）；LittleYue 里是 **我们的 v37**（`recovery.img` 与 `v37/skyward-aurora-v37-OS3.0.308.0.WNACNXM.img` 逐字节相同，配置与当前只差 rfkill 链与 `[backup] efs`）。
 
 **由此排除的假设**：加密方案不同、vndk apex 缺失、HAL 名称/实例不符、属性不存在、配置里的二进制路径写错。剩下仍站得住的只有两条：旧版 rfkill 链，以及刷错槽位（两台机器都是 `_a`，见 §14）。
+
+## 16. 4 GB 那条线：`unzip` 能读目录，却流不出内容
+
+用 4.5 GiB 的条目录过一遍才发现：ramdisk 里的 `unzip`（指向 `ziptool`）能列出 `4831838208` 这个长度，但 `unzip -p` 立刻失败：
+
+```
+unzip: failed to extract payload/big.bin: Zlib error
+    0m00.15s real
+```
+
+0.15 秒就退出，说明它拿到的是截断到 32 位的长度，根本没有开始解压。
+
+这条恰好卡在两个第三方包的命门上：它们最后一步是
+
+```sh
+7za e -so "$ZIPFILE" "images/super.img.zst" | /tmp/bin/zstd -c -d > /dev/block/bootdevice/by-name/super
+```
+
+A14 是 5.9 GB、A17 是 7.1 GB，都在这条线之外。所以 7za 替身不能接 `unzip -p`，要接自己的读取器：
+
+```sh
+exec /system/bin/recovery unzip "$3" "$4"
+```
+
+`recovery unzip` 走的是安装器同一个 zip 库，逐块拷贝到标准输出，不落内存。实测 4.5 GiB 用 10.6 秒，输出字节数一字不差。
+
+**教训**：工具“存在”不等于“能用在需要的量级上”。列得出名字、读得出长度，都不代表能把它交出来；大文件这条路径要单独验一次，而验它只要造一个全零的大条目（压缩后 21 MB）。

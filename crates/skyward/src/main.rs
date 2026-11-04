@@ -86,6 +86,24 @@ enum Cmd {
     /// Reboot through init: system, recovery, fastboot, bootloader, edl, or
     /// off.
     Reboot { target: String },
+    /// Write one entry of a zip to standard output, byte for byte, as
+    /// `unzip -p` does — for the entries that tool cannot stream, which is
+    /// anything past four gigabytes: the super image of a package that
+    /// writes whole partitions.
+    Unzip {
+        /// The zip to read.
+        zip: String,
+        /// The entry in it.
+        entry: String,
+    },
+    /// Wait for a volume key, and answer with the exit status: 0 for volume
+    /// up, 1 for volume down, 2 when neither came in time. What a package's
+    /// install script asks through the `getVolumeKey` TWRP gives it.
+    VolumeKey {
+        /// How long to wait, in seconds.
+        #[arg(default_value = "30")]
+        seconds: u64,
+    },
     /// Print or change the flags of the phone's vbmeta blocks: what says
     /// whether the bootloader and the kernel check what they start.
     Avb {
@@ -264,6 +282,8 @@ fn main() -> Result<()> {
             let p = Power::parse(&target).ok_or_else(|| anyhow!("unknown target {target:?}"))?;
             skyward_sys::power(p)
         }
+        Cmd::Unzip { zip, entry } => unzip_entry(&zip, &entry),
+        Cmd::VolumeKey { seconds } => volume_key(seconds),
         Cmd::Avb { action } => avb(action),
         Cmd::Bcb { clear } => {
             let misc = bcb::misc();
@@ -897,6 +917,123 @@ fn prepare(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
         Err(e) => skyward_sys::kmsg(&format!("partitions not mounted: {e:#}"))?,
     }
     Ok(())
+}
+
+/// Write one entry of `zip` to standard output, byte for byte.
+///
+/// A package that writes whole partitions opens its super image with
+/// `7za e -so`, which answers with the entry's bytes; the zip tool this
+/// recovery carries reads such an entry's name but cannot stream its
+/// contents past four gigabytes, and says only "Zlib error". This reads it
+/// the way the installer reads a package — the zip library — and writes it
+/// straight out, so an image of any size goes through without landing in
+/// memory first.
+fn unzip_entry(zip: &str, entry: &str) -> Result<()> {
+    use std::io::{BufReader, Write};
+    let file = std::fs::File::open(zip).with_context(|| format!("open {zip}"))?;
+    let mut archive = zip::ZipArchive::new(BufReader::new(file)).with_context(|| format!("read the directory of {zip}"))?;
+    let mut item = archive.by_name(entry).with_context(|| format!("{entry} in {zip}"))?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    std::io::copy(&mut item, &mut out).with_context(|| format!("write {entry} out"))?;
+    out.flush().context("flush what was written")?;
+    Ok(())
+}
+
+/// Wait for a volume key and answer with the exit status a package's install
+/// script reads: 0 for volume up, 1 for volume down, 2 when neither came in
+/// time. Silence is a no: a package that asks for a key and gets none does
+/// not go on to write.
+#[cfg(target_os = "android")]
+fn volume_key(seconds: u64) -> Result<()> {
+    use evdev::{raw_stream::RawDevice, EventSummary, KeyCode};
+    use std::collections::HashSet;
+    use std::io::ErrorKind;
+    use std::os::fd::AsRawFd;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    /// The devices under /dev/input that report a volume key, taking in any
+    /// that have appeared since the last look: a button's driver may load
+    /// after the recovery starts, and the wait must not be blind to it.
+    fn scan(devices: &mut Vec<RawDevice>, seen: &mut HashSet<PathBuf>) -> Result<()> {
+        for (path, dev) in evdev::raw_stream::enumerate() {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let wanted = dev
+                .supported_keys()
+                .is_some_and(|k| k.contains(KeyCode::KEY_VOLUMEUP) || k.contains(KeyCode::KEY_VOLUMEDOWN));
+            if !wanted {
+                continue;
+            }
+            let fd = dev.as_raw_fd();
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+                let e = std::io::Error::last_os_error();
+                skyward_sys::kmsg(&format!("volume keys: {} cannot be watched: {e}", path.display()))?;
+                continue;
+            }
+            devices.push(dev);
+        }
+        Ok(())
+    }
+
+    let mut devices: Vec<RawDevice> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    scan(&mut devices, &mut seen)?;
+    let mut looked = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < deadline {
+        if looked.elapsed() >= Duration::from_secs(1) {
+            let before = devices.len();
+            scan(&mut devices, &mut seen)?;
+            if devices.len() != before {
+                skyward_sys::kmsg(&format!("volume keys: {} device(s) now watched", devices.len()))?;
+            }
+            looked = Instant::now();
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let wait = left.as_millis().min(200) as i32;
+        let mut fds: Vec<libc::pollfd> =
+            devices.iter().map(|d| libc::pollfd { fd: d.as_raw_fd(), events: libc::POLLIN, revents: 0 }).collect();
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, wait) };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e).context("wait for a volume key");
+        }
+        if rc == 0 {
+            continue;
+        }
+        for (i, dev) in devices.iter_mut().enumerate() {
+            if fds[i].revents & libc::POLLIN == 0 {
+                continue;
+            }
+            let Ok(events) = dev.fetch_events() else { continue };
+            for e in events {
+                if let EventSummary::Key(_, code, 1) = e.destructure() {
+                    match code {
+                        KeyCode::KEY_VOLUMEUP => return Ok(()),
+                        KeyCode::KEY_VOLUMEDOWN => std::process::exit(1),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    skyward_sys::kmsg(&format!("volume keys: none was pressed in {seconds}s, {} device(s) watched", devices.len()))?;
+    std::process::exit(2)
+}
+
+#[cfg(not(target_os = "android"))]
+fn volume_key(_seconds: u64) -> Result<()> {
+    anyhow::bail!("this host has no volume keys")
 }
 
 fn info(config: &str) -> Result<()> {
