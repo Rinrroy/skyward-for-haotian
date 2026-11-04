@@ -260,3 +260,23 @@ mount --bind $V/rfkill.ko /system_dlkm/flatten/lib/modules/rfkill.ko
 - 确认刷进去了：`adb shell "/system/bin/recovery info --config /skyward/device.toml" | grep recovery`，版本号应与镜像一致；拆开 rfkill 之后的构建，日志里 `ran /system/bin/sh` 至少两条，拆之前是零条。
 
 这条已写进两个 README 的安装段。
+
+## 15. 两份第三方 ROM 包给出的答案（Durex OS1.0.15 / LittleYue 2.1.0.5）
+
+**加密参数一致，可以排除「方案不兼容」。** Durex（A14）的 `/vendor/etc/fstab.qcom` 中 `/data` 一行与 OS3.0.308.0 上我们自己的逐字相同：
+
+```
+fileencryption=aes-256-xts:aes-256-cts:v2+inlinecrypt_optimized+wrappedkey_v0,
+keydirectory=/metadata/vold/metadata_encryption,
+metadata_encryption=aes-256-xts:wrappedkey_v0
+```
+
+**system_dlkm 有模块、没有 flatten。** `lib/modules/6.1.57-android14-11-g301ae5a84ab6-mioki/kernel/net/rfkill/` 存在，而整个分区没有 `flatten/` 目录。旧版那条 `mount --bind … /system_dlkm/flatten/…` 在这台机器上必然 ENOENT，整条 `&&` 链失败——这一条不再是推断。
+
+**HAL 与二进制都在，名字也对得上。** `/vendor/bin/hw/` 有 `android.hardware.security.keymint-service-qti`（45 KB）、`…gatekeeper-service-qti`、`…weaver-service.nxp`；vintf 片段声明 keymint v3 + sharedsecret + secureclock，`manifest_pineapple.xml` 声明 `android.hardware.gatekeeper/IGatekeeper/default`，weaver v2 片段与中转包写出的 `/kmlibs/weaver.xml` 完全一致。`qseecomd` 里确有 `vendor.sys.listeners.registered`。
+
+**weaver 的真身**：`/vendor/bin/hw/android.hardware.weaver-service-nxp`，`user vendor_nxp_weaver`，`group system drmrpc`——本仓库从未启动它，用户 999 解不开的原因就在这里。
+
+**两份包内置的 recovery**：Durex 里是 **TWRP**（`system/bin/twrp`，3,964 个条目、无 `skyward/device.toml`）；LittleYue 里是 **我们的 v37**（`recovery.img` 与 `v37/skyward-aurora-v37-OS3.0.308.0.WNACNXM.img` 逐字节相同，配置与当前只差 rfkill 链与 `[backup] efs`）。
+
+**由此排除的假设**：加密方案不同、vndk apex 缺失、HAL 名称/实例不符、属性不存在、配置里的二进制路径写错。剩下仍站得住的只有两条：旧版 rfkill 链，以及刷错槽位（两台机器都是 `_a`，见 §14）。
