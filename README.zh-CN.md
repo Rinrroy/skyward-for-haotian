@@ -46,6 +46,22 @@ fastboot flash recovery skyward-aurora-v37-OS3.0.308.0.WNACNXM.img
 fastboot reboot recovery
 ```
 
+这里的 `recovery` 指手机当前启动槽位的那个分区。手机有 `recovery_a` 和 `recovery_b`，刷进不启动的那个分区，**什么都不会变**：命令照样报成功，手机启动的还是原来的东西。所以先问清楚槽位，两者不同时把分区名写全：
+
+```sh
+fastboot getvar current-slot                    # 打印 _a 或 _b
+fastboot flash recovery_a <镜像>                # 用上面打印出来的那个字母
+fastboot reboot recovery
+```
+
+要确认手机跑的确实是刚刷进去的那一份，问手机而不是问电脑：
+
+```sh
+adb shell "/system/bin/recovery info --config /skyward/device.toml" | grep recovery
+```
+
+它打印的版本号是构建自己的，和「关于」页上的是同一个。如果还是旧号，说明刷错了槽。
+
 之后可以在 Skyward 自己的“安装”页面安装解压出来的新版镜像。打开 **自动重新刷入 Skyward** 之后，系统更新或者刷机包覆盖 recovery 分区的时候，Skyward 会重新刷回这些分区。
 
 super 中没有系统的时候，Skyward 仍然可以启动：屏幕和按键、adb、`adb sideload` 和 fastbootd 都能使用，足够装回一个系统。触摸、WLAN 和解密依赖已安装系统中的程序，系统装回之后随之恢复。

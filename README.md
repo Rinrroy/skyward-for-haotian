@@ -58,6 +58,28 @@ fastboot flash recovery skyward-aurora-v37-OS3.0.308.0.WNACNXM.img
 fastboot reboot recovery
 ```
 
+`recovery` here is the partition of the slot the phone starts from. A phone on
+the `_a` slot has `recovery_a` and `recovery_b`, and writing the one it does not
+start from changes nothing that boots: the flash is reported as done, and the
+phone still runs what was there before. So say which slot it is, and name the
+partition where the two differ:
+
+```sh
+fastboot getvar current-slot                    # prints _a or _b
+fastboot flash recovery_a <image>               # the letter it printed
+fastboot reboot recovery
+```
+
+To see that the phone runs what was just flashed, ask the phone rather than the
+computer:
+
+```sh
+adb shell "/system/bin/recovery info --config /skyward/device.toml" | grep recovery
+```
+
+The number it prints is the build's own, and the same number is on the About
+page. A phone that still answers with the old one was flashed in the wrong slot.
+
 Afterwards a newer image, unzipped, installs from Skyward's own Install page. With
 **Flash Skyward again** on, a system update or zip that writes over the recovery
 partitions gets Skyward back in them.

@@ -250,3 +250,13 @@ mount --bind $V/rfkill.ko /system_dlkm/flatten/lib/modules/rfkill.ko
 同目录还会写一份 `RESTORE.txt`，写明每个文件是什么、怎么用 `dd` 或 `fastboot` 写回。手机起不来时人是读不到这个页面的，所以说明必须跟副本放在一起。
 
 拷贝大小可忽略：三个 vbmeta 块各一份，合计约 24 KB。
+
+## 14. 刷错槽位不会报错，只会什么都不发生
+
+两台来反馈的机器（A14 的 Durex OS、A17 的 LittleYue）活动槽都是 **`_a`**，而给用户的说明一律写 `fastboot flash recovery_b`。命令返回 `OKAY`，`reboot recovery` 起来的却是 `recovery_a` 里的旧版本——于是「刷了新版还是老问题」，白白排查了一整轮。
+
+- 问槽位：`fastboot getvar current-slot`
+- 刷对分区：`fastboot flash recovery_a`（或 `_b`，用上面打印的字母）
+- 确认刷进去了：`adb shell "/system/bin/recovery info --config /skyward/device.toml" | grep recovery`，版本号应与镜像一致；拆开 rfkill 之后的构建，日志里 `ran /system/bin/sh` 至少两条，拆之前是零条。
+
+这条已写进两个 README 的安装段。
