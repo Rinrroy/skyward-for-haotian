@@ -15,12 +15,24 @@ load = ["synaptics_tcm2"]
 [touch]
 writes = [{ path = "/sys/class/touch/touch_dev/enable_touch_raw", value = "0" }]
 # Stage the shared libraries the key services ask for that the recovery's
-# own library folder does not carry, out of the installed system's, and lay
-# the signed rfkill of the running kernel over the flattened copy, whose
-# signature the kernel does not take.
+# own library folder does not carry. Nothing here may fail for a reason of
+# the WLAN's: a step that goes wrong takes every service after it with it,
+# and the key service is what the data partition opens with.
 [[service]]
 path = "/system/bin/sh"
-args = ["-c", "mkdir -p /kmlibs && cp /mnt/system/system/lib64/libhardware.so /mnt/system/system/lib64/libvndksupport.so /mnt/system/system/lib64/libnetutils.so /mnt/system/system/lib64/bootstrap/libdl_android.so /kmlibs/ && printf '[recovery]\\nnamespace.default.isolated = false\\n' > /kmlibs/ld.config.txt && printf '<manifest version=\"1.0\" type=\"device\"><hal format=\"aidl\"><name>android.hardware.weaver</name><version>2</version><fqname>IWeaver/default</fqname></hal></manifest>' > /kmlibs/weaver.xml && printf '#!/system/bin/sh\\nexport LD_CONFIG_FILE=/kmlibs/ld.config.txt\\nexec \"$@\"\\n' > /kmlibs/km.sh && chmod 755 /kmlibs/km.sh && V=$(ls -d /system_dlkm/lib/modules/*/kernel/net/rfkill 2>/dev/null | head -1) && mount --bind $V/rfkill.ko /system_dlkm/flatten/lib/modules/rfkill.ko"]
+args = ["-c", "mkdir -p /kmlibs && cp /mnt/system/system/lib64/libhardware.so /mnt/system/system/lib64/libvndksupport.so /mnt/system/system/lib64/libnetutils.so /mnt/system/system/lib64/bootstrap/libdl_android.so /kmlibs/ && printf '[recovery]\\nnamespace.default.isolated = false\\n' > /kmlibs/ld.config.txt && printf '<manifest version=\"1.0\" type=\"device\"><hal format=\"aidl\"><name>android.hardware.weaver</name><version>2</version><fqname>IWeaver/default</fqname></hal></manifest>' > /kmlibs/weaver.xml && printf '#!/system/bin/sh\\nexport LD_CONFIG_FILE=/kmlibs/ld.config.txt\\nexec \"$@\"\\n' > /kmlibs/km.sh && chmod 755 /kmlibs/km.sh"]
+oneshot = true
+user = "root"
+groups = ["root"]
+
+# Lay the signed rfkill of the running kernel over the flattened copy, whose
+# signature the kernel does not take. The WLAN is what loads it, so a phone
+# that keeps the module elsewhere, or flattens it differently, loses the
+# WLAN and not the key services: this says what it could not find and steps
+# aside rather than failing.
+[[service]]
+path = "/system/bin/sh"
+args = ["-c", "V=$(ls -d /system_dlkm/lib/modules/*/kernel/net/rfkill 2>/dev/null | head -1); T=/system_dlkm/flatten/lib/modules/rfkill.ko; [ -n \"$V\" ] || { echo \"no rfkill.ko under /system_dlkm/lib/modules\"; exit 0; }; [ -f \"$T\" ] || { echo \"no flattened copy at $T\"; exit 0; }; mount --bind \"$V/rfkill.ko\" \"$T\" || { echo \"could not lay it over $T\"; exit 0; }"]
 oneshot = true
 user = "root"
 groups = ["root"]

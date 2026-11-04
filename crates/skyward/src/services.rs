@@ -22,6 +22,10 @@ const RESTART_DELAY: Duration = Duration::from_secs(1);
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 const READY_POLL: Duration = Duration::from_millis(100);
 
+/// The most lines of a program that runs once are kept: enough for a step
+/// to name what was missing, short of a step that fails in a loop.
+const SAID_LINES: usize = 40;
+
 /// Where the kernel says the highest capability it knows.
 const CAP_LAST_CAP: &str = "/proc/sys/kernel/cap_last_cap";
 
@@ -51,8 +55,20 @@ pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
         }
         let who = Credentials::of(&s, &known)?;
         if s.oneshot {
-            let status = command(&s, &who).status().with_context(|| format!("run {}", s.path))?;
-            ensure!(status.success(), "{} {} ended: {status}", s.path, s.args.join(" "));
+            // What it said goes to the log. A step that fails names its
+            // reason there and nowhere else, and one that finds nothing to
+            // do says so; without this the log keeps a bare exit status and
+            // the reason is lost with the pipe it went down.
+            let done = command(&s, &who)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .with_context(|| format!("run {}", s.path))?;
+            let said = format!("{}{}", String::from_utf8_lossy(&done.stdout), String::from_utf8_lossy(&done.stderr));
+            for line in said.lines().filter(|l| !l.trim().is_empty()).take(SAID_LINES) {
+                skyward_sys::kmsg(&format!("{}: {line}", s.path))?;
+            }
+            ensure!(done.status.success(), "{} {} ended: {}", s.path, s.args.join(" "), done.status);
             skyward_sys::kmsg(&format!("ran {} {}", s.path, s.args.join(" ")))?;
             continue;
         }
