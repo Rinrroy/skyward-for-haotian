@@ -49,9 +49,30 @@ pub struct Visible {
     pub filesystem: String,
 }
 
+use std::path::Path;
+
+/// Whether the mount table's line for `path` says read-only, if it has one:
+/// `None` where nothing is mounted there. Later lines are mounts stacked
+/// over earlier ones, so the last one for a path is what shows at it.
+fn read_only_in(table: &str, path: &Path) -> Option<bool> {
+    let mut found = None;
+    for line in table.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(_device), Some(at), Some(_kind), Some(options)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if Path::new(at) == path {
+            found = Some(options.split(',').any(|o| o == "ro"));
+        }
+    }
+    found
+}
+
 #[cfg(target_os = "android")]
 mod sys {
-    use super::{Visible, FILESYSTEMS};
+    use super::{read_only_in, Visible, FILESYSTEMS};
     use anyhow::{bail, Context, Result};
     use procfs::process::{all_processes, MMapPath, MountInfo, MountOptFields, Process};
     use procfs::{ProcError, ProcResult};
@@ -189,6 +210,16 @@ mod sys {
         }
         let what = if writable { "writable" } else { "read-only" };
         remount(target, flags, what)
+    }
+
+    /// Whether what is mounted at `path` may be written to, as the kernel
+    /// records it in the mount table: `None` where nothing is mounted there.
+    /// A partition that stays mounted read-only is one whose blocks can be
+    /// written beneath it, because nothing is ever written back through it;
+    /// a writable one would put its own bytes back over the new ones.
+    pub fn read_only(path: &Path) -> Result<Option<bool>> {
+        let table = std::fs::read_to_string("/proc/mounts").context("read /proc/mounts")?;
+        Ok(read_only_in(&table, path))
     }
 
     /// What is visibly mounted at `path`, the last of any mounts stacked there.
@@ -474,6 +505,10 @@ mod sys {
         bail!("this host has no mount table to look up {}", path.display())
     }
 
+    pub fn read_only(path: &Path) -> Result<Option<bool>> {
+        bail!("this host has no mount table to look up {}", path.display())
+    }
+
     pub fn visible(path: &Path) -> Result<Option<Visible>> {
         bail!("this host has no mount table to look up {}", path.display())
     }
@@ -501,7 +536,7 @@ mod sys {
 
 pub use sys::{
     bind, holders, holding, is_mount_point, mount, mount_ids, mount_ro, mount_ro_over, points_of, remount_writable, umount,
-    umount_detach, umount_detach_over, umount_over, umount_when_free, visible,
+    read_only, umount_detach, umount_detach_over, umount_over, umount_when_free, visible,
 };
 
 #[cfg(test)]
@@ -519,5 +554,25 @@ mod tests {
         assert_eq!(own, "discard,reserve_root=32768,resgid=1065,fsync_mode=nobarrier,inlinecrypt,gc_merge,atgc");
         let (flags, own) = split_options(&["ro".into(), "defaults".into(), String::new()]);
         assert_eq!((flags, own.as_str()), (1, ""), "read-only, and nothing for the filesystem");
+    }
+
+    #[test]
+    fn a_mount_table_says_which_mount_points_are_read_only() {
+        let table = "\
+/dev/block/dm-2 /mnt/system erofs ro,seclabel,relatime 0 0\n\
+/dev/block/dm-3 /mnt/vendor erofs rw,relatime 0 0\n\
+tmpfs /tmp tmpfs rw,seclabel 0 0\n";
+        assert_eq!(read_only_in(table, Path::new("/mnt/system")), Some(true));
+        assert_eq!(read_only_in(table, Path::new("/mnt/vendor")), Some(false));
+        assert_eq!(read_only_in(table, Path::new("/tmp")), Some(false));
+        assert_eq!(read_only_in(table, Path::new("/mnt/odm")), None, "nothing mounted there");
+    }
+
+    #[test]
+    fn the_last_mount_stacked_at_a_path_is_the_one_that_shows() {
+        let table = "\
+/dev/block/dm-3 /mnt/vendor erofs ro,relatime 0 0\n\
+/dev/block/dm-9 /mnt/vendor erofs rw,relatime 0 0\n";
+        assert_eq!(read_only_in(table, Path::new("/mnt/vendor")), Some(false));
     }
 }

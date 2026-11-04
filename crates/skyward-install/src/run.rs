@@ -56,6 +56,9 @@ const SCRIPT_PATH: &str = "/sbin:/system/bin:/system/xbin";
 /// `/tmp`, and then call the unpacker they shipped — `7za`, `zstd` — by name.
 const TOOLS: &str = "/sbin";
 
+/// Where the stand-in for 7-Zip goes when a package carries none.
+const SEVEN_ZIP: &str = "/sbin/7za";
+
 /// The largest file taken out of a package's `bin/`, so a package cannot
 /// fill the recovery's memory with what it calls a tool.
 const TOOL_LIMIT: u64 = 64 << 20;
@@ -497,6 +500,32 @@ fn detach_once(ctx: &mut Context) -> Result<()> {
     }
 }
 
+/// Move off the installed system before a script writes, letting go of what
+/// a script can safely write under: a partition still mounted read-only
+/// never writes back, so its blocks may be overwritten beneath it. One still
+/// mounted writable would put its own bytes back over the new ones, and
+/// stops the install.
+fn detach_for_script(ctx: &mut Context, slot: skyward_vab::Slot) -> Result<()> {
+    let Err(failure) = detach_once(ctx) else { return Ok(()) };
+    let mut writable = Vec::new();
+    let mut staying = 0;
+    for m in skyward_vab::mounted_partitions(slot)? {
+        match skyward_block::mount::read_only(&m.mount_point)? {
+            Some(true) => staying += 1,
+            Some(false) => writable.push(m.mount_point.display().to_string()),
+            // Gone since: it did come off, and is nothing to allow for.
+            None => {}
+        }
+    }
+    if !writable.is_empty() {
+        return Err(failure).with_context(|| format!("and {} would be written under", writable.join(", ")));
+    }
+    kmsg(&format!(
+        "install: {staying} partition(s) stayed mounted read-only, and their blocks are written under them"
+    ))?;
+    Ok(())
+}
+
 fn describe(package: &Package) -> String {
     match package {
         Package::Update(u) => format!("an update to {}", u.version().unwrap_or("an unnamed version")),
@@ -789,9 +818,10 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
     let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
     extract_script()?;
     extract_tools()?;
+    shim_7za()?;
     shell_at_sbin()?;
     let kept = hold(ctx, slot)?;
-    detach_once(ctx)?;
+    detach_for_script(ctx, slot)?;
     // While an update is in flight, the slot's partitions in super are its
     // and stay unmapped.
     let mapped = match skyward_vab::snapshot_state()? {
@@ -885,6 +915,43 @@ fn extract_tools() -> Result<()> {
     if !taken.is_empty() {
         kmsg(&format!("install: the tools the package carries are in {TOOLS}: {}", taken.join(", ")))?;
     }
+    Ok(())
+}
+
+/// Put a stand-in for 7-Zip where a package's script looks for it.
+///
+/// The packages that write whole partitions open their super image with
+/// `7za e -so <zip> <entry>`, because a recovery is expected to carry one;
+/// this one does not, and a package that carries its own is preferred. What
+/// a script may ask of the stand-in is exactly that form — anything else is
+/// refused by name rather than answered wrongly.
+fn shim_7za() -> Result<()> {
+    let at = Path::new(SEVEN_ZIP);
+    match fs::symlink_metadata(at) {
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("look at {SEVEN_ZIP}")),
+    }
+    fs::create_dir_all(TOOLS).with_context(|| format!("make {TOOLS}"))?;
+    let script = r#"#!/system/bin/sh
+# Stand-in for 7-Zip, for the one thing an install script asks of it:
+#   7za e -so <zip> <entry>    the entry's bytes on standard output
+# A package's own 7za is preferred; this is written only where a
+# package carries none. Any other use is refused, not guessed at.
+if [ "$1" != e ] && [ "$1" != x ]; then
+    echo "7za: only 'e -so <zip> <entry>' is served here, not '$*'" >&2
+    exit 2
+fi
+if [ "$2" != -so ] || [ "$#" -ne 4 ]; then
+    echo "7za: only 'e -so <zip> <entry>' is served here, not '$*'" >&2
+    exit 2
+fi
+echo "skyward: 7za $1 -so $3 $4 was answered by unzip -p" > /dev/kmsg 2>/dev/null
+exec unzip -p "$3" "$4"
+"#;
+    fs::write(at, script).with_context(|| format!("write {SEVEN_ZIP}"))?;
+    fs::set_permissions(at, fs::Permissions::from_mode(0o755)).with_context(|| format!("make {SEVEN_ZIP} runnable"))?;
+    kmsg("install: the packages' 7za is answered by a stand-in over unzip")?;
     Ok(())
 }
 
