@@ -207,3 +207,31 @@ adb shell cat /mnt/logfs/skyward/session-*.log   # 或直接看
 
 - **「无法启动系统」页**（系统请求擦除数据时出现）：页面上的擦除是**请求**，滑动才会执行。先选「重试」或「进入恢复模式」，两者都不动数据。
 - **「启动指令」页**（高级 → 启动指令）：显示 `misc` 里的便条及其解析结果。系统正常启动时这里是空的——一次性指令（如 `bootonce-bootloader`）在启动读完就被清掉了，只有持续性的请求（擦除、装更新、sideload）才会一直留着。
+
+## 12. 一条命令失败，整台机器解不开 data（A14 HyperOS 的报告）
+
+一位网友在 **Android 14 的 HyperOS** 上报告「不支持解密 data」。日志给出的是另一回事：
+
+```
+[15.163544] devices not brought up: /system/bin/sh -c mkdir -p /kmlibs && cp … && mount --bind … ended: exit status: 1
+[36.308048] the data partition stays closed: android.hardware.security.keymint.IKeyMintDevice/default is not running
+```
+
+第一行是**原因**，第二行是**结果**。`services::start` 逐条启动服务，one-shot 用 `ensure!(status.success(), …)`，第一条失败就返回，于是排在后面的 `qseecomd`、`ssgtzd`、keymint、gatekeeper、boot control **一条都没启动**——日志里 `ran /system/bin/sh …` 出现 0 次就是证据。
+
+而失败的那条命令，最后一段是给 **WLAN** 用的：
+
+```
+V=$(ls -d /system_dlkm/lib/modules/*/kernel/net/rfkill | head -1)
+mount --bind $V/rfkill.ko /system_dlkm/flatten/lib/modules/rfkill.ko
+```
+
+它把运行内核里那份已签名的 `rfkill.ko` 盖到扁平副本上（`[wlan] modules` 里有 rfkill）。两个路径都随构建版本变化：源不在、或 `flatten` 里没有对应文件，`$V` 为空、`mount` 报 ENOENT、退出码 1——**WLAN 的准备步骤于是决定了 data 能不能解开**。
+
+三处改动：
+
+1. **rfkill 叠加拆成独立 one-shot**，并且自己判空：找不到源、找不到目标、`mount` 失败，都打印一句原因后 `exit 0`。它失败只失去 WLAN。
+2. **one-shot 的输出进日志**。原来 `services.rs` 把三个标准流全接 `/dev/null`，`cp: cannot stat …` 这类话一个字都不留，只剩一个退出码——这是那次排查里最大的障碍。现在 stdout/stderr 收下来，非空行写进内核日志（最多 40 行）。
+3. **版本号 0.1.4**，让日志能分清是哪一版。
+
+**教训**：给 A 功能准备的前置步骤，不能坐在 B 功能的必经链上，尤其当 A 是锦上添花（WLAN）、B 是核心能力（解密）。`&&` 链把「可选」和「必需」焊在一起，而 `services::start` 又把「一条失败」升级成「全部不启动」。
