@@ -39,6 +39,25 @@ pub fn folder() -> Result<PathBuf> {
     bail!("no folder would keep a copy of the blocks, so nothing was changed ({})", refused.join("; "))
 }
 
+/// The folder the copies were kept in, where one still holds any: what a
+/// change is undone out of.
+pub fn existing() -> Option<PathBuf> {
+    FOLDERS.iter().map(PathBuf::from).find(|dir| holds_copies(dir))
+}
+
+/// Whether `dir` holds any of the copies [`folder`] hands to [`note`]'s
+/// neighbours.
+fn holds_copies(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.ends_with(".img") && name.contains("-0x")
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Whether `at` can be made and written to: a file written and taken away
 /// again, so a folder that only looks writable is not taken for one.
 fn write_and_take_away(at: &Path) -> Result<()> {

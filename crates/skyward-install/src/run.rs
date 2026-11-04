@@ -51,6 +51,15 @@ const SBIN_SHELL: &str = "/sbin/sh";
 const SHELL: &str = "/system/bin/sh";
 const SCRIPT_PATH: &str = "/sbin:/system/bin:/system/xbin";
 
+/// Where a package's own tools are put. `/sbin` and not `/tmp`: the install
+/// scripts of the packages that write whole partitions start by clearing
+/// `/tmp`, and then call the unpacker they shipped — `7za`, `zstd` — by name.
+const TOOLS: &str = "/sbin";
+
+/// The largest file taken out of a package's `bin/`, so a package cannot
+/// fill the recovery's memory with what it calls a tool.
+const TOOL_LIMIT: u64 = 64 << 20;
+
 /// How long what an install script leaves running may keep its output open
 /// once the script has ended, before it is ended too; and after that, how
 /// long its output is waited on before it is let go.
@@ -779,6 +788,7 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
     }
     let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
     extract_script()?;
+    extract_tools()?;
     shell_at_sbin()?;
     let kept = hold(ctx, slot)?;
     detach_once(ctx)?;
@@ -838,6 +848,44 @@ fn extract_script() -> Result<()> {
     let mut out = OpenOptions::new().write(true).create_new(true).open(BINARY).with_context(|| format!("make {BINARY}"))?;
     io::copy(&mut script, &mut out).with_context(|| format!("write {BINARY}"))?;
     out.set_permissions(fs::Permissions::from_mode(0o755)).with_context(|| format!("make {BINARY} runnable"))
+}
+
+/// Put the tools a package carries where its script looks for them.
+///
+/// A package that writes whole partitions carries the unpacker it needs,
+/// because no recovery is expected to have `7za`; its script calls it by
+/// name and stops halfway without it — after the partitions it wrote before
+/// it. A name this recovery already answers to is left alone: a package may
+/// add a tool, not stand in for one of ours.
+fn extract_tools() -> Result<()> {
+    let zip = File::open(fuse::PACKAGE).context("open the package")?;
+    let mut zip = zip::ZipArchive::new(BufReader::new(zip)).context("read the zip directory")?;
+    let mut taken = Vec::new();
+    for i in 0..zip.len() {
+        let Ok(mut entry) = zip.by_index(i) else { continue };
+        let name = entry.name().to_string();
+        let Some(tool) = name.strip_prefix("bin/") else { continue };
+        if tool.is_empty() || tool.contains('/') || !entry.is_file() || entry.size() > TOOL_LIMIT {
+            continue;
+        }
+        let at = Path::new(TOOLS).join(tool);
+        if at.exists() {
+            continue;
+        }
+        fs::create_dir_all(TOOLS).with_context(|| format!("make {TOOLS}"))?;
+        let mut out = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&at)
+            .with_context(|| format!("make {}", at.display()))?;
+        io::copy(&mut entry, &mut out).with_context(|| format!("write {}", at.display()))?;
+        out.set_permissions(fs::Permissions::from_mode(0o755)).with_context(|| format!("make {} runnable", at.display()))?;
+        taken.push(tool.to_string());
+    }
+    if !taken.is_empty() {
+        kmsg(&format!("install: the tools the package carries are in {TOOLS}: {}", taken.join(", ")))?;
+    }
+    Ok(())
 }
 
 /// Give scripts written for other recoveries the shell they start with.

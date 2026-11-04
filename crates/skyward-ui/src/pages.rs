@@ -2453,6 +2453,16 @@ pub fn avb(cx: &Ctx) -> Frame {
                                     "已關閉 {changed} 個區塊。改動前的原樣存在 {dir}，可以整個目錄拷到電腦留存。要恢復，把這個開關滑回「開啟」即可。",
                                     "{changed} blocks turned off. What they said before is kept in {dir}; copy that folder off the phone if you want it to outlast it. To undo, slide the switch back on."
                                 ),
+                                // Turning them on either puts the copy
+                                // back — the flags a phone's own build set
+                                // are not always the two this page writes —
+                                // or, with no copy left, writes zeros.
+                                false if changes.iter().any(|c| c.after != 0) => tr!(
+                                    l,
+                                    "已打开 {changed} 个区块：把 {dir} 里改动前的原样写了回去，不是写 0。",
+                                    "已開啟 {changed} 個區塊：把 {dir} 裡改動前的原樣寫了回去，不是寫 0。",
+                                    "{changed} blocks put back as they were, out of {dir} — not written as zeros."
+                                ),
                                 false => tr!(
                                     l,
                                     "已打开 {changed} 个区块。关闭状态下的副本存在 {dir}。",

@@ -187,6 +187,50 @@ pub fn read(slot: Slot) -> Result<Vec<Reading>> {
         .collect()
 }
 
+/// Put back what each block held before it was changed, out of the copies
+/// kept under `dir`.
+///
+/// The flags a phone's own build sets are not always the two this recovery
+/// writes: a build that ships its hashtree off and its verification on
+/// cannot be brought back by writing zeros. So undoing a change means
+/// writing the copy back whole, not a number chosen here.
+pub fn restore_all(slot: Slot, dir: &Path) -> Result<Vec<Change>> {
+    let mut changes = Vec::new();
+    for mut block in blocks(slot)? {
+        let name = block.name();
+        let Some(copy) = newest_copy(dir, &name)? else { continue };
+        let kept = std::fs::read(&copy).with_context(|| format!("read {}", copy.display()))?;
+        if kept.len() < HEADER || &kept[..4] != MAGIC {
+            bail!("{} does not hold a vbmeta block", copy.display());
+        }
+        let before = block.flags();
+        block.bytes = kept;
+        let after = block.flags();
+        store(&block)?;
+        changes.push(Change { name, before, after, kept: Some(copy) });
+    }
+    Ok(changes)
+}
+
+/// The copy of `name` taken most recently under `dir`, out of the files
+/// [`stash`] writes, which are named for the block, the flags it held and
+/// the second it was taken.
+fn newest_copy(dir: &Path, name: &str) -> Result<Option<PathBuf>> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Ok(None) };
+    let mut newest: Option<(u64, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(rest) = file.strip_prefix(name).and_then(|r| r.strip_prefix("-0x")) else { continue };
+        let Some((_, stamp)) = rest.split_once('-') else { continue };
+        let Ok(seconds) = stamp.trim_end_matches(".img").parse::<u64>() else { continue };
+        if newest.as_ref().is_none_or(|(best, _)| seconds > *best) {
+            newest = Some((seconds, path));
+        }
+    }
+    Ok(newest.map(|(_, path)| path))
+}
+
 /// Set the same flags on every vbmeta block of `slot`, keeping a copy of
 /// each one it changes first: what a block held before is not to be lost
 /// with the change. Blocks that already say `flags` are left untouched, and

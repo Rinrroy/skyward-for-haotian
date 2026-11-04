@@ -525,6 +525,23 @@ fn avb(action: AvbAction) -> Result<()> {
             }
         }
         AvbAction::Disable | AvbAction::Enable => {
+            // Turning them back on means putting the copy back where one was
+            // kept: what a phone's own build set is not always the two values
+            // this command writes, and writing zeros over a build that ships
+            // its hashtree off leaves it unable to start.
+            if matches!(action, AvbAction::Enable) {
+                if let Some(folder) = avbkeep::existing() {
+                    let restored = skyward_vab::avb::restore_all(slot, &folder)?;
+                    if !restored.is_empty() {
+                        for c in &restored {
+                            println!("{:<22} 0x{:x} -> 0x{:x}   put back from {}", c.name, c.before, c.after, c.kept.as_deref().unwrap_or(Path::new("")).display());
+                        }
+                        println!();
+                        println!("the blocks are as they were before the change, out of {}", folder.display());
+                        return Ok(());
+                    }
+                }
+            }
             let wanted = match action {
                 AvbAction::Disable => skyward_vab::avb::HASHTREE_DISABLED | skyward_vab::avb::VERIFICATION_DISABLED,
                 _ => 0,
