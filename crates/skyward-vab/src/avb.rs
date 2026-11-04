@@ -204,6 +204,14 @@ pub fn restore_all(slot: Slot, dir: &Path) -> Result<Vec<Change>> {
             bail!("{} does not hold a vbmeta block", copy.display());
         }
         let before = block.flags();
+        // Only a block that still says what this recovery left it saying is
+        // one this recovery may put back. An update package writes the
+        // blocks too, with a rollback counter of its own; dragging an older
+        // block over what it wrote would count the phone backwards, which a
+        // bootloader with anti-rollback refuses.
+        if before != (HASHTREE_DISABLED | VERIFICATION_DISABLED) {
+            continue;
+        }
         block.bytes = kept;
         let after = block.flags();
         store(&block)?;
