@@ -2634,6 +2634,10 @@ pub struct App {
     /// A swipe-to-confirm control whose knob the power key moved, to draw
     /// again with the page.
     knob: Option<(Confirm, Rect)>,
+    /// Whether the knob of a swipe-to-confirm control has already tapped
+    /// the motor for the drag it is in: it taps once as the knob passes
+    /// the point where letting go does the thing, not on every step.
+    confirm_ticked: bool,
     /// The slider lit takes the volume keys, until the power key lets it
     /// go.
     adjusting: bool,
@@ -2765,6 +2769,7 @@ impl App {
             chord: None,
             seek: None,
             knob: None,
+            confirm_ticked: false,
             adjusting: false,
             height: 0.0,
             drawn: Vec::new(),
@@ -6116,6 +6121,7 @@ impl App {
                     .filter(|&(a, r)| self.frame.as_ref().is_some_and(|fr| fr.hits.contains(&Hit { rect: r, action: a })))
                     .filter(|&(a, r)| row_wide(&t, r) && !matches!(a, Action::Open(Screen::Search) | Action::Confirm(_) | Action::TypeInto(_)))
                     .map(|(_, r)| r);
+                let mut joined = false;
                 self.drag = match hit {
                     Some((Action::Slider(which), track)) => {
                         self.set_slider(&t, which, track, x);
@@ -6123,11 +6129,15 @@ impl App {
                     }
                     Some((Action::Confirm(which), track)) if self.on_knob(track, x) => {
                         let knob_x = track.x + (track.w - track.h) * self.state.confirm;
+                        // A new drag of the knob taps the motor anew when
+                        // it passes the point where letting go does the
+                        // thing.
+                        self.confirm_ticked = false;
                         Drag::Confirm { which, track, grab: x - knob_x }
                     }
                     Some((Action::Pattern, _)) => {
                         self.state.pattern.clear();
-                        self.trace(&t, x, y + scroll);
+                        joined = self.trace(&t, x, y + scroll);
                         Drag::Pattern
                     }
                     _ => {
@@ -6138,6 +6148,11 @@ impl App {
                         Drag::Press { x, y, action, edge: at_edge, at: now }
                     }
                 };
+                // A tap of the motor as the finger finds the first dot, as
+                // the system's pattern lock does.
+                if joined && self.state.vibrate {
+                    fx.push(Effect::Haptic);
+                }
             }
             Touch::Move(x, y) => match std::mem::replace(&mut self.drag, Drag::Idle) {
                 Drag::Press { x: x0, y: y0, action, edge: at_edge, at } => {
@@ -6191,11 +6206,24 @@ impl App {
                 Drag::Confirm { which, track, grab } => {
                     let travel = (track.w - track.h).max(1.0);
                     self.state.confirm = ((x - grab - track.x) / travel).clamp(0.0, 1.0);
+                    // A tap of the motor as the knob passes the point where
+                    // letting go does the thing, so the finger knows it is
+                    // far enough before it lifts. A control that is only
+                    // armed by this slide does nothing yet, and says so
+                    // with words instead.
+                    if self.state.confirm > SLID && !self.confirm_ticked && self.state.vibrate && self.will_act(which) {
+                        self.confirm_ticked = true;
+                        fx.push(Effect::Haptic);
+                    }
                     self.repaint_confirm(&t, f, which, track);
                     self.drag = Drag::Confirm { which, track, grab };
                 }
                 Drag::Pattern => {
-                    self.trace(&t, x, y + scroll);
+                    // A tap of the motor as the finger finds each dot, as
+                    // the system's pattern lock does.
+                    if self.trace(&t, x, y + scroll) && self.state.vibrate {
+                        fx.push(Effect::Haptic);
+                    }
                     self.drag = Drag::Pattern;
                 }
                 Drag::History { last, carry, pitch } => {
@@ -6266,8 +6294,16 @@ impl App {
                 Drag::Confirm { which, track, .. } => {
                     let done = self.state.confirm > SLID;
                     self.state.confirm = 0.0;
+                    self.confirm_ticked = false;
                     self.repaint_confirm(&t, f, which, track);
                     if done {
+                        // A tap of the motor as the thing it asked for
+                        // begins, so the hand that let go is answered. A
+                        // slide that only arms a control has not begun
+                        // anything, and is left silent.
+                        if self.state.vibrate && self.will_act(which) {
+                            fx.push(Effect::Haptic);
+                        }
                         fx.extend(self.confirmed(which, now));
                     }
                 }
@@ -6482,6 +6518,12 @@ impl App {
         self.dirty = true;
     }
 
+    /// Whether sliding this control to its end now would do the thing,
+    /// rather than only ask what a second slide would do.
+    fn will_act(&self, which: Confirm) -> bool {
+        !(arms(which) && self.state.armed != Some(which))
+    }
+
     /// What a swipe-to-confirm control slid to its end does.
     ///
     /// Two of them are slid twice. Turning the checks the vbmeta blocks name
@@ -6656,8 +6698,12 @@ impl App {
                 if self.state.pattern.is_empty() {
                     self.say(l.pick(["连接完成后，在最后一个点上再按一次电源键", "連接完成後，在最後一個點上再按一次電源鍵", "When the pattern is done, press the power key again on its last dot"]), now);
                 }
-                self.join(&self.theme(), i);
-                Vec::new()
+                let joined = self.join(&self.theme(), i);
+                // A tap of the motor as a dot is taken, as the finger's is.
+                match joined && self.state.vibrate {
+                    true => vec![Effect::Haptic],
+                    false => Vec::new(),
+                }
             }
         }
     }
@@ -7045,22 +7091,23 @@ impl App {
     }
 
     /// Add the dot under the finger to the pattern being drawn.
-    fn trace(&mut self, t: &Theme, x: f32, y: f32) {
-        let Some((cx, cy, span)) = self.frame.as_ref().and_then(|fr| fr.pattern) else { return };
+    fn trace(&mut self, t: &Theme, x: f32, y: f32) -> bool {
+        let Some((cx, cy, span)) = self.frame.as_ref().and_then(|fr| fr.pattern) else { return false };
         let reach = t.m.dp(widgets::PATTERN_REACH_DP);
         let dots = widgets::pattern_dots(cx, cy, span);
-        if let Some(i) = dots.iter().position(|&(dx, dy)| (dx - x).hypot(dy - y) < reach) {
-            self.join(t, i);
+        match dots.iter().position(|&(dx, dy)| (dx - x).hypot(dy - y) < reach) {
+            Some(i) => self.join(t, i),
+            None => false,
         }
     }
 
     /// Join dot `i` to the pattern being drawn, after the dot it passes
     /// straight over on its way from the last one, as the system's pattern
     /// lock joins that one too. A dot joined once is not joined again.
-    fn join(&mut self, t: &Theme, i: usize) {
+    fn join(&mut self, t: &Theme, i: usize) -> bool {
         let drawn = &mut self.state.pattern;
         if drawn.contains(&i) {
-            return;
+            return false;
         }
         if let Some(&last) = drawn.last() {
             let (row, col) = ((last / 3) as i32, (last % 3) as i32);
@@ -7075,6 +7122,7 @@ impl App {
         }
         drawn.push(i);
         self.repaint_pattern(t);
+        true
     }
 
     fn repaint_pattern(&mut self, t: &Theme) {
@@ -7922,7 +7970,7 @@ mod tests {
         app.set_update(Standing::Waiting);
         assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Update)), vec![Effect::ReadUpdate], "the page reads where the update stands");
         assert_eq!(app.screen(), Screen::Update);
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Merge), vec![Effect::Merge]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Merge), vec![Effect::Merge]);
         assert_eq!(app.state.update, Standing::Merging(0.0), "the page turns to the merge at once");
         assert!(app.frame(&f, &i).hits.is_empty(), "nothing to swipe while it merges");
         app.set_update(Standing::Merging(0.5));
@@ -8462,7 +8510,11 @@ mod tests {
         app.touch(Touch::Move(track.x + track.w / 2.0, y), &f, 0);
         app.touch(Touch::Move(track.x + track.w, y), &f, 0);
         let fx = app.touch(Touch::Up, &f, 0);
-        assert_eq!(fx, vec![Effect::Reboot(Target::Bootloader)]);
+        assert_eq!(
+            fx,
+            vec![Effect::Haptic, Effect::Reboot(Target::Bootloader)],
+            "the motor taps as the reboot begins; the other tap came with the move that passed the point"
+        );
         assert_eq!(app.state.confirm, 0.0, "the knob springs back");
     }
 
@@ -8564,7 +8616,11 @@ mod tests {
         let y = track.centre().1 - app.top().1;
         app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
         app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
-        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Flash { partition: "boot", pick: Pick::Both }]);
+        assert_eq!(
+            app.touch(Touch::Up, &f, 1000),
+            vec![Effect::Haptic, Effect::Flash { partition: "boot", pick: Pick::Both }],
+            "the motor taps as the writing begins"
+        );
         assert_eq!(app.state.install, Install::Flashing { partition: "boot", stage: None });
         app.install(Event::Progress(Stage::Flashing { done: 10, total: 40 }), 1000);
         assert_eq!(app.state.install, Install::Flashing { partition: "boot", stage: Some(Stage::Flashing { done: 10, total: 40 }) });
@@ -8632,7 +8688,20 @@ mod tests {
         let fastboot = TARGETS.iter().position(|t| *t == Target::Fastboot).unwrap();
         tap(&mut app, &f, &i, Action::RebootTarget(fastboot));
         assert_eq!(app.state.reboot, fastboot);
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Reboot), vec![Effect::Reboot(Target::Fastboot)]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Reboot), vec![Effect::Reboot(Target::Fastboot)]);
+    }
+
+    #[test]
+    fn a_swipe_to_confirm_taps_the_motor_as_it_passes_the_point_and_as_the_thing_begins() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Reboot, W, H, PPD);
+        let fastboot = TARGETS.iter().position(|t| *t == Target::Fastboot).unwrap();
+        tap(&mut app, &f, &i, Action::RebootTarget(fastboot));
+        assert_eq!(
+            swipe(&mut app, &f, &i, Confirm::Reboot),
+            vec![Effect::Haptic, Effect::Haptic, Effect::Reboot(Target::Fastboot)],
+            "one tap as the knob passes the point, one as the thing begins"
+        );
     }
 
     /// Press `key` and let it go.
@@ -8992,7 +9061,7 @@ mod tests {
         app.frame(&f, &i);
         press(&mut app, Key::VolumeDown, 0);
         assert_eq!(lit(&mut app, &f, &i), Some(Stop::Dot(0)), "the grid's first dot is lit first");
-        assert!(press(&mut app, Key::Power, 0).is_empty());
+        assert_eq!(press(&mut app, Key::Power, 0), vec![Effect::Haptic], "the dot taken taps the motor");
         assert_eq!(app.state.pattern, [0]);
         assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("连接完成后，在最后一个点上再按一次电源键"));
         press(&mut app, Key::Power, 0);
@@ -9133,8 +9202,15 @@ mod tests {
         let mut app = App::new(Screen::CantStart, W, H, PPD);
         app.set_asked(Asked { reason: Some("RescueParty".into()), ..Asked::default() });
         assert_eq!(tap(&mut app, &f, &i, Action::RebootTo(Target::System)), vec![Effect::Reboot(Target::System)]);
-        assert!(swipe(&mut app, &f, &i, Confirm::FactoryReset).is_empty(), "the first slide only asks what the second would do");
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::FactoryReset), vec![Effect::FactoryReset], "the second does it");
+        assert!(
+            swipe(&mut app, &f, &i, Confirm::FactoryReset).is_empty(),
+            "the first slide only asks what the second would do, and taps no motor"
+        );
+        assert_eq!(
+            swipe(&mut app, &f, &i, Confirm::FactoryReset),
+            vec![Effect::Haptic, Effect::Haptic, Effect::FactoryReset],
+            "the second does it, and the motor says so"
+        );
         assert_eq!(tap(&mut app, &f, &i, Action::Dismiss), vec![Effect::Dismiss]);
         assert_eq!(app.screen(), Screen::Home);
         app.key(Key::Back, 0);
@@ -9179,22 +9255,22 @@ mod tests {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Wipe, &f, &i);
         let chosen = |app: &App| WIPES.iter().zip(app.state.wipe).filter(|(_, on)| *on).map(|(&w, _)| w).collect::<Vec<_>>();
-        assert!(swipe(&mut app, &f, &i, Confirm::Wipe).is_empty(), "nothing is chosen at first");
+        assert!(swiped(&mut app, &f, &i, Confirm::Wipe).is_empty(), "nothing is chosen at first");
         for part in [Wipe::Updates, Wipe::Logs, Wipe::Art, Wipe::SystemCaches, Wipe::AppCaches, Wipe::Media, Wipe::AppData] {
             tap(&mut app, &f, &i, Action::WipeItem(part));
         }
         let parts = vec![Wipe::AppData, Wipe::Media, Wipe::AppCaches, Wipe::SystemCaches, Wipe::Art, Wipe::Logs, Wipe::Updates];
         assert_eq!(chosen(&app), parts, "every part the page lists can be chosen with the others");
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(parts)], "in the order listed");
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(parts)], "in the order listed");
         tap(&mut app, &f, &i, Action::WipeItem(Wipe::All));
         assert_eq!(chosen(&app), [Wipe::All], "everything takes the parts in");
         tap(&mut app, &f, &i, Action::WipeItem(Wipe::Art));
         assert_eq!(chosen(&app), [Wipe::Art], "a part on its own leaves everything out");
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(vec![Wipe::Art])]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(vec![Wipe::Art])]);
         tap(&mut app, &f, &i, Action::WipeItem(Wipe::Art));
         assert!(chosen(&app).is_empty(), "tapped again, a part is left out");
         tap(&mut app, &f, &i, Action::WipeItem(Wipe::All));
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(vec![Wipe::All])]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(vec![Wipe::All])]);
     }
 
     #[test]
@@ -9208,7 +9284,7 @@ mod tests {
         assert!(offered(&mut app));
         tap(&mut app, &f, &i, Action::WipeItem(Wipe::Cache));
         tap(&mut app, &f, &i, Action::WipeItem(Wipe::Media));
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(vec![Wipe::Media, Wipe::Cache])], "in the order listed");
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(vec![Wipe::Media, Wipe::Cache])], "in the order listed");
     }
 
     #[test]
@@ -9271,7 +9347,7 @@ mod tests {
         let y = track.centre().1 - app.top().1;
         app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
         app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
-        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Install]);
+        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Haptic, Effect::Install], "the motor taps as it begins");
         assert_eq!(app.state.install, Install::Updating { version: Some("OS3.0.306.0.WMACNXM".into()), stage: None, overwriting: false });
         app.key(Key::Back, 1000);
         assert_eq!(app.screen(), Screen::Installing, "an update being written keeps the page");
@@ -9299,7 +9375,7 @@ mod tests {
         let y = track.centre().1 - app.top().1;
         app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
         app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
-        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Install]);
+        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Haptic, Effect::Install], "the motor taps as it begins");
         assert_eq!(app.state.install, Install::Scripting { stage: None, running: false });
         app.install(Event::Running, 1000);
         for line in ["- Flashing boot", " ", "- Done"] {
@@ -9440,6 +9516,14 @@ mod tests {
     }
 
     /// Drag the knob of a swipe-to-confirm track all the way across.
+    /// What a swipe to confirm did, with the taps of the motor left out:
+    /// what the slide was for, and not how it felt.
+    fn swiped(app: &mut App, f: &Fonts, i: &DeviceInfo, which: Confirm) -> Vec<Effect> {
+        let mut fx = swipe(app, f, i, which);
+        fx.retain(|e| !matches!(e, Effect::Haptic));
+        fx
+    }
+
     fn swipe(app: &mut App, f: &Fonts, i: &DeviceInfo, which: Confirm) -> Vec<Effect> {
         let track = app.frame(f, i).hits.iter().find(|h| h.action == Action::Confirm(which)).expect("the track is on the page").rect;
         let y = track.centre().1 - app.top().1;
@@ -9513,28 +9597,28 @@ mod tests {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Backup, &f, &i);
         assert_eq!(app.state.backup, [true, true, false, true, false]);
-        assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "internal storage waits for the data partition");
+        assert!(swiped(&mut app, &f, &i, Confirm::Backup).is_empty(), "internal storage waits for the data partition");
         assert_eq!(app.deadline(0), Some(TOAST_MS), "and says so");
         // The owner's files open first; another user's still wait.
         app.data_waiting(Some((10, Keys::Digits)));
         let first = Effect::Backup { parts: [true, true, false, true, false], place: Place::Storage, compress: false, verify: true };
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Backup), vec![first]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Backup), vec![first]);
         tap(&mut app, &f, &i, Action::BackupPart(2));
-        assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "the data partition is backed up only with every user's files open");
+        assert!(swiped(&mut app, &f, &i, Confirm::Backup).is_empty(), "the data partition is backed up only with every user's files open");
         app.data_waiting(None);
         tap(&mut app, &f, &i, Action::BackupPart(0));
         assert_eq!(app.state.backup, [false, true, true, true, false]);
         tap(&mut app, &f, &i, Action::BackupTo(Place::UsbDrive));
         tap(&mut app, &f, &i, Action::Toggle(Switch::Compress));
         tap(&mut app, &f, &i, Action::Toggle(Switch::Verify));
-        assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "no drive is plugged in");
+        assert!(swiped(&mut app, &f, &i, Confirm::Backup).is_empty(), "no drive is plugged in");
         app.set_usb_drive(Some(UsbDrive::Shown));
         let second = Effect::Backup { parts: [false, true, true, true, false], place: Place::UsbDrive, compress: true, verify: false };
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Backup), vec![second]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Backup), vec![second]);
         for k in 1..5 {
             tap(&mut app, &f, &i, Action::BackupPart(k));
         }
-        assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "nothing ticked, nothing backed up");
+        assert!(swiped(&mut app, &f, &i, Confirm::Backup).is_empty(), "nothing ticked, nothing backed up");
     }
 
     /// A backup found in `place`, made at `made`, holding `parts`.
@@ -9577,7 +9661,7 @@ mod tests {
         tap(&mut app, &f, &i, Action::RestorePart(1));
         assert_eq!(app.state.restore.as_ref().map(|r| r.1), Some([true, false, false, true, false]));
         let name = fmt::stamp(1_792_348_260, 0);
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Restore), vec![Effect::Restore {
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Restore), vec![Effect::Restore {
             place: Place::Storage,
             name: name.clone(),
             parts: [true, false, false, true, false]
@@ -9585,7 +9669,7 @@ mod tests {
         for k in [0, 3] {
             tap(&mut app, &f, &i, Action::RestorePart(k));
         }
-        assert!(swipe(&mut app, &f, &i, Confirm::Restore).is_empty(), "nothing ticked, nothing restored");
+        assert!(swiped(&mut app, &f, &i, Confirm::Restore).is_empty(), "nothing ticked, nothing restored");
         assert_eq!(app.key(Key::Back, 0), vec![Effect::FindBackups { storage: false, usb: false }], "back on the list, it is looked for again");
         assert_eq!((app.screen(), app.state.restore.clone()), (Screen::Restore, None));
     }
@@ -9596,10 +9680,10 @@ mod tests {
         let mut app = opened(Screen::Restore, &f, &i);
         app.set_backups(vec![found(Place::Storage, 1_792_348_260, [false, false, true, false, false])]);
         tap(&mut app, &f, &i, Action::OpenBackup(0));
-        assert!(swipe(&mut app, &f, &i, Confirm::Restore).is_empty());
+        assert!(swiped(&mut app, &f, &i, Confirm::Restore).is_empty());
         assert_eq!(app.deadline(0), Some(TOAST_MS), "the page says to decrypt first");
         app.data_waiting(None);
-        let fx = swipe(&mut app, &f, &i, Confirm::Restore);
+        let fx = swiped(&mut app, &f, &i, Confirm::Restore);
         assert!(matches!(&fx[..], [Effect::Restore { parts: [false, false, true, false, false], .. }]), "{fx:?}");
     }
 
@@ -9629,7 +9713,7 @@ mod tests {
         tap(&mut app, &f, &i, Action::OpenBackup(0));
         assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::Confirm(Confirm::DeleteBackup)), "asked for first");
         tap(&mut app, &f, &i, Action::AskDelete);
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::DeleteBackup), vec![Effect::DeleteBackup { place: Place::Storage, name: entry.name }]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::DeleteBackup), vec![Effect::DeleteBackup { place: Place::Storage, name: entry.name }]);
         assert!(app.backup_deleted(Err("Permission denied".into()), 0).is_empty());
         assert_eq!(app.screen(), Screen::RestoreBackup, "not deleted, the page stays and says why");
         assert_eq!(app.backup_deleted(Ok(()), 0), vec![Effect::FindBackups { storage: true, usb: false }]);
@@ -9694,10 +9778,10 @@ mod tests {
         assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Slot)), vec![Effect::ReadSlots], "read as the page opens");
         let held = BootSlots { active: Slot::B, bootable: [false, true], successful: [true, true] };
         app.set_boot_slots(Ok(held));
-        assert!(swipe(&mut app, &f, &i, Confirm::Slot).is_empty());
+        assert!(swiped(&mut app, &f, &i, Confirm::Slot).is_empty());
         assert_eq!(app.deadline(0), Some(TOAST_MS), "B starts next already");
         tap(&mut app, &f, &i, Action::PickSlot(Slot::A));
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Slot), vec![Effect::SetSlot(Slot::A)]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Slot), vec![Effect::SetSlot(Slot::A)]);
         let switched = BootSlots { active: Slot::A, bootable: [true, true], ..held };
         app.slot_switched(Ok(switched), 0);
         assert_eq!((app.state.boot_slots.clone(), app.state.next_slot), (Some(Ok(switched)), None), "the pick is done with");
@@ -9796,6 +9880,28 @@ mod tests {
         assert_eq!(fx, vec![Effect::Unlock { user: 0, code: "1258".into() }], "the dots counted from one across the rows");
         assert!(app.state.pattern.is_empty(), "the grid is cleared once it is sent");
         assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::Pattern), "nothing more is drawn while it is checked");
+    }
+
+    #[test]
+    fn a_pattern_taps_the_motor_at_each_dot_the_finger_finds() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Decrypt, W, H, PPD);
+        app.data_waiting(Some((0, Keys::Pattern)));
+        let (cx, cy, span) = app.frame(&f, &i).pattern.expect("the grid is on the page");
+        let dots = widgets::pattern_dots(cx, cy, span);
+        let scroll = app.top().1;
+        assert_eq!(
+            app.touch(Touch::Down(dots[0].0, dots[0].1 - scroll), &f, 0),
+            vec![Effect::Haptic],
+            "the first dot found"
+        );
+        for &which in &[1usize, 4, 7] {
+            assert_eq!(
+                app.touch(Touch::Move(dots[which].0, dots[which].1 - scroll), &f, 0),
+                vec![Effect::Haptic],
+                "each dot found"
+            );
+        }
     }
 
     #[test]
@@ -10408,14 +10514,14 @@ mod tests {
         let mut app = App::new(Screen::Advanced, W, H, PPD);
         tap(&mut app, &f, &i, Action::Open(Screen::Relabel));
         assert_eq!(app.screen(), Screen::Relabel);
-        assert!(swipe(&mut app, &f, &i, Confirm::Relabel).is_empty());
+        assert!(swiped(&mut app, &f, &i, Confirm::Relabel).is_empty());
         assert_eq!(toast(&app), Some("请先在「解密」中打开 data 分区"));
         app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false };
         app.refresh();
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Relabel), vec![Effect::Relabel], "open, though a user has yet to unlock");
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Relabel), vec![Effect::Relabel], "open, though a user has yet to unlock");
         app.state.data = Data::Open;
         app.refresh();
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Relabel), vec![Effect::Relabel]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Relabel), vec![Effect::Relabel]);
         app.relabel_started();
         assert!(!app.frame(&f, &i).back, "no going back while it works");
         app.key(Key::Back, 0);
@@ -10461,7 +10567,7 @@ mod tests {
         tap(&mut app, &f, &i, Action::ChooseFs(FsChoice::Remake(0)));
         assert_eq!(app.state.fs_action, FsAction::Remake("f2fs".into()));
         let remake = Effect::Filesystem { name: "cache".into(), action: FsAction::Remake("f2fs".into()) };
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Filesystem), vec![remake]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Filesystem), vec![remake]);
         app.part_work_started(PartKind::Remake("f2fs".into()), false);
         assert_eq!(app.screen(), Screen::PartWork);
         app.part_listed(vec!["cache".into()]);
@@ -10487,12 +10593,12 @@ mod tests {
         tap(&mut app, &f, &i, Action::ChooseFs(FsChoice::Repair));
         app.state.data = Data::Opening;
         app.refresh();
-        assert!(swipe(&mut app, &f, &i, Confirm::Filesystem).is_empty());
+        assert!(swiped(&mut app, &f, &i, Confirm::Filesystem).is_empty());
         assert_eq!(toast(&app), Some("正在打开 data 分区，请稍后再试"));
         app.state.data = Data::Open;
         app.refresh();
         let repair = Effect::Filesystem { name: "data".into(), action: FsAction::Repair };
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Filesystem), vec![repair]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Filesystem), vec![repair]);
         app.part_work_started(PartKind::Repair, false);
         app.part_listed(vec!["data".into()]);
         app.part_at(0);
@@ -10967,7 +11073,7 @@ mod tests {
         hold_entry(&mut app, &f, &i, 1);
         assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::Confirm(Confirm::DeleteEntry)));
         tap(&mut app, &f, &i, Action::AskDelete);
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::DeleteEntry), vec![Effect::Delete("/sdcard/a.zip".into())]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::DeleteEntry), vec![Effect::Delete("/sdcard/a.zip".into())]);
         app.file_job_started(FileTask::Delete { path: "/sdcard/a.zip".into() });
         assert_eq!(app.screen(), Screen::FileJob);
         assert_eq!(tap(&mut app, &f, &i, Action::StopJob), vec![Effect::StopJob]);
