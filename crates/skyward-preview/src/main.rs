@@ -374,7 +374,7 @@ fn main() -> Result<()> {
     let adding = |app: &mut App, name: &str, security: Security, field: Field, choosing: bool| {
         app.state.adding = Some(Adding { name: name.into(), security, field, choosing });
     };
-    let pages: [PageShot; 165] = [
+    let pages: [PageShot; 166] = [
         ("11-install-light-locked", Screen::Install, false, &|app| {
             app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false };
         }),
@@ -536,9 +536,16 @@ fn main() -> Result<()> {
         ("49-avb-dark-off", Screen::Avb, true, &|app| {
             app.set_avb(Ok(avb_blocks(true)), Some("enforcing".into()));
             app.state.avb_result = Some(Ok(vec![
-                AvbChange { name: "vbmeta".into(), before: 0, after: 3, kept: Some("/tmp/avb/vbmeta-0x00000000-1793681979.img".into()) },
-                AvbChange { name: "vbmeta_system".into(), before: 0, after: 3, kept: Some("/tmp/avb/vbmeta_system-0x00000000-1793681979.img".into()) },
+                AvbChange { name: "vbmeta".into(), before: 0, after: 3, kept: Some("/mnt/logfs/skyward/avb/vbmeta_b-0x00000000-1793681979.img".into()) },
+                AvbChange { name: "vbmeta_system".into(), before: 0, after: 3, kept: Some("/mnt/logfs/skyward/avb/vbmeta_system_b-0x00000000-1793681979.img".into()) },
             ]));
+        }),
+        ("49-avb-light-nowhere-to-keep", Screen::Avb, false, &|app| {
+            app.set_avb(Ok(avb_blocks(true)), Some("enforcing".into()));
+            app.state.avb_result = Some(Err(
+                "no folder would keep a copy of the blocks, so nothing was changed (/mnt/logfs/skyward/avb: read-only file system; /sdcard/Skyward/avb: the data partition is not open)"
+                    .into(),
+            ));
         }),
         ("49-bcb-light", Screen::Bcb, false, &|app| {
             app.set_starter(Ok(Starter {

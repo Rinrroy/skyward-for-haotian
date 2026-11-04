@@ -6,6 +6,8 @@ use skyward_vab::SnapshotState;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "android")]
+mod avbkeep;
+#[cfg(target_os = "android")]
 mod backup;
 #[cfg(target_os = "android")]
 mod decrypt;
@@ -498,23 +500,10 @@ fn firmware(out: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Where a copy of each vbmeta block is kept before it is changed.
-const AVB_KEPT: &str = "/tmp/avb";
-
-/// The same, on a partition that outlasts a restart where one is mounted:
-/// a copy kept in the recovery's own memory is gone the moment it reboots,
-/// which is exactly when it would be wanted.
-fn avb_kept() -> &'static str {
-    if Path::new("/data/local/tmp").is_dir() {
-        "/data/local/tmp/avb"
-    } else {
-        AVB_KEPT
-    }
-}
-
 /// Print what the slot's vbmeta blocks say, or turn their two checks off or
-/// back on. A copy of each block goes to [`avb_kept`] before it is written,
-/// so what it held first is not lost with the change.
+/// back on. A copy of each block goes to [`avbkeep::folder`] before it is
+/// written, with the way back beside it, so what it held first is not lost
+/// with the change.
 fn avb(action: AvbAction) -> Result<()> {
     let slot = booted_slot()?;
     match action {
@@ -530,21 +519,30 @@ fn avb(action: AvbAction) -> Result<()> {
                 );
             }
             println!();
-            println!("kept blocks, when any, are in {}", avb_kept());
+            match avbkeep::folder() {
+                Ok(folder) => println!("a copy of each block, when one is changed, goes to {}", folder.display()),
+                Err(e) => println!("nowhere would keep a copy of a block, so none can be changed: {e:#}"),
+            }
         }
         AvbAction::Disable | AvbAction::Enable => {
             let wanted = match action {
                 AvbAction::Disable => skyward_vab::avb::HASHTREE_DISABLED | skyward_vab::avb::VERIFICATION_DISABLED,
                 _ => 0,
             };
-            for c in skyward_vab::avb::set_all(slot, wanted, Path::new(avb_kept()))? {
+            let folder = avbkeep::folder()?;
+            let changes = skyward_vab::avb::set_all(slot, wanted, &folder)?;
+            let changed = changes.iter().any(|c| c.kept.is_some());
+            for c in &changes {
                 match &c.kept {
                     Some(kept) => println!("{:<22} 0x{:x} -> 0x{:x}   kept as {}", c.name, c.before, c.after, kept.display()),
                     None => println!("{:<22} already 0x{:x}", c.name, c.before),
                 }
             }
+            if changed {
+                avbkeep::note(&folder, slot)?;
+            }
             println!();
-            println!("pull {} off the phone before leaving", avb_kept());
+            println!("the way back, and the copies, are in {}; pull that folder off the phone before leaving", folder.display());
         }
     }
     Ok(())

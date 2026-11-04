@@ -2473,6 +2473,20 @@ pub fn avb(cx: &Ctx) -> Frame {
             Err(why) => tr!(l, "未能改动：{why}", "未能改動：{why}", "Nothing was changed: {why}"),
         };
         y = widgets::footnote(&mut c, t, f, y + t.m.card_gap, &note);
+        // Where the copies are is only half of it: whether they outlast the
+        // phone not starting decides whether that folder is a way back or
+        // just a record. Said only where it is true.
+        if let Ok(changes) = result {
+            let on_the_log_disk = changes.iter().filter_map(|c| c.kept.as_deref()).any(|p| p.starts_with("/mnt/logfs"));
+            if on_the_log_disk {
+                let steady = l.pick([
+                    "这些副本在未加密的日志分区上：系统起不来、data 解不开的时候仍然读得到，也不随重启或恢复出厂消失。",
+                    "這些副本在未加密的日誌分割區上：系統起不來、data 解不開的時候仍然讀得到，也不隨重新啟動或恢復原廠設定消失。",
+                    "The copies are on the log disk, which is not encrypted: they stay readable when the phone will not start and data cannot be opened, and neither a restart nor a factory reset takes them away.",
+                ]);
+                y = widgets::footnote(&mut c, t, f, y, steady);
+            }
+        }
     }
 
     // The swipe, which turns them off where they are on and back on where

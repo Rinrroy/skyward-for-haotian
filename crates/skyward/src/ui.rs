@@ -998,17 +998,6 @@ fn read_slots() -> Result<skyward_vab::BootSlots, String> {
     read().map_err(|e| format!("{e:#}"))
 }
 
-/// Where a copy of each vbmeta block is kept before it is changed: a
-/// partition that outlasts a restart where one is mounted, and the recovery's
-/// own memory otherwise.
-fn avb_kept() -> &'static str {
-    if Path::new("/data/local/tmp").is_dir() {
-        "/data/local/tmp/avb"
-    } else {
-        "/tmp/avb"
-    }
-}
-
 /// What every vbmeta block the running slot keeps says about the checks it
 /// names.
 fn read_avb() -> Result<Vec<skyward_vab::avb::Reading>, String> {
@@ -1026,7 +1015,10 @@ fn verity_mode() -> Option<String> {
 }
 
 /// Turn both checks the vbmeta blocks name off, or back on, across every
-/// block the running slot keeps, giving what each held before and after.
+/// block the running slot keeps, giving what each held before and after. A
+/// copy of each block is kept first, in a folder that outlasts the phone not
+/// starting, with the way back written beside it; a phone that has nowhere
+/// to keep one is left as it is.
 fn set_avb(on: bool) -> Result<Vec<skyward_vab::avb::Change>, String> {
     let write = || -> Result<Vec<skyward_vab::avb::Change>> {
         let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
@@ -1035,7 +1027,17 @@ fn set_avb(on: bool) -> Result<Vec<skyward_vab::avb::Change>, String> {
         } else {
             skyward_vab::avb::HASHTREE_DISABLED | skyward_vab::avb::VERIFICATION_DISABLED
         };
-        skyward_vab::avb::set_all(slot, flags, Path::new(avb_kept()))
+        let kept = crate::avbkeep::folder()?;
+        let changes = skyward_vab::avb::set_all(slot, flags, &kept)?;
+        if changes.iter().any(|c| c.kept.is_some()) {
+            // The copies are of no use to whoever needs them without the way
+            // back written beside them, but the blocks are already changed:
+            // the note failing must not report the change as not made.
+            if let Err(e) = crate::avbkeep::note(&kept, slot) {
+                let _ = skyward_sys::kmsg(&format!("the way back beside the kept blocks is not written: {e:#}"));
+            }
+        }
+        Ok(changes)
     };
     write().map_err(|e| format!("{e:#}"))
 }

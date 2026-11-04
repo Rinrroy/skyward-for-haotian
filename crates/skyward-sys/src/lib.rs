@@ -259,7 +259,7 @@ fn forget_older_sessions(folder: &Path) {
 /// empty folder the ramdisk leaves where it is to be mounted. Writing into
 /// that one succeeds and goes with the next start, which is the same as
 /// writing to [`LOG`]; only a mounted data partition is worth a file.
-fn internal_storage_ready() -> bool {
+pub fn internal_storage_ready() -> bool {
     std::fs::read_to_string("/proc/mounts")
         .map(|mounts| {
             mounts.lines().any(|line| {
