@@ -65,7 +65,11 @@ pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
                 .output()
                 .with_context(|| format!("run {}", s.path))?;
             let said = format!("{}{}", String::from_utf8_lossy(&done.stdout), String::from_utf8_lossy(&done.stderr));
-            for line in said.lines().filter(|l| !l.trim().is_empty()).take(SAID_LINES) {
+            // The last lines are kept, not the first: a step that fails says
+            // why at its end, and a step that talks its way there would
+            // otherwise push the reason out of the log.
+            let lines: Vec<&str> = said.lines().filter(|l| !l.trim().is_empty()).collect();
+            for line in &lines[lines.len().saturating_sub(SAID_LINES)..] {
                 skyward_sys::kmsg(&format!("{}: {line}", s.path))?;
             }
             ensure!(done.status.success(), "{} {} ended: {}", s.path, s.args.join(" "), done.status);
