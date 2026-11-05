@@ -374,7 +374,7 @@ fn main() -> Result<()> {
     let adding = |app: &mut App, name: &str, security: Security, field: Field, choosing: bool| {
         app.state.adding = Some(Adding { name: name.into(), security, field, choosing });
     };
-    let pages: [PageShot; 166] = [
+    let pages: [PageShot; 167] = [
         ("11-install-light-locked", Screen::Install, false, &|app| {
             app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false };
         }),
@@ -914,6 +914,19 @@ fn main() -> Result<()> {
         ("89-decrypt-light-open", Screen::Decrypt, false, &|app| app.data_waiting(None)),
         ("90-decrypt-dark-failed", Screen::Decrypt, true, &|app| {
             app.data_failed("android.hardware.security.keymint.IKeyMintDevice/default is not running".into())
+        }),
+        // The shape a real failure takes: the reason, then one line for each
+        // service that would not stay up. Long enough that a page drawn one
+        // screen tall would lose its end.
+        ("90b-decrypt-light-failed-long", Screen::Decrypt, false, &|app| {
+            app.data_failed(concat!(
+                "none of user 0's 2 blobs opened: android.hardware.weaver.IWeaver/default is not running; ",
+                "the phone's weaver has to be started first\n",
+                "— /vendor/bin/hw/android.hardware.weaver-service.nxp: CANNOT LINK EXECUTABLE ",
+                "\"/vendor/bin/hw/android.hardware.weaver-service.nxp\": library \"libnxp_weaver.so\" not found\n",
+                "— /vendor/bin/hw/android.hardware.weaver-service.nxp: pid 1234 ended: exit status: 1"
+            )
+            .into())
         }),
         ("91-wipe-light-all", Screen::Wipe, false, &|app| app.state.wipe[0] = true),
         ("92-wipe-dark-parts-cache", Screen::Wipe, true, &|app| {

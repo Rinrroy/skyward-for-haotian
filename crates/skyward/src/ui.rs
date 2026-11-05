@@ -1925,7 +1925,12 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     // is not explained by anything a service said, and is
                     // left to speak for itself.
                     let why = match crate::services::why() {
-                        Some(said) if why.contains("is not running") => format!("{why} — {said}"),
+                        // Each service that stopped says its own line, and
+                        // each gets a line of its own on the page.
+                        Some(said) if why.contains("is not running") => {
+                            let lines: Vec<&str> = said.split("; ").collect();
+                            format!("{why}\n— {}", lines.join("\n— "))
+                        }
                         _ => why,
                     };
                     skyward_sys::kmsg(&format!("the data partition stays closed: {why}"))?;
