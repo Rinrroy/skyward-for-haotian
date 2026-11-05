@@ -10,7 +10,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -72,6 +74,21 @@ pub fn why() -> Option<String> {
         false => Some(kept.iter().map(|(_, line)| line.as_str()).collect::<Vec<_>>().join("; ")),
     }
 }
+
+/// The installed system's own linker, where it keeps one. A program built
+/// for the phone may need a library this recovery does not carry, and one
+/// that cannot be had is the end of the road: the linker refuses the
+/// program outright. The phone's own linker knows the phone's own
+/// libraries — its libc++, its base, its log — and they were built
+/// together, where this recovery's were not.
+const PHONE_LINKERS: [&str; 2] = ["/mnt/system/system/bin/linker64", "/mnt/system/bin/linker64"];
+
+/// Where the phone's own libraries are, for a program started through the
+/// phone's own linker.
+const PHONE_LIBRARIES: &str = "/mnt/system/system/lib64:/mnt/system/system_ext/lib64:/mnt/system/product/lib64:/mnt/system/odm/lib64:/vendor/lib64:/vendor/lib64/hw:/odm/lib64";
+
+/// What the linker says when it refuses a program for want of a library.
+const REFUSED: &str = "CANNOT LINK EXECUTABLE";
 
 /// Where the kernel says the highest capability it knows.
 const CAP_LAST_CAP: &str = "/proc/sys/kernel/cap_last_cap";
@@ -319,27 +336,52 @@ fn supervise(s: &Service, who: &Credentials) -> ! {
 /// explanation. Its streams were thrown away, so a phone whose service
 /// would not stay up left only "ended: exit status 1" behind.
 fn run(s: &Service, who: &Credentials) -> Result<String> {
-    let mut started = command(s, who);
+    let refused = Arc::new(AtomicBool::new(false));
+    let (pid, status) = spawn(s, who, None, refused.clone())?;
+    if refused.load(Ordering::Relaxed) {
+        // The linker would not have the program. The phone's own linker
+        // knows the phone's own libraries, and those were built together.
+        if let Some(linker) = phone_linker() {
+            let _ = skyward_sys::kmsg(&format!(
+                "{}: the recovery's own libraries will not do; it is started with the phone's own",
+                s.path
+            ));
+            let (pid, status) = spawn(s, who, Some(&linker), Arc::new(AtomicBool::new(false)))?;
+            return Ok(format!("pid {pid} ended: {status}"));
+        }
+    }
+    Ok(format!("pid {pid} ended: {status}"))
+}
+
+/// Start the program and wait for it to end. `runner` is the phone's own
+/// linker, when this recovery's libraries will not have the program.
+fn spawn(s: &Service, who: &Credentials, runner: Option<&Path>, refused: Arc<AtomicBool>) -> Result<(u32, ExitStatus)> {
+    let mut started = command_with(s, who, runner);
     started.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = started.spawn().with_context(|| format!("start {}", s.path))?;
     let mut keepers = Vec::new();
     if let Some(out) = child.stdout.take() {
-        keepers.push(said(s.path.clone(), out));
+        keepers.push(said(s.path.clone(), out, refused.clone()));
     }
     if let Some(err) = child.stderr.take() {
-        keepers.push(said(s.path.clone(), err));
+        keepers.push(said(s.path.clone(), err, refused.clone()));
     }
     let status = child.wait().context("wait for it")?;
     for k in keepers {
         let _ = k.join();
     }
-    Ok(format!("pid {} ended: {status}", child.id()))
+    Ok((child.id(), status))
+}
+
+/// The installed system's own linker, where the phone keeps one.
+fn phone_linker() -> Option<PathBuf> {
+    PHONE_LINKERS.iter().map(Path::new).find(|p| p.is_file()).map(Path::to_path_buf)
 }
 
 /// Keep the first [`DAEMON_LINES`] lines a program writes to one of its
 /// streams, and go on reading the rest without keeping it — a program that
 /// fills the pipe must never be blocked by a log that is full.
-fn said(path: String, stream: impl io::Read + Send + 'static) -> thread::JoinHandle<()> {
+fn said(path: String, stream: impl io::Read + Send + 'static, refused: Arc<AtomicBool>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         use io::BufRead;
         let mut kept = 0;
@@ -347,6 +389,9 @@ fn said(path: String, stream: impl io::Read + Send + 'static) -> thread::JoinHan
             let Ok(line) = line else { return };
             if line.trim().is_empty() {
                 continue;
+            }
+            if line.contains(REFUSED) {
+                refused.store(true, Ordering::Relaxed);
             }
             if kept < DAEMON_LINES {
                 kept += 1;
@@ -402,9 +447,28 @@ fn create_init_socket(name: &str) -> anyhow::Result<i32> {
 /// tree, reading and writing nothing of the recovery's, finding its
 /// libraries where it names them, and as `who`.
 fn command(s: &Service, who: &Credentials) -> Command {
-    let mut cmd = Command::new(&s.path);
-    cmd.args(&s.args).current_dir("/").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    if !s.libraries.is_empty() {
+    command_with(s, who, None)
+}
+
+/// The program to run. Through the phone's own linker, the libraries are
+/// the phone's own and its own linker decides where they are; this
+/// recovery's search path is of no use to it, and is left out.
+fn command_with(s: &Service, who: &Credentials, runner: Option<&Path>) -> Command {
+    let mut cmd = match runner {
+        Some(linker) => {
+            let mut c = Command::new(linker);
+            c.arg("--library-path").arg(PHONE_LIBRARIES).arg(&s.path).args(&s.args);
+            c.env_remove("LD_LIBRARY_PATH");
+            c
+        }
+        None => {
+            let mut c = Command::new(&s.path);
+            c.args(&s.args);
+            c
+        }
+    };
+    cmd.current_dir("/").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    if runner.is_none() && !s.libraries.is_empty() {
         cmd.env("LD_LIBRARY_PATH", s.libraries.join(":"));
     }
     // Android-init-style sockets: create each one bound and listening under
