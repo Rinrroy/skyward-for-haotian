@@ -86,7 +86,7 @@ const PHONE_LINKERS: [&str; 2] = ["/mnt/system/system/bin/linker64", "/mnt/syste
 
 /// Where the phone's own libraries are, for a program started through the
 /// phone's own linker.
-const PHONE_LIBRARIES: &str = "/mnt/system/system/lib64:/mnt/system/system_ext/lib64:/mnt/system/product/lib64:/mnt/system/odm/lib64:/vendor/lib64:/vendor/lib64/hw:/odm/lib64";
+const PHONE_LIBRARIES: &str = "/mnt/system/system/lib64:/mnt/system/system/lib64/bootstrap:/mnt/system/lib64:/mnt/system/system_ext/lib64:/mnt/system/product/lib64:/mnt/system/odm/lib64:/vendor/lib64:/vendor/lib64/hw:/odm/lib64";
 
 /// What the linker says when it refuses a program for want of a library.
 const REFUSED: &str = "CANNOT LINK EXECUTABLE";
@@ -357,15 +357,19 @@ fn run(s: &Service, who: &Credentials) -> Result<String> {
 /// Start the program and wait for it to end. `runner` is the phone's own
 /// linker, when this recovery's libraries will not have the program.
 fn spawn(s: &Service, who: &Credentials, runner: Option<&Path>, refused: Arc<AtomicBool>) -> Result<(u32, ExitStatus)> {
+    let tag = match runner {
+        Some(_) => " through the phone's own linker",
+        None => "",
+    };
     let mut started = command_with(s, who, runner);
     started.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = started.spawn().with_context(|| format!("start {}", s.path))?;
     let mut keepers = Vec::new();
     if let Some(out) = child.stdout.take() {
-        keepers.push(said(s.path.clone(), out, refused.clone()));
+        keepers.push(said(s.path.clone(), out, refused.clone(), tag.to_string()));
     }
     if let Some(err) = child.stderr.take() {
-        keepers.push(said(s.path.clone(), err, refused.clone()));
+        keepers.push(said(s.path.clone(), err, refused.clone(), tag.to_string()));
     }
     let status = child.wait().context("wait for it")?;
     for k in keepers {
@@ -393,7 +397,7 @@ fn phone_linker() -> Option<PathBuf> {
 /// Keep the first [`DAEMON_LINES`] lines a program writes to one of its
 /// streams, and go on reading the rest without keeping it — a program that
 /// fills the pipe must never be blocked by a log that is full.
-fn said(path: String, stream: impl io::Read + Send + 'static, refused: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+fn said(path: String, stream: impl io::Read + Send + 'static, refused: Arc<AtomicBool>, tag: String) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         use io::BufRead;
         let mut kept = 0;
@@ -407,7 +411,7 @@ fn said(path: String, stream: impl io::Read + Send + 'static, refused: Arc<Atomi
             }
             if kept < DAEMON_LINES {
                 kept += 1;
-                let said = format!("{path}: {line}");
+                let said = format!("{path}{tag}: {line}");
                 remember(said.clone());
                 let _ = skyward_sys::kmsg(&said);
             }
