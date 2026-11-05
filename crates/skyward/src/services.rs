@@ -6,6 +6,7 @@ use skyward_vab::Mounted;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::os::unix::fs::PermissionsExt;
@@ -338,7 +339,7 @@ fn supervise(s: &Service, who: &Credentials) -> ! {
 fn run(s: &Service, who: &Credentials) -> Result<String> {
     let refused = Arc::new(AtomicBool::new(false));
     let (pid, status) = spawn(s, who, None, refused.clone())?;
-    if refused.load(Ordering::Relaxed) {
+    if refused.load(Ordering::Relaxed) && is_program(&s.path) {
         // The linker would not have the program. The phone's own linker
         // knows the phone's own libraries, and those were built together.
         if let Some(linker) = phone_linker() {
@@ -371,6 +372,17 @@ fn spawn(s: &Service, who: &Credentials, runner: Option<&Path>, refused: Arc<Ato
         let _ = k.join();
     }
     Ok((child.id(), status))
+}
+
+/// Whether the file at `path` is a program the linker can load, rather
+/// than a script it would refuse for a different reason: a script's own
+/// error is the script's to report, and the phone's linker would refuse
+/// the script itself.
+fn is_program(path: &str) -> bool {
+    let Ok(mut file) = fs::File::open(path) else { return false };
+    let mut head = [0u8; 4];
+    let Ok(read) = file.read(&mut head) else { return false };
+    read == 4 && &head[..2] != b"#!"
 }
 
 /// The installed system's own linker, where the phone keeps one.
@@ -456,9 +468,12 @@ fn command(s: &Service, who: &Credentials) -> Command {
 fn command_with(s: &Service, who: &Credentials, runner: Option<&Path>) -> Command {
     let mut cmd = match runner {
         Some(linker) => {
+            // The phone's own linker takes the program as its first
+            // argument and has no option for the libraries: it reads
+            // LD_LIBRARY_PATH, like any other program it starts.
             let mut c = Command::new(linker);
-            c.arg("--library-path").arg(PHONE_LIBRARIES).arg(&s.path).args(&s.args);
-            c.env_remove("LD_LIBRARY_PATH");
+            c.arg(&s.path).args(&s.args);
+            c.env("LD_LIBRARY_PATH", PHONE_LIBRARIES);
             c
         }
         None => {
