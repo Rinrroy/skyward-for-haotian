@@ -20,7 +20,7 @@ writes = [{ path = "/sys/class/touch/touch_dev/enable_touch_raw", value = "0" }]
 # and the key service is what the data partition opens with.
 [[service]]
 path = "/system/bin/sh"
-args = ["-c", "mkdir -p /kmlibs && cp /mnt/system/system/lib64/libhardware.so /mnt/system/system/lib64/libvndksupport.so /mnt/system/system/lib64/libnetutils.so /mnt/system/system/lib64/bootstrap/libdl_android.so /kmlibs/ && printf '[recovery]\\nnamespace.default.isolated = false\\n' > /kmlibs/ld.config.txt && printf '<manifest version=\"1.0\" type=\"device\"><hal format=\"aidl\"><name>android.hardware.weaver</name><version>2</version><fqname>IWeaver/default</fqname></hal></manifest>' > /kmlibs/weaver.xml && printf '#!/system/bin/sh\\nexport LD_CONFIG_FILE=/kmlibs/ld.config.txt\\nexec \"$@\"\\n' > /kmlibs/km.sh && chmod 755 /kmlibs/km.sh"]
+args = ["-c", "mkdir -p /kmlibs && cp /mnt/system/system/lib64/libhardware.so /mnt/system/system/lib64/libvndksupport.so /mnt/system/system/lib64/libnetutils.so /mnt/system/system/lib64/bootstrap/libdl_android.so /kmlibs/ && printf '[recovery]\\nnamespace.default.isolated = false\\n' > /kmlibs/ld.config.txt && printf '#!/system/bin/sh\\nexport LD_CONFIG_FILE=/kmlibs/ld.config.txt\\nexec \"$@\"\\n' > /kmlibs/km.sh && chmod 755 /kmlibs/km.sh"]
 oneshot = true
 user = "root"
 groups = ["root"]
@@ -101,6 +101,28 @@ ready_service = "android.hardware.gatekeeper.IGatekeeper/default"
 description = "/vendor/etc/vintf/manifest_pineapple.xml"
 user = "root"
 groups = ["root", "drmrpc"]
+
+# The weaver: the hardware slot a screen lock's secret is kept in, on the
+# builds that keep it there. It is what a credential guarded that way is
+# read back through, so a phone whose lock is kept in a slot cannot open
+# the data partition until this answers — and the page says only that it
+# is not running. A phone whose lock is kept elsewhere never asks for it.
+# Optional, so that a build which keeps it under another name, or not at
+# all, loses nothing but this path.
+[[service]]
+path = "/vendor/bin/hw/android.hardware.weaver-service.nxp"
+libraries = ["/kmlibs", "/vendor/lib64", "/vendor/lib64/hw", "/system/lib64", "/odm/lib64"]
+ready_service = "android.hardware.weaver.IWeaver/default"
+# The phone's own description names the interface and the instance in two
+# fields; the directory reads them as one name, and takes a registration
+# only for a name it has been told of. This says the same the way the
+# directory reads it, and is written out before any service starts.
+description_text = '<manifest version="1.0" type="device"><hal format="aidl"><name>android.hardware.weaver</name><version>2</version><fqname>IWeaver/default</fqname></hal></manifest>'
+# Its init runs it as vendor_nxp_weaver; the others here run as root, and
+# root is what the recovery's own domain answers the secure world as.
+user = "root"
+groups = ["root", "drmrpc"]
+optional = true
 
 # The boot control, which says which slot the bootloader starts next and
 # switches it. It comes last: the phone is usable without it.

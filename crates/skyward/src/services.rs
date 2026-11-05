@@ -94,13 +94,24 @@ pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
     let known = ueventd::accounts(&ueventd::PASSWD_FILES.iter().chain(&ueventd::GROUP_FILES).copied().collect::<Vec<_>>());
     for s in services {
         if !Path::new(&s.path).is_file() {
+            if s.optional {
+                skyward_sys::kmsg(&format!("{} is missing; this phone does without it", s.path))?;
+                continue;
+            }
             bail!("{} is missing; is its partition mounted?", s.path);
         }
         let mut s = s.clone();
         if let Some(dir) = libraries {
             s.libraries.push(dir.to_string_lossy().into_owned());
         }
-        let who = Credentials::of(&s, &known)?;
+        let who = match Credentials::of(&s, &known) {
+            Ok(who) => who,
+            Err(e) if s.optional => {
+                skyward_sys::kmsg(&format!("{e:#}; this phone does without it"))?;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         if s.oneshot {
             // What it said goes to the log. A step that fails names its
             // reason there and nowhere else, and one that finds nothing to
@@ -136,10 +147,19 @@ pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
             skyward_sys::kmsg(&format!("ran {} {}", s.path, s.args.join(" ")))?;
             continue;
         }
+        let optional = s.optional;
         let waiting = s.clone();
         let name = Path::new(&s.path).file_name().map_or_else(|| s.path.clone(), |n| n.to_string_lossy().into_owned());
         thread::Builder::new().name(name).spawn(move || supervise(&s, &who)).context("start a supervising thread")?;
-        ready(&waiting)?;
+        if let Err(e) = ready(&waiting) {
+            // One the phone can do without holds up nothing: it may come up
+            // late, or not at all, and what needs it says so when it is
+            // asked.
+            if !optional {
+                return Err(e);
+            }
+            skyward_sys::kmsg(&format!("{e:#}"))?;
+        }
     }
     Ok(())
 }

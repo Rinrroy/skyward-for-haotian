@@ -691,8 +691,9 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
     let mut registering: Vec<String> = services.iter().flat_map(|s| s.ready_service.iter().chain(&s.registers).cloned()).collect();
     registering.extend(cfg.wlan.iter().map(|w| w.service.clone()));
     let files: Vec<String> = services.iter().filter_map(|s| s.description.clone()).collect();
-    if !registering.is_empty() || !files.is_empty() {
-        let described = secure::publish_descriptions(&registering, &files)?;
+    let texts: Vec<String> = services.iter().filter_map(|s| s.description_text.clone()).collect();
+    if !registering.is_empty() || !files.is_empty() || !texts.is_empty() {
+        let described = secure::publish_descriptions(&registering, &files, &texts)?;
         skyward_sys::kmsg(&format!("{described} of the phone's own service descriptions published"))?;
     }
     let libraries = secure::libraries()?;

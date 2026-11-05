@@ -342,6 +342,12 @@ pub struct Service {
     /// puts in place of another on some builds of the hardware.
     #[serde(default)]
     pub description: Option<String>,
+    /// The description itself, where the phone has none that names the
+    /// service the way the directory wants it read. Written beside the
+    /// others before any service starts, which is when the directory reads
+    /// them — a file a service writes later would come too late.
+    #[serde(default)]
+    pub description_text: Option<String>,
     /// A service the program registers with the other directory, the one
     /// the phone's hardware services of the older kind use. It is written
     /// as the interface and then which of them it is.
@@ -367,6 +373,14 @@ pub struct Service {
     /// names it: it keeps these alone, through its change of user.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// The phone may do without this one. A program that is not on the
+    /// phone, or whose account this build does not have, is passed over
+    /// with a line in the log instead of stopping everything after it, and
+    /// one that does not become ready holds up nothing. For a service only
+    /// some builds carry, whose absence costs a feature rather than the
+    /// phone.
+    #[serde(default)]
+    pub optional: bool,
 }
 
 /// The kernel's capabilities, by the names init's capabilities lines give
@@ -485,7 +499,7 @@ impl DeviceConfig {
         for s in cfg.services.iter().filter(|s| s.oneshot) {
             let waits = s.ready_property.is_some() || s.ready_service.is_some() || s.ready_hardware_service.is_some();
             ensure!(
-                !waits && s.registers.is_empty() && s.description.is_none(),
+                !waits && s.registers.is_empty() && s.description.is_none() && s.description_text.is_none(),
                 "[[service]] {}: a program run once is ready when it ends, and registers nothing",
                 s.path
             );

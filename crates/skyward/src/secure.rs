@@ -365,7 +365,7 @@ fn image(file: &Path) -> Result<(u64, u64)> {
 /// are taken: the directory reads the whole of its description directory
 /// at once, and one file it cannot make sense of leaves it describing
 /// nothing.
-pub fn publish_descriptions(wanted: &[String], files: &[String]) -> Result<usize> {
+pub fn publish_descriptions(wanted: &[String], files: &[String], texts: &[String]) -> Result<usize> {
     let into = Path::new(RECOVERY_DESCRIPTIONS);
     fs::create_dir_all(into).with_context(|| format!("make {}", into.display()))?;
     let mut copied = 0;
@@ -395,6 +395,11 @@ pub fn publish_descriptions(wanted: &[String], files: &[String]) -> Result<usize
     for file in files {
         let from = Path::new(file);
         take(from, &fs::read_to_string(from).with_context(|| format!("read {file}"))?)?;
+    }
+    for (n, text) in texts.iter().enumerate() {
+        let at = into.join(format!("recovery-{n}.xml"));
+        fs::write(&at, as_framework(text)).with_context(|| format!("write {}", at.display()))?;
+        copied += 1;
     }
     let rewritten = say_framework(into)?;
     open_descriptions(into)?;
