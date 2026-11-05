@@ -1917,6 +1917,17 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     show_closed(&mut app, &closed)?;
                 }
                 decrypt::Ended::Opened(Err(why)) => {
+                    // A key service that never came up is why this failed;
+                    // what that service said on its way out is why *it*
+                    // failed, and the page is the only place the phone's
+                    // owner can read it. A failure that is not about a
+                    // service — a wrong PIN, refused by the secure world —
+                    // is not explained by anything a service said, and is
+                    // left to speak for itself.
+                    let why = match crate::services::why() {
+                        Some(said) if why.contains("is not running") => format!("{why} — {said}"),
+                        _ => why,
+                    };
                     skyward_sys::kmsg(&format!("the data partition stays closed: {why}"))?;
                     // The update the system asked for cannot be read, and
                     // is done with.

@@ -26,6 +26,53 @@ const READY_POLL: Duration = Duration::from_millis(100);
 /// to name what was missing, short of a step that fails in a loop.
 const SAID_LINES: usize = 40;
 
+/// The same for a program that stays up, kept per start: a daemon that
+/// ends at once says why on its way out, and next to nothing while it
+/// runs, so a handful of its first lines is what tells the two apart.
+const DAEMON_LINES: usize = 12;
+
+/// What the services last said on their way out, kept where the page can
+/// reach it: a phone whose key service will not stay up says so in the
+/// recovery's own log, which its owner can read nowhere. The page is the
+/// one place they can.
+static SAID: std::sync::OnceLock<std::sync::Mutex<Vec<(String, String)>>> = std::sync::OnceLock::new();
+
+/// How many of a service's last lines are kept for the page.
+const SAID_KEPT: usize = 4;
+
+/// A line with its numbers blanked, so that a service started again and
+/// again is not remembered once per pid. A phone whose key service dies on
+/// every start leaves three hundred lines that differ only in the number,
+/// and keeping them would push out the one line saying why it will not
+/// stay up.
+fn shape(line: &str) -> String {
+    line.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect()
+}
+
+/// Keep one line of a service's own words, a few of the latest: a step that
+/// runs once says why at its end, a daemon says it first, and four of the
+/// latest hold both.
+fn remember(line: String) {
+    let kept = SAID.get_or_init(Default::default);
+    let mut kept = kept.lock().expect("no thread panics while the words are kept");
+    let key = shape(&line);
+    kept.retain(|(k, _)| *k != key);
+    kept.push((key, line));
+    while kept.len() > SAID_KEPT {
+        kept.remove(0);
+    }
+}
+
+/// What the services last said that explains why one of them is not
+/// running, when any of them said anything.
+pub fn why() -> Option<String> {
+    let kept = SAID.get()?.lock().ok()?;
+    match kept.is_empty() {
+        true => None,
+        false => Some(kept.iter().map(|(_, line)| line.as_str()).collect::<Vec<_>>().join("; ")),
+    }
+}
+
 /// Where the kernel says the highest capability it knows.
 const CAP_LAST_CAP: &str = "/proc/sys/kernel/cap_last_cap";
 
@@ -69,8 +116,21 @@ pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
             // why at its end, and a step that talks its way there would
             // otherwise push the reason out of the log.
             let lines: Vec<&str> = said.lines().filter(|l| !l.trim().is_empty()).collect();
+            // Only a step that failed is remembered for the page: a step
+            // that succeeded may still have said something, and that would
+            // not explain a later failure.
+            let failed = !done.status.success();
+            if failed && lines.is_empty() {
+                // A step that failed without a word is still named for the
+                // page: which step it was is half the answer.
+                remember(format!("{} {} ended: {}", s.path, s.args.join(" "), done.status));
+            }
             for line in &lines[lines.len().saturating_sub(SAID_LINES)..] {
-                skyward_sys::kmsg(&format!("{}: {line}", s.path))?;
+                let said = format!("{}: {line}", s.path);
+                if failed {
+                    remember(said.clone());
+                }
+                skyward_sys::kmsg(&said)?;
             }
             ensure!(done.status.success(), "{} {} ended: {}", s.path, s.args.join(" "), done.status);
             skyward_sys::kmsg(&format!("ran {} {}", s.path, s.args.join(" ")))?;
@@ -221,6 +281,9 @@ fn supervise(s: &Service, who: &Credentials) -> ! {
             Ok(how) => format!("{}: {how}", s.path),
             Err(e) => format!("{}: {e:#}", s.path),
         };
+        // The page is told which service stopped, even when it stopped
+        // without a word.
+        remember(line.clone());
         let _ = skyward_sys::kmsg(&line);
         if started.elapsed() < RESTART_DELAY {
             thread::sleep(RESTART_DELAY);
@@ -228,11 +291,51 @@ fn supervise(s: &Service, who: &Credentials) -> ! {
     }
 }
 
-/// Start the program and wait for it to end.
+/// Start the program and wait for it to end, keeping the first lines it
+/// says on the way.
+///
+/// A daemon that ends at once — a library it cannot load, a device that is
+/// not there — says so on standard error, and that one line is the whole
+/// explanation. Its streams were thrown away, so a phone whose service
+/// would not stay up left only "ended: exit status 1" behind.
 fn run(s: &Service, who: &Credentials) -> Result<String> {
-    let mut child = command(s, who).spawn().with_context(|| format!("start {}", s.path))?;
+    let mut started = command(s, who);
+    started.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = started.spawn().with_context(|| format!("start {}", s.path))?;
+    let mut keepers = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        keepers.push(said(s.path.clone(), out));
+    }
+    if let Some(err) = child.stderr.take() {
+        keepers.push(said(s.path.clone(), err));
+    }
     let status = child.wait().context("wait for it")?;
+    for k in keepers {
+        let _ = k.join();
+    }
     Ok(format!("pid {} ended: {status}", child.id()))
+}
+
+/// Keep the first [`DAEMON_LINES`] lines a program writes to one of its
+/// streams, and go on reading the rest without keeping it — a program that
+/// fills the pipe must never be blocked by a log that is full.
+fn said(path: String, stream: impl io::Read + Send + 'static) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        use io::BufRead;
+        let mut kept = 0;
+        for line in io::BufReader::new(stream).lines() {
+            let Ok(line) = line else { return };
+            if line.trim().is_empty() {
+                continue;
+            }
+            if kept < DAEMON_LINES {
+                kept += 1;
+                let said = format!("{path}: {line}");
+                remember(said.clone());
+                let _ = skyward_sys::kmsg(&said);
+            }
+        }
+    })
 }
 
 
