@@ -239,6 +239,39 @@ fn session_in(folder: &Path) -> Option<File> {
     Some(file)
 }
 
+/// Keep the kernel's own log of this session beside the session's lines.
+///
+/// The lines [`kmsg`] writes are ours; what the kernel said — the mounts,
+/// the denials, the devices that were not there — is in its ring buffer,
+/// and the ring buffer goes with the restart. A session that ended badly is
+/// worth reading after the phone has started again, so it is written out
+/// as well: to the log disk when there is one, to the internal storage
+/// otherwise, and nowhere when neither can be written.
+pub fn keep_kernel_log() -> Result<()> {
+    let folder = match mount_log_disk() {
+        Some(_) => PathBuf::from(LOG_DISK_FOLDER),
+        None if internal_storage_ready() => PathBuf::from(LOG_FOLDER),
+        None => return Ok(()),
+    };
+    std::fs::create_dir_all(&folder).ok();
+    let at = since_boot().map(|d| d.as_secs()).unwrap_or(0);
+    let read = std::process::Command::new("/system/bin/dmesg").output().context("read the kernel log")?;
+    let text = String::from_utf8_lossy(&read.stdout);
+    // A phone that has just started says much before we arrive; the last
+    // part is where the trouble is, and the partition is small.
+    let mut lines: Vec<&str> = text.lines().collect();
+    if lines.len() > 4000 {
+        lines = lines.split_off(lines.len() - 4000);
+    }
+    let mut out = String::from("the kernel log of this session, as it stood when the devices were brought up\n\n");
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    std::fs::write(folder.join(format!("kernel-{at}.log")), out).with_context(|| format!("write the kernel log to {}", folder.display()))?;
+    Ok(())
+}
+
 /// Leave the newest few sessions in `folder` and take the rest away, so a
 /// small partition does not fill with them.
 fn forget_older_sessions(folder: &Path) {

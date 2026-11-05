@@ -701,6 +701,12 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
         skyward_sys::kmsg(&format!("the phone's own libraries are at {}", dir.display()))?;
     }
     services::start(&services, libraries.as_deref())?;
+    // The kernel's own log of this session goes out with the session's
+    // lines: the ring buffer it lives in goes with the next start, and
+    // that is exactly when it is wanted.
+    if let Err(e) = skyward_sys::keep_kernel_log() {
+        let _ = skyward_sys::kmsg(&format!("the kernel log is not kept: {e:#}"));
+    }
     agree_on_the_notes_key(&registering)
 }
 
