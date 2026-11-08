@@ -76,9 +76,14 @@ impl Block {
 /// chain in it points at. A phone that keeps none of the others simply has
 /// fewer entries.
 pub fn partitions(slot: Slot) -> Vec<PathBuf> {
+    partitions_in(Path::new(BY_NAME), slot)
+}
+
+/// [`partitions`], under `base`, where a test keeps stand-in partitions.
+fn partitions_in(base: &Path, slot: Slot) -> Vec<PathBuf> {
     ["vbmeta", "vbmeta_system", "vbmeta_vendor"]
         .iter()
-        .map(|name| Path::new(BY_NAME).join(format!("{name}{}", slot.suffix())))
+        .map(|name| base.join(format!("{name}{}", slot.suffix())))
         .filter(|path| path.exists())
         .collect()
 }
@@ -111,6 +116,10 @@ pub fn store(block: &Block) -> Result<()> {
     file.write_all(&block.bytes)
         .with_context(|| format!("write {}", block.path.display()))?;
     file.flush().with_context(|| format!("flush {}", block.path.display()))?;
+    // The read-back below goes through the page cache, which would pass
+    // even if the write had not reached the disk: this is what makes the
+    // block survive the power going away mid-change.
+    file.sync_all().with_context(|| format!("sync {}", block.path.display()))?;
     drop(file);
     let back = open(&block.path)?;
     if back.bytes != block.bytes {
@@ -172,7 +181,16 @@ pub struct Change {
 
 /// Every vbmeta block the slot keeps, read whole.
 fn blocks(slot: Slot) -> Result<Vec<Block>> {
-    let paths = partitions(slot);
+    #[cfg(test)]
+    if let Ok(base) = std::env::var("SKYWARD_VAB_TEST_BLOCKS") {
+        return blocks_in(Path::new(&base), slot);
+    }
+    blocks_in(Path::new(BY_NAME), slot)
+}
+
+/// [`blocks`], out of `base`, where a test keeps stand-in partitions.
+fn blocks_in(base: &Path, slot: Slot) -> Result<Vec<Block>> {
+    let paths = partitions_in(base, slot);
     if paths.is_empty() {
         bail!("no vbmeta partition for slot {}", slot.letter());
     }
@@ -218,6 +236,30 @@ pub fn restore_all(slot: Slot, dir: &Path) -> Result<Vec<Change>> {
         changes.push(Change { name, before, after, kept: Some(copy) });
     }
     Ok(changes)
+}
+
+/// Turn both checks back on: put the copy of each block back out of `dir`
+/// where one was kept. Where no copy is kept, the blocks are left as they
+/// are unless every one already says both checks are on: the flags a
+/// phone's own build set are not always the two zeros this writes, and a
+/// build that ships its hashtree off cannot start with them on.
+pub fn enable(slot: Slot, dir: Option<&Path>) -> Result<Vec<Change>> {
+    if let Some(dir) = dir {
+        let restored = restore_all(slot, dir)?;
+        if !restored.is_empty() {
+            return Ok(restored);
+        }
+    }
+    for block in blocks(slot)? {
+        if block.flags() & (HASHTREE_DISABLED | VERIFICATION_DISABLED) != 0 {
+            bail!(
+                "no copy is kept of what {} held first, and a check is off in it; writing \
+                 zeros there could leave the phone unable to start, so nothing was changed",
+                block.name()
+            );
+        }
+    }
+    Ok(Vec::new())
 }
 
 /// The copy of `name` taken most recently under `dir`, out of the files
@@ -299,5 +341,86 @@ mod tests {
         std::fs::write(&path, vec![0u8; 4096]).unwrap();
         assert!(open(&path).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stand-in vbmeta partition as a build ships it, with `flags`.
+    fn shipped(dir: &Path, name: &str, flags: u32) -> Vec<u8> {
+        let mut bytes = vec![0u8; 4096];
+        bytes[..4].copy_from_slice(MAGIC);
+        bytes[ALGORITHM_AT..ALGORITHM_AT + 4].copy_from_slice(&2u32.to_be_bytes());
+        bytes[FLAGS_AT..FLAGS_AT + 4].copy_from_slice(&flags.to_be_bytes());
+        std::fs::write(dir.join(name), &bytes).unwrap();
+        bytes
+    }
+
+    fn flags_of(path: &Path) -> u32 {
+        let bytes = std::fs::read(path).unwrap();
+        u32::from_be_bytes([bytes[FLAGS_AT], bytes[FLAGS_AT + 1], bytes[FLAGS_AT + 2], bytes[FLAGS_AT + 3]])
+    }
+
+    /// The two chains the recovery offers, over stand-in partitions, the
+    /// way the phone would run them: the checks go off with a copy of each
+    /// block kept, a package is installed with them off, and putting them
+    /// back writes the copies whole. Where no copy is kept, a block with a
+    /// check off is left as it is — writing zeros is only for blocks that
+    /// already say both checks are on.
+    #[test]
+    fn the_change_is_made_and_taken_back_through_the_whole_chain() {
+        let scratch = std::env::temp_dir().join(format!("skyward-avb-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let base = scratch.join("by-name");
+        std::fs::create_dir_all(&base).unwrap();
+        let factory = [
+            ("vbmeta_a", shipped(&base, "vbmeta_a", 0)),
+            ("vbmeta_system_a", shipped(&base, "vbmeta_system_a", 0)),
+            ("vbmeta_vendor_a", shipped(&base, "vbmeta_vendor_a", 0)),
+        ];
+        std::env::set_var("SKYWARD_VAB_TEST_BLOCKS", &base);
+        let both = HASHTREE_DISABLED | VERIFICATION_DISABLED;
+
+        // Turning the checks off: each block changes only in its flag word,
+        // and a whole copy of what it held goes somewhere that outlives it.
+        let kept = scratch.join("kept");
+        let changes = set_all(Slot::A, both, &kept).unwrap();
+        assert_eq!(changes.len(), 3, "every block is told of");
+        for (name, was) in &factory {
+            let change = changes.iter().find(|c| c.name == *name).unwrap();
+            let copy = change.kept.as_ref().expect("a copy was kept");
+            assert_eq!(std::fs::read(copy).unwrap(), *was, "the copy is the block as shipped");
+            assert_eq!(flags_of(&base.join(name)), both, "{name} has both checks off");
+        }
+
+        // A package is installed with the checks off; the checks the
+        // bootloader would make are what the flags say they are.
+        let readings = read(Slot::A).unwrap();
+        assert!(readings.iter().all(|r| !r.verity() && !r.verification()));
+
+        // Putting them back: the copies go back whole, the phone's own
+        // flags and not zeros, and the copies stay where they were.
+        let back = enable(Slot::A, Some(&kept)).unwrap();
+        assert_eq!(back.len(), 3, "every block is put back");
+        for (name, was) in &factory {
+            assert_eq!(std::fs::read(&base.join(name)).unwrap(), *was, "{name} is as it shipped");
+        }
+
+        // With every block already on, a further enable has nothing to do.
+        assert!(enable(Slot::A, Some(&kept)).unwrap().is_empty());
+
+        // A build that ships its hashtree off, and no copy kept: the block
+        // is left as it is rather than written zeros it cannot start with.
+        shipped(&base, "vbmeta_a", HASHTREE_DISABLED);
+        let refused = enable(Slot::A, None).unwrap_err();
+        assert!(refused.to_string().contains("vbmeta_a"), "{refused:#}");
+        assert_eq!(flags_of(&base.join("vbmeta_a")), HASHTREE_DISABLED, "the block was not written");
+
+        // An update package wrote the block again, with its own flags: it
+        // is not dragged back over, which would count the phone backwards.
+        shipped(&base, "vbmeta_a", 0);
+        let untouched = enable(Slot::A, Some(&kept)).unwrap();
+        assert!(untouched.is_empty(), "a block that does not say the recovery left it saying is skipped");
+        assert_eq!(flags_of(&base.join("vbmeta_a")), 0);
+
+        std::env::remove_var("SKYWARD_VAB_TEST_BLOCKS");
+        std::fs::remove_dir_all(&scratch).unwrap();
     }
 }

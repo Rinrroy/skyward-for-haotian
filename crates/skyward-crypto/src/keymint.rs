@@ -1,5 +1,5 @@
 use crate::token::Token;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use skyward_binder::driver::{Binder, Handle};
 use skyward_binder::parcel::Parcel;
 use skyward_binder::{service, status};
@@ -7,6 +7,11 @@ use skyward_binder::{service, status};
 /// The phone's own key service, the only thing that can use a key the
 /// hardware wrapped.
 pub const SERVICE: &str = "android.hardware.security.keymint.IKeyMintDevice/default";
+
+/// The name the key service of the older kind goes by: the one Android
+/// put in its place in the twelfth version of Android, and which the
+/// phones that are older than that still carry.
+pub const OLDER_SERVICE: &str = "android.hardware.security.keymaster.IKeyMasterDevice/default";
 
 const DEVICE: &str = "android.hardware.security.keymint.IKeyMintDevice";
 const OPERATION: &str = "android.hardware.security.keymint.IKeyMintOperation";
@@ -126,11 +131,20 @@ pub struct KeyMint<'a> {
 }
 
 impl<'a> KeyMint<'a> {
-    /// Reach the running key service, or say that none is.
+    /// Reach the running key service, or say that none is. A phone whose
+    /// key service is the older kind answers to another name, and such a
+    /// phone is told so in words rather than being left to fail on a call
+    /// the service does not answer.
     pub fn open(binder: &'a Binder) -> Result<KeyMint<'a>> {
-        let device = service::find(binder, SERVICE)?
-            .with_context(|| format!("{SERVICE} is not running; the phone's key service has to be started first"))?;
-        Ok(KeyMint { device })
+        if let Some(device) = service::find(binder, SERVICE)? {
+            return Ok(KeyMint { device });
+        }
+        if service::find(binder, OLDER_SERVICE)?.is_some() {
+            bail!(
+                "the phone's key service is the older kind ({OLDER_SERVICE}), which this recovery does not talk to; it needs a phone of the twelfth version of Android or later"
+            );
+        }
+        bail!("neither {SERVICE} nor {OLDER_SERVICE} is running; the phone's key service has to be started first")
     }
 
     pub fn hardware(&self) -> Result<Hardware> {

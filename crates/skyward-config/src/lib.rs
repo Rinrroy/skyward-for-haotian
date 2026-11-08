@@ -308,6 +308,12 @@ pub struct Partitions {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Service {
     pub path: String,
+    /// Other paths the same service is known by on other builds of the
+    /// hardware, tried in order where `path` is absent: a vendor binary
+    /// whose name the installed ROM changed keeps the service for phones
+    /// still on the older one.
+    #[serde(default)]
+    pub alternates: Option<Vec<String>>,
     /// What the program is given after its own path, as init gives a
     /// service the words after its path.
     #[serde(default)]

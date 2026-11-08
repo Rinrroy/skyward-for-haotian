@@ -1023,17 +1023,18 @@ fn verity_mode() -> Option<String> {
 /// Turning them back on puts the copy back, where there is one: the flags a
 /// phone's own build set are not always the two this page writes, and a
 /// build that ships its hashtree off would not start with them on. Writing
-/// zeros is what is left when no copy survives.
+/// zeros are written only where every block already says both checks are
+/// on; a block with a check off and no copy kept is left as it is.
 fn set_avb(on: bool) -> Result<Vec<skyward_vab::avb::Change>, String> {
     let write = || -> Result<Vec<skyward_vab::avb::Change>> {
         let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
         if on {
-            if let Some(folder) = crate::avbkeep::existing() {
-                let restored = skyward_vab::avb::restore_all(slot, &folder)?;
-                if !restored.is_empty() {
-                    let _ = skyward_sys::kmsg(&format!("avb: {} blocks put back from {}", restored.len(), folder.display()));
-                    return Ok(restored);
-                }
+            let folder = crate::avbkeep::existing();
+            let restored = skyward_vab::avb::enable(slot, folder.as_deref())?;
+            if !restored.is_empty() {
+                let at = folder.map(|f| f.display().to_string()).unwrap_or_default();
+                let _ = skyward_sys::kmsg(&format!("avb: {} blocks put back from {}", restored.len(), at));
+                return Ok(restored);
             }
         }
         let flags = if on {

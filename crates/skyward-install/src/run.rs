@@ -48,6 +48,7 @@ const RETRY: &str = "retry";
 /// Scripts written for other recoveries start with the shell they find
 /// here, and look for programs where those recoveries keep them.
 const SBIN_SHELL: &str = "/sbin/sh";
+const SBIN_BASH: &str = "/sbin/bash";
 const SHELL: &str = "/system/bin/sh";
 const SCRIPT_PATH: &str = "/sbin:/system/bin:/system/xbin";
 
@@ -128,8 +129,16 @@ impl Installer {
         let (event_tx, events) = mpsc::channel();
         let (commands, command_rx) = mpsc::channel();
         let shared = Arc::new(Shared::default());
-        let mut ctx =
-            Context { events: event_tx, signal, commands: command_rx, shared: shared.clone(), detach: Some(detach), options, origin };
+        let mut ctx = Context {
+            events: event_tx,
+            signal,
+            commands: command_rx,
+            shared: shared.clone(),
+            detach: Some(detach),
+            options,
+            origin,
+            package: None,
+        };
         let thread = thread::Builder::new()
             .name("installer".into())
             .spawn(move || {
@@ -214,6 +223,11 @@ struct Context {
     detach: Option<Detach>,
     options: Options,
     origin: Origin,
+    /// Where the package is, when the phone holds it as a file: the path the
+    /// install script is told, so that it reads the package where it lies and
+    /// under the name it has. A package the computer sends has no such path,
+    /// and the script is told the mount the bytes are served at instead.
+    package: Option<PathBuf>,
 }
 
 impl Context {
@@ -305,6 +319,11 @@ fn run_file(ctx: &mut Context, path: &Path) -> Outcome {
         Err(e) => return Outcome::Failed(Failure::Unreadable(format!("{e:#}"))),
     };
     let _ = kmsg(&format!("install: {}, {} bytes", path.display(), offer.size));
+    // The script is told where the package is, so it reads it there and under
+    // the name the phone gave it rather than through the mount: a package the
+    // phone holds is read twice by the script, and once through a mount whose
+    // every block is checked is twice the work.
+    ctx.package = Some(path.to_path_buf());
     serve_local(ctx, file, offer, path)
 }
 
@@ -699,6 +718,10 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
     });
     let logged = thread::spawn(move || {
         lines(stderr, |line| {
+            // The engine's own words are the only explanation it gives, and
+            // the file here goes with the restart: each line goes to the
+            // kernel log too, where it outlives it.
+            let _ = kmsg(&format!("engine: {line}"));
             if let Some(l) = ota::log(line) {
                 let _ = tx.send(Line::Log(l));
             }
@@ -739,6 +762,9 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
     let ended = child.wait().context("wait for update_engine")?;
     status.join().expect("the status reader does not panic").context("read update_engine's status")?;
     logged.join().expect("the log reader does not panic").context("read update_engine's log")?;
+    if ended.code() != Some(0) {
+        let _ = kmsg(&format!("install: why the engine stopped is in {ENGINE_LOG}, which a restart takes away"));
+    }
     match (ended.code(), error) {
         (_, Some(code)) => Ok(code),
         (Some(code), None) => Ok(code),
@@ -988,16 +1014,22 @@ exec unzip -p "$3" "$4"
 }
 
 /// Give scripts written for other recoveries the shell they start with.
+/// Some start with `bash`, which here is the same shell under another name:
+/// a package whose script says `#!/sbin/bash` otherwise does not run at
+/// all, which is what a Durex install did.
 fn shell_at_sbin() -> Result<()> {
-    let link = Path::new(SBIN_SHELL);
-    match fs::symlink_metadata(link) {
-        Ok(_) => return Ok(()),
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("look at {SBIN_SHELL}")),
+    for name in [SBIN_SHELL, SBIN_BASH] {
+        let link = Path::new(name);
+        match fs::symlink_metadata(link) {
+            Ok(_) => continue,
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("look at {name}")),
+        }
+        let dir = link.parent().expect("the link is in a folder");
+        fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
+        symlink(SHELL, link).with_context(|| format!("link {name} to {SHELL}"))?;
     }
-    let dir = link.parent().expect("the link is in a folder");
-    fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
-    symlink(SHELL, link).with_context(|| format!("link {SBIN_SHELL} to {SHELL}"))
+    Ok(())
 }
 
 /// A line one of the install script's outputs gave.
@@ -1029,7 +1061,10 @@ fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
     let (output_read, output_write) = pipe(0)?;
     let fd = requests_write.as_raw_fd();
     let mut command = std::process::Command::new(BINARY);
-    command.args([API_VERSION, &fd.to_string(), fuse::PACKAGE]);
+    // The package is named as the phone holds it where it does; a package the
+    // computer sends is only in the mount, and is named there.
+    let package = ctx.package.as_deref().unwrap_or(Path::new(fuse::PACKAGE)).to_string_lossy().into_owned();
+    command.args([API_VERSION, &fd.to_string(), &package]);
     // A script started again after a restart cut it off is told so, as
     // Android's own recovery tells it, to pick up where it was.
     if ctx.origin == (Origin::Asked { retry: true }) {

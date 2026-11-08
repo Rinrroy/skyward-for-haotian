@@ -111,6 +111,18 @@ const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
     let known = ueventd::accounts(&ueventd::PASSWD_FILES.iter().chain(&ueventd::GROUP_FILES).copied().collect::<Vec<_>>());
     for s in services {
+        let mut s = s.clone();
+        if !Path::new(&s.path).is_file() {
+            // The same service carries another name on other builds of the
+            // hardware; the installed ROM renamed its vendor binary. Take
+            // the first alternate that is there, so the service keeps
+            // working without a separate device file per build.
+            if let Some(alts) = &s.alternates {
+                if let Some(found) = alts.iter().find(|a| Path::new(a).is_file()) {
+                    s.path = found.clone();
+                }
+            }
+        }
         if !Path::new(&s.path).is_file() {
             if s.optional {
                 skyward_sys::kmsg(&format!("{} is missing; this phone does without it", s.path))?;
@@ -118,7 +130,6 @@ pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
             }
             bail!("{} is missing; is its partition mounted?", s.path);
         }
-        let mut s = s.clone();
         if let Some(dir) = libraries {
             s.libraries.push(dir.to_string_lossy().into_owned());
         }

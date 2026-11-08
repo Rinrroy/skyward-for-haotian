@@ -57,16 +57,29 @@ impl Encryption {
     /// the encryption off leaves them out, and so does the table of the
     /// other slot, which a recovery started from one slot reads while the
     /// partition stays encrypted as the system of the other slot left it.
+    /// The words are read as the phone writes them and not as one build of
+    /// it writes them: the algorithm may be left out, the one left out
+    /// being the one every build uses, and the key may be said to be
+    /// wrapped in either of the two ways a phone says it.
     pub fn of(entry: &Entry) -> Result<Encryption> {
         let Some(said) = entry.extra("metadata_encryption") else {
             return Ok(Encryption { cipher: CIPHERS[0].1.to_string(), wrapped: true });
         };
         let (name, rest) = said.split_once(':').unwrap_or((said, ""));
-        let cipher = CIPHERS
-            .iter()
-            .find_map(|(theirs, kernels)| (*theirs == name).then_some(*kernels))
-            .with_context(|| format!("no cipher here is the {name} the phone names"))?;
-        Ok(Encryption { cipher: cipher.to_string(), wrapped: rest == "wrappedkey_v0" })
+        // The algorithm left out is the one every build of this Android
+        // uses, which is the first of the ones here.
+        let cipher = if name.is_empty() {
+            CIPHERS[0].1
+        } else {
+            CIPHERS
+                .iter()
+                .find_map(|(theirs, kernels)| (*theirs == name).then_some(*kernels))
+                .with_context(|| format!("no cipher here is the {name} the phone names"))?
+        };
+        // The key is wrapped in hardware when the phone says so in either
+        // of the two ways it says it.
+        let wrapped = rest.split('+').any(|flag| flag == "wrappedkey" || flag == "wrappedkey_v0");
+        Ok(Encryption { cipher: cipher.to_string(), wrapped })
     }
 }
 

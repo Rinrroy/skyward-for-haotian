@@ -178,13 +178,22 @@ const LOG_DISK_FOLDER: &str = "/mnt/logfs/skyward";
 /// How many sessions are kept where they outlast the start.
 const SESSIONS_KEPT: usize = 20;
 
+/// The bytes the sessions and kernel logs may take together on the
+/// bootloader's log disk. The disk is a few megabytes and carries the
+/// maker's own logs besides, and the kernel's log of one session can be
+/// most of a megabyte, so the older files go by their size together and
+/// not by their count alone: a count alone let the disk fill and every
+/// write to it fail, which took the WLAN down with it.
+const LOG_DISK_BUDGET: u64 = 2_500_000;
+
 /// The file [`kmsg`] writes its lines to as well, once [`keep_log`] opened
 /// it.
 static KEPT: OnceLock<Mutex<File>> = OnceLock::new();
 
 /// The lasting copy's file, opened the first time the data partition is
-/// writable.
-static KEPT_LONG: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+/// writable, with the folder it was opened in — the folder names the write
+/// when it fails, which the message names truly or not at all.
+static KEPT_LONG: OnceLock<Mutex<Option<(File, PathBuf)>>> = OnceLock::new();
 
 /// The second past the start at which the lasting copy was last tried, so a
 /// phone whose data stays closed pays one attempt a second rather than one
@@ -201,7 +210,7 @@ pub fn keep_log(path: &Path) -> Result<()> {
 /// The lasting copy, opened where it can be; `None` while neither the data
 /// partition nor the bootloader's log disk can be written to, or between the
 /// attempts to open one.
-fn lasting_log() -> Option<File> {
+fn lasting_log() -> Option<(File, PathBuf)> {
     let held = KEPT_LONG.get_or_init(|| Mutex::new(None));
     let mut held = held.lock().ok()?;
     if held.is_none() {
@@ -214,14 +223,16 @@ fn lasting_log() -> Option<File> {
         // partition is open, and a session that ended badly is worth reading
         // precisely when that partition is closed. Internal storage is the
         // fallback, for a phone whose log disk will not mount.
-        let file = match mount_log_disk() {
-            Some(_) => session_in(Path::new(LOG_DISK_FOLDER)),
-            None if internal_storage_ready() => session_in(Path::new(LOG_FOLDER)),
-            None => None,
-        }?;
-        *held = Some(file);
+        let folder = match mount_log_disk() {
+            Some(_) => PathBuf::from(LOG_DISK_FOLDER),
+            None if internal_storage_ready() => PathBuf::from(LOG_FOLDER),
+            None => return None,
+        };
+        let file = session_in(&folder)?;
+        *held = Some((file, folder));
     }
-    held.as_ref()?.try_clone().ok()
+    let (file, folder) = held.as_ref()?;
+    Some((file.try_clone().ok()?, folder.clone()))
 }
 
 /// A file for this session in `folder`, opened after what earlier sessions
@@ -269,22 +280,37 @@ pub fn keep_kernel_log() -> Result<()> {
         out.push('\n');
     }
     std::fs::write(folder.join(format!("kernel-{at}.log")), out).with_context(|| format!("write the kernel log to {}", folder.display()))?;
+    forget_older_sessions(&folder);
     Ok(())
 }
 
-/// Leave the newest few sessions in `folder` and take the rest away, so a
-/// small partition does not fill with them.
+/// Leave the newest sessions and kernel logs in `folder` and take the rest
+/// away, so a small partition does not fill with them: newest first, while
+/// their count and their size together stay under the budget. On the
+/// bootloader's disk the kernel's log of a session past is the heavy part
+/// and was never taken away before, which is what filled it.
 fn forget_older_sessions(folder: &Path) {
     let Ok(entries) = std::fs::read_dir(folder) else { return };
-    let mut sessions: Vec<PathBuf> = entries
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("session-")))
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("session-") || n.starts_with("kernel-")))
+        .filter_map(|p| {
+            let meta = std::fs::metadata(&p).ok()?;
+            Some((meta.modified().ok()?, meta.len(), p))
+        })
         .collect();
-    sessions.sort();
-    let extra = sessions.len().saturating_sub(SESSIONS_KEPT);
-    for old in sessions.into_iter().take(extra) {
-        let _ = std::fs::remove_file(old);
+    files.sort();
+    files.reverse();
+    let mut kept = 0usize;
+    let mut taken = 0u64;
+    for (_when, size, path) in &files {
+        if kept < SESSIONS_KEPT && taken + size <= LOG_DISK_BUDGET {
+            kept += 1;
+            taken += size;
+            continue;
+        }
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -374,8 +400,8 @@ pub fn kmsg(line: &str) -> Result<()> {
         let mut kept = kept.lock().expect("nothing panics while writing the log");
         write!(kept, "{stamped}").with_context(|| format!("write {LOG}"))?;
     }
-    if let Some(mut lasting) = lasting_log() {
-        write!(lasting, "{stamped}").with_context(|| format!("write {LOG_FOLDER}"))?;
+    if let Some((mut lasting, at)) = lasting_log() {
+        write!(lasting, "{stamped}").with_context(|| format!("write {}", at.display()))?;
     }
     Ok(())
 }

@@ -548,18 +548,21 @@ fn avb(action: AvbAction) -> Result<()> {
             // Turning them back on means putting the copy back where one was
             // kept: what a phone's own build set is not always the two values
             // this command writes, and writing zeros over a build that ships
-            // its hashtree off leaves it unable to start.
+            // its hashtree off leaves it unable to start. Where no copy is
+            // kept and a block still has a check off, the blocks are left
+            // as they are.
             if matches!(action, AvbAction::Enable) {
-                if let Some(folder) = avbkeep::existing() {
-                    let restored = skyward_vab::avb::restore_all(slot, &folder)?;
-                    if !restored.is_empty() {
-                        for c in &restored {
-                            println!("{:<22} 0x{:x} -> 0x{:x}   put back from {}", c.name, c.before, c.after, c.kept.as_deref().unwrap_or(Path::new("")).display());
-                        }
-                        println!();
-                        println!("the blocks are as they were before the change, out of {}", folder.display());
-                        return Ok(());
+                let folder = avbkeep::existing();
+                let restored = skyward_vab::avb::enable(slot, folder.as_deref())?;
+                if !restored.is_empty() {
+                    for c in &restored {
+                        println!("{:<22} 0x{:x} -> 0x{:x}   put back from {}", c.name, c.before, c.after, c.kept.as_deref().unwrap_or(Path::new("")).display());
                     }
+                    println!();
+                    if let Some(folder) = &folder {
+                        println!("the blocks are as they were before the change, out of {}", folder.display());
+                    }
+                    return Ok(());
                 }
             }
             let wanted = match action {
@@ -642,8 +645,27 @@ fn load_modules(cfg: &DeviceConfig, names: &[String]) -> Result<Vec<PathBuf>> {
 /// from the partitions just mounted: on the 13 Ultra, the touchscreen
 /// driver and the touch processing. Of the programs the configuration
 /// names, only those this phone's build of the hardware runs are started.
+/// The device nodes ueventd makes for the partitions take a moment past the
+/// kernel's own start: the coldboot that names them races this bring-up,
+/// and reading the installed system's version before the names are there
+/// left a phone looping inside its own recovery. Wait for the names, but
+/// not for long; whatever still fails afterwards fails as it did.
+fn wait_for_partition_nodes(slot: skyward_vab::Slot) {
+    let expected = Path::new("/dev/block/by-name").join(format!("vendor{}", slot.suffix()));
+    let began = std::time::Instant::now();
+    while !expected.exists() && began.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let _ = skyward_sys::kmsg(&format!(
+        "the partition names {} after {} ms",
+        if expected.exists() { "are ready" } else { "did not appear" },
+        began.elapsed().as_millis()
+    ));
+}
+
 #[cfg(target_os = "android")]
 fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
+    wait_for_partition_nodes(slot);
     let nodes = skyward_sys::ueventd::apply()?;
     skyward_sys::kmsg(&format!("{nodes} device nodes given the owner their phone describes"))?;
     let props = skyward_info::installed_props(slot)?;
@@ -700,13 +722,16 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
     if let Some(dir) = &libraries {
         skyward_sys::kmsg(&format!("the phone's own libraries are at {}", dir.display()))?;
     }
-    services::start(&services, libraries.as_deref())?;
-    // The kernel's own log of this session goes out with the session's
-    // lines: the ring buffer it lives in goes with the next start, and
-    // that is exactly when it is wanted.
+    // Keep the kernel's own log whether the services came up or not. A
+    // service that ends at once, or one that never registers, says why in
+    // that log; returning early from this function used to leave it behind
+    // in a ring buffer that goes away with the next start -- exactly when
+    // it is wanted. The services' own error is still returned unchanged.
+    let started = services::start(&services, libraries.as_deref());
     if let Err(e) = skyward_sys::keep_kernel_log() {
         let _ = skyward_sys::kmsg(&format!("the kernel log is not kept: {e:#}"));
     }
+    started?;
     agree_on_the_notes_key(&registering)
 }
 

@@ -14,6 +14,21 @@ sources = ["vendor_boot", "vendor_dlkm", "vendor", "system_dlkm"]
 load = ["synaptics_tcm2"]
 [touch]
 writes = [{ path = "/sys/class/touch/touch_dev/enable_touch_raw", value = "0" }]
+# Some boot loaders copy a fixed-size slice of the ramdisk stream, sized
+# for the stock recovery image, and the tail of a bigger stream never
+# reaches the kernel's unpacker: the entries sitting last in the cpio --
+# the UI font and the whole private OMAPI folder -- come up missing on
+# those phones while every earlier entry is fine. So the two of them ride
+# in one zip placed early, and this step lays them back out before any
+# service asks for them. A phone whose loader delivers everything still
+# runs this, unpacks, and moves on; a step that cannot be done says why
+# and steps aside, costing at most the font and the WLAN-side extras.
+[[service]]
+path = "/system/bin/sh"
+args = ["-c", 'R=/system/bin/recovery; if $R unzip /skyward/payload.zip skyward/restore.sh > /skyward/restore.sh.part; then mv /skyward/restore.sh.part /skyward/restore.sh; sh /skyward/restore.sh; else echo could not extract the restore; fi; rm -f /skyward/restore.sh.part; exit 0']
+oneshot = true
+user = "root"
+groups = ["root"]
 # Stage the shared libraries the key services ask for that the recovery's
 # own library folder does not carry. Nothing here may fail for a reason of
 # the WLAN's: a step that goes wrong takes every service after it with it,
@@ -25,14 +40,18 @@ oneshot = true
 user = "root"
 groups = ["root"]
 
-# Lay the signed rfkill of the running kernel over the flattened copy, whose
-# signature the kernel does not take. The WLAN is what loads it, so a phone
-# that keeps the module elsewhere, or flattens it differently, loses the
-# WLAN and not the key services: this says what it could not find and steps
-# aside rather than failing.
+# Lay the signed rfkill of the running kernel where the module loader will
+# find it. Some builds flatten system_dlkm into a writable copy, whose
+# signature the kernel does not take: the signed module is bound over it.
+# Others have no flatten/ directory at all and their system_dlkm is a
+# read-only erofs; there the signed module goes into /lib/modules, the
+# vendor_boot source, with the modules.dep the loader asks for. Either way
+# a WLAN that cannot load rfkill costs the phone its WiFi and nothing else,
+# so a step that cannot be done says why and steps aside rather than
+# failing the services after it.
 [[service]]
 path = "/system/bin/sh"
-args = ["-c", "V=$(ls -d /system_dlkm/lib/modules/*/kernel/net/rfkill 2>/dev/null | head -1); T=/system_dlkm/flatten/lib/modules/rfkill.ko; [ -n \"$V\" ] || { echo \"no rfkill.ko under /system_dlkm/lib/modules\"; exit 0; }; [ -f \"$T\" ] || { echo \"no flattened copy at $T\"; exit 0; }; mount --bind \"$V/rfkill.ko\" \"$T\" || { echo \"could not lay it over $T\"; exit 0; }"]
+args = ["-c", "V=$(ls -d /system_dlkm/lib/modules/*/kernel/net/rfkill 2>/dev/null | head -1); [ -n \"$V\" ] || { echo \"no rfkill.ko under /system_dlkm/lib/modules\"; exit 0; }; T=/system_dlkm/flatten/lib/modules/rfkill.ko; if [ -f \"$T\" ]; then mount --bind \"$V/rfkill.ko\" \"$T\" || { echo \"could not lay it over $T\"; exit 0; }; else mkdir -p /lib/modules || { echo \"could not make /lib/modules\"; exit 0; }; cp \"$V/rfkill.ko\" /lib/modules/rfkill.ko || { echo \"could not copy rfkill.ko\"; exit 0; }; printf 'rfkill.ko:\\n' > /lib/modules/modules.dep || { echo \"could not write modules.dep\"; exit 0; }; echo \"put the signed rfkill.ko in /lib/modules\"; fi"]
 oneshot = true
 user = "root"
 groups = ["root"]
@@ -80,6 +99,7 @@ path = "/kmlibs/km.sh"
 args = ["/vendor/bin/hw/android.hardware.security.keymint-service-qti"]
 libraries = ["/kmlibs", "/vendor/lib64", "/vendor/lib64/hw", "/system/lib64", "/odm/lib64"]
 registers = [
+    "android.hardware.security.keymint.IKeyMintDevice/default",
     "android.hardware.security.keymint.IRemotelyProvisionedComponent/default",
     "android.hardware.security.secureclock.ISecureClock/default",
     "android.hardware.security.sharedsecret.ISharedSecret/default",
@@ -111,13 +131,38 @@ groups = ["root", "drmrpc"]
 # all, loses nothing but this path.
 [[service]]
 path = "/vendor/bin/hw/android.hardware.weaver-service.nxp"
+# The same HAL is kept under different names and on different partitions
+# across the builds this recovery serves: the older ones keep the dotted
+# name under vendor, the newer ones moved to odm and took -qti, and one
+# build's port names it with a hyphen. Nothing here chooses by Android
+# version; the first path that is actually present is the one started, so
+# a version nobody has sampled yet still finds its own HAL.
+alternates = [
+    "/odm/bin/hw/android.hardware.weaver-service.nxp-qti",
+    "/vendor/bin/hw/android.hardware.weaver-service.nxp-qti",
+    "/vendor/bin/hw/android.hardware.weaver-service-nxp",
+    "/odm/bin/hw/android.hardware.weaver-service.nxp",
+]
 libraries = ["/kmlibs", "/vendor/lib64", "/vendor/lib64/hw", "/system/lib64", "/odm/lib64"]
 ready_service = "android.hardware.weaver.IWeaver/default"
 # The phone's own description names the interface and the instance in two
 # fields; the directory reads them as one name, and takes a registration
 # only for a name it has been told of. This says the same the way the
 # directory reads it, and is written out before any service starts.
-description_text = '<manifest version="1.0" type="device"><hal format="aidl"><name>android.hardware.weaver</name><version>2</version><fqname>IWeaver/default</fqname></hal></manifest>'
+# ae2: the secure element instances are declared in this same manifest,
+# folded into the one description text the recovery already publishes. A
+# second description file would make publish_descriptions() copy one more
+# file and restart the service directory on a slightly different timing;
+# ad booted fine on that path and ae did not (register_again timed out on
+# vendor.fastboot-default). Keeping the file count identical to ad keeps
+# this diagnostic build on the timing that is known to work.
+# The third HAL here is the native OMAPI service from the A14 port. It is
+# folded into this one text rather than added as another description file:
+# publish_descriptions() counts the files it writes and restarts the service
+# directory when the count changes. ae's boot failed on that restart's
+# register_again() timeout, so keeping the file count identical to ad is
+# deliberate. One text can name as many HALs as the directory needs.
+description_text = '<manifest version="1.0" type="device"><hal format="aidl"><name>android.hardware.weaver</name><version>2</version><fqname>IWeaver/default</fqname></hal><hal format="aidl"><name>android.hardware.secure_element</name><version>1</version><fqname>ISecureElement/SIM1</fqname><fqname>ISecureElement/SIM2</fqname><fqname>ISecureElement/eSE1</fqname></hal><hal format="aidl"><name>android.se.omapi</name><version>1</version><fqname>ISecureElementService/default</fqname></hal></manifest>'
 # Its init runs it as vendor_nxp_weaver; the others here run as root, and
 # root is what the recovery's own domain answers the secure world as.
 user = "root"
@@ -132,6 +177,48 @@ libraries = ["/system/lib64", "/vendor/lib64"]
 ready_service = "android.hardware.boot.IBootControl/default"
 user = "root"
 groups = ["root"]
+
+# A build whose weaver asks the secure element through OMAPI needs a native
+# provider, which no Android framework supplies in recovery. These two
+# services supply it. They are deliberately not fenced by Android version:
+# a build that does not need them simply gains two optional daemons, and a
+# build that does need them gets the provider it was missing. Whether an
+# intermediate release needs OMAPI is not known from any device here, and
+# gating on a version would leave that release with no provider at all.
+#
+# Both are optional and have no `ready_service`: waiting on a registration
+# that never comes costs 20 seconds and adds a name to the set
+# publish_descriptions() builds its file list from. The engine keeps the
+# first lines of a daemon's streams in the log, so a HAL that cannot link
+# says which library it wants, and one that starts says "aidl service
+# starts". None of this holds up the boot, and the description files the
+# directory is given stay identical in number to the older builds.
+[[service]]
+path = "/vendor/bin/hw/android.hardware.secure_element-service.qti"
+libraries = ["/kmlibs", "/vendor/lib64", "/vendor/lib64/hw", "/odm/lib64", "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap", "/mnt/system/lib64", "/mnt/system/system_ext/lib64", "/mnt/product/lib64", "/mnt/system_ext/lib64", "/mnt/system/odm/lib64", "/apex/com.android.vndk.v34/lib64"]
+user = "root"
+groups = ["root", "drmrpc"]
+optional = true
+
+# The native OMAPI service, taken byte for byte from the A14 port's TWRP
+# (the desktop 小米14u-twrp-安卓15.img, which is byte-identical to the
+# Durex port's images/recovery.img and works on both A14 and A17). It is a
+# sh script rather than the binary itself because the binary was linked
+# against that TWRP's own libc++/linker: start.sh runs the A14 linker64 on
+# the A14 se_omapi with the whole matched library set in /skyward/omapi and
+# an ld.config.txt whose [recovery] namespace is not isolated. Nothing from
+# that set replaces a recovery library, so the recovery's own program and
+# the other HALs keep the linker/libc pair they were built with.
+# Optional, and deliberately no ready_service: a registration that never
+# comes would cost 20 seconds here and add a name to publish_descriptions()'s
+# file list. The engine keeps the first lines of a daemon's streams, so this
+# one says "Secure Element AIDL service(omapi) running..." if it comes up.
+[[service]]
+path = "/skyward/omapi/start.sh"
+libraries = ["/skyward/omapi"]
+user = "root"
+groups = ["root"]
+optional = true
 
 [wlan]
 modules = ["rfkill", "qca_cld3_kiwi_v2"]

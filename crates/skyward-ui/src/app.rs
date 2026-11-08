@@ -5819,7 +5819,13 @@ impl App {
         let Data::Locked { user, keys, .. } = self.state.data else { unreachable!("only a screen lock waiting takes what is entered") };
         self.state.data = Data::Locked { user, keys, checking: true };
         self.refresh();
-        vec![Effect::Unlock { user, code }]
+        let mut fx = vec![Effect::Unlock { user, code }];
+        // Sending it is felt, as the key that sent it was: the dots clear
+        // while it is checked, and nothing says it went otherwise.
+        if self.state.vibrate {
+            fx.push(Effect::Haptic);
+        }
+        fx
     }
 
     /// A key of the keyboard on the editor page: a character or a space
