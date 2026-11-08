@@ -3589,7 +3589,7 @@ impl App {
         let battery = info.battery.as_ref();
         Bar {
             clock,
-            battery: battery.map(|b| (b.level, b.plugged().then_some(if b.quick { Bolt::Quick } else { Bolt::Charging }))),
+            battery: battery.map(|b| (b.level, b.plugged.then_some(if b.quick { Bolt::Quick } else { Bolt::Charging }))),
             wlan: self.wlan_mark(),
             data: match self.state.data {
                 Data::Erased => None,
@@ -4570,7 +4570,7 @@ impl App {
         }
         if let Some(battery) = &info.battery {
             let level = battery.level;
-            let words = if battery.plugged() {
+            let words = if battery.plugged {
                 tr!(l, "充电中 {level}%", "充電中 {level}%", "Charging {level}%")
             } else {
                 format!("{level}%")
