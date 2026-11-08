@@ -692,6 +692,14 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
     for path in load_modules(cfg, &cfg.modules.load)? {
         skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
     }
+    // The CPUs as the phone's own system runs them: the governors its boot
+    // scripts set, and idle cores allowed to power down. The recovery works
+    // either way, so a failure goes to the kernel log.
+    #[cfg(target_os = "android")]
+    match skyward_sys::cpu::run_as_system() {
+        Ok(done) => skyward_sys::kmsg(&format!("the CPUs run as the system runs them: {}", done.join(", ")))?,
+        Err(e) => skyward_sys::kmsg(&format!("the CPUs run as the kernel started them: {e:#}"))?,
+    }
     // The drivers have made their nodes and their files by now, and the phone's
     // own init would give them an owner and permissions here, in its `on boot`
     // block. A recovery runs no init, so what it leaves is root-only, and the
