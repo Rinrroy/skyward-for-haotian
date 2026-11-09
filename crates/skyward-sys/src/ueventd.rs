@@ -143,14 +143,97 @@ pub fn apply() -> anyhow::Result<usize> {
 /// programs that run as users.
 pub const INIT_DIRS: [&str; 2] = ["/vendor/etc/init", "/odm/etc/init"];
 
+/// The `on` stages this replay follows, in the order the phone's init runs
+/// them: early-init, then init, then the stages the stock `late-init` sets
+/// off in turn, ending in boot. A trigger of any other kind — `charger`, a
+/// `property:` or a joined condition, an event, a device, a service's own
+/// action — says when the real init would run its block, which is not here
+/// and now, so the block's commands are left for the stage they belong to.
+#[cfg(any(target_os = "android", test))]
+const STAGES: [&str; 11] = [
+    "early-init",
+    "init",
+    "late-init",
+    "early-fs",
+    "fs",
+    "post-fs",
+    "late-fs",
+    "post-fs-data",
+    "zygote-start",
+    "early-boot",
+    "boot",
+];
+
+/// One `chown` or `chmod` of an init script, taken apart and ready to
+/// apply, with the path it names kept whole.
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum InitCommand {
+    Chown { uid: u32, gid: u32, path: String },
+    Chmod { mode: u32, path: String },
+}
+
+/// Which stage of the boot a block's trigger names, as its place in
+/// [`STAGES`]. A trigger that joins conditions or names anything else is
+/// one this replay cannot say has come to pass, so its block is left alone:
+/// nothing in it runs on the strength of a condition nobody checked.
+#[cfg(any(target_os = "android", test))]
+fn stage_of(trigger: &[&str]) -> Option<usize> {
+    match trigger {
+        [name] => STAGES.iter().position(|s| s == name),
+        _ => None,
+    }
+}
+
+/// The `chown` and `chmod` lines of one init script that this replay
+/// follows: only those of the `on` blocks whose trigger names a stage of
+/// the boot it replays, each with the stage it belongs to, in the order
+/// the script writes them.
+#[cfg(any(target_os = "android", test))]
+fn replayable(text: &str, known: &HashMap<String, u32>) -> Vec<(usize, InitCommand)> {
+    let mut out = Vec::new();
+    let mut stage = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words[0] {
+            // A section of another kind ends one that was open.
+            "on" => stage = stage_of(words.get(1..).unwrap_or(&[])),
+            "service" | "import" => stage = None,
+            _ => {}
+        }
+        let Some(rank) = stage else { continue };
+        let command = match words.as_slice() {
+            ["chown", user, group, path] => {
+                let (Some(uid), Some(gid)) = (account(known, user), account(known, group)) else { continue };
+                InitCommand::Chown { uid, gid, path: path.to_string() }
+            }
+            ["chmod", mode, path] => {
+                let Ok(mode) = u32::from_str_radix(mode, 8) else { continue };
+                InitCommand::Chmod { mode, path: path.to_string() }
+            }
+            _ => continue,
+        };
+        out.push((rank, command));
+    }
+    out
+}
+
 /// Apply the `chown` and `chmod` lines of those scripts to the files they
 /// name, where those files are there: a trigger may name something this phone
 /// does not have, or something on a partition a recovery has not mounted.
-/// Every line is tried on its own, and one that cannot be applied is passed
+///
+/// Only the blocks whose trigger names a stage of the boot this replay
+/// follows are taken ([`STAGES`]); the commands of every script together
+/// then run in the boot's order, so a node two stages both touch ends where
+/// init would leave it — the later stage's word last, not where a folder
+/// read happened to put the script. A line that cannot be applied is passed
 /// over rather than failing the run.
 #[cfg(target_os = "android")]
 pub fn apply_init() -> anyhow::Result<usize> {
-    type Apply = Box<dyn Fn(&CString) -> bool>;
     use std::ffi::CString;
     use std::path::Path;
     let known = accounts(&PASSWD_FILES.iter().chain(GROUP_FILES.iter()).copied().collect::<Vec<_>>());
@@ -158,29 +241,29 @@ pub fn apply_init() -> anyhow::Result<usize> {
     for dir in INIT_DIRS {
         scripts_under(Path::new(dir), &mut scripts)?;
     }
+    let mut commands: Vec<(usize, usize, usize, InitCommand)> = Vec::new();
+    for (at, script) in scripts.iter().enumerate() {
+        let Ok(text) = std::fs::read_to_string(script) else { continue };
+        for (line, (rank, command)) in replayable(&text, &known).into_iter().enumerate() {
+            commands.push((rank, at, line, command));
+        }
+    }
+    commands.sort_by_key(|(rank, at, line, _)| (*rank, *at, *line));
     let mut changed = 0;
-    for script in scripts {
-        let Ok(text) = std::fs::read_to_string(&script) else { continue };
-        for line in text.lines() {
-            let words: Vec<&str> = line.split_whitespace().collect();
-            let (path, apply): (&str, Apply) = match words.as_slice() {
-                ["chown", user, group, path] => {
-                    let (Some(uid), Some(gid)) = (account(&known, user), account(&known, group)) else { continue };
-                    (path, Box::new(move |p| unsafe { libc::chown(p.as_ptr(), uid, gid) } == 0))
-                }
-                ["chmod", mode, path] => {
-                    let Ok(mode) = u32::from_str_radix(mode, 8) else { continue };
-                    (path, Box::new(move |p| unsafe { libc::chmod(p.as_ptr(), mode as libc::mode_t) } == 0))
-                }
-                _ => continue,
-            };
-            if !path.starts_with('/') || std::fs::symlink_metadata(path).is_err() {
-                continue;
-            }
-            let Ok(c_path) = CString::new(path) else { continue };
-            if apply(&c_path) {
-                changed += 1;
-            }
+    for (_, _, _, command) in &commands {
+        let path = match command {
+            InitCommand::Chown { path, .. } | InitCommand::Chmod { path, .. } => path,
+        };
+        if !path.starts_with('/') || std::fs::symlink_metadata(path).is_err() {
+            continue;
+        }
+        let Ok(c_path) = CString::new(path.as_str()) else { continue };
+        let took = match command {
+            InitCommand::Chown { uid, gid, .. } => (unsafe { libc::chown(c_path.as_ptr(), *uid, *gid) }) == 0,
+            InitCommand::Chmod { mode, .. } => (unsafe { libc::chmod(c_path.as_ptr(), *mode as libc::mode_t) }) == 0,
+        };
+        if took {
+            changed += 1;
         }
     }
     Ok(changed)
@@ -314,5 +397,65 @@ mod tests {
         assert_eq!(account(&known, "vendor_qti_diag"), Some(2901));
         assert_eq!(account(&known, "system"), Some(1000));
         assert_eq!(account(&known, "nothing"), None);
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    fn known() -> HashMap<String, u32> {
+        [("system", 1000), ("root", 0)].iter().map(|(n, id)| (n.to_string(), *id)).collect()
+    }
+
+    fn rank(name: &str) -> usize {
+        STAGES.iter().position(|s| *s == name).unwrap()
+    }
+
+    /// A command under a trigger this replay cannot say has come to pass —
+    /// a property, a joined condition, a mode of its own — does not run on
+    /// the strength of it, whatever it would do to the node.
+    #[test]
+    fn only_the_stages_the_replay_follows_are_taken() {
+        let text = "\
+on boot
+    chmod 0660 /dev/touch
+    chown system system /dev/touch
+
+on property:ro.build.type=user
+    chmod 0777 /dev/touch
+
+on charger
+    chmod 0600 /dev/touch
+
+on boot && property:ro.boot.mode=normal
+    chmod 0666 /dev/touch
+
+service touch /vendor/bin/touch
+    class late_start
+    user system
+";
+        assert_eq!(
+            replayable(text, &known()),
+            vec![
+                (rank("boot"), InitCommand::Chmod { mode: 0o660, path: "/dev/touch".into() }),
+                (rank("boot"), InitCommand::Chown { uid: 1000, gid: 1000, path: "/dev/touch".into() }),
+            ]
+        );
+    }
+
+    /// A node two stages both touch takes the later stage's word, whatever
+    /// order the scripts were read in.
+    #[test]
+    fn a_node_two_stages_touch_takes_the_later_stage_s_word() {
+        let early = "on post-fs-data\n    chmod 0600 /dev/touch\n";
+        let late = "on boot\n    chmod 0660 /dev/touch\n";
+        let mut commands = replayable(early, &known());
+        commands.extend(replayable(late, &known()));
+        commands.sort_by_key(|(rank, _)| *rank);
+        assert_eq!(
+            commands.last().unwrap(),
+            &(rank("boot"), InitCommand::Chmod { mode: 0o660, path: "/dev/touch".into() })
+        );
     }
 }

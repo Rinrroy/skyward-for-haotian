@@ -1208,33 +1208,6 @@ impl AodStyle {
     }
 }
 
-/// The settings the owner's storage kept, as read back; a look or level
-/// the file does not name comes as the default it would start at.
-#[derive(Clone, Copy, Debug)]
-pub struct SavedSettings {
-    pub aod_style: AodStyle,
-    pub brightness: f32,
-    pub dark: bool,
-    pub lang: Lang,
-    pub screen_off: usize,
-    pub vibrate: bool,
-    pub vibration: f32,
-}
-
-impl Default for SavedSettings {
-    fn default() -> Self {
-        SavedSettings {
-            aod_style: AodStyle::Digits,
-            brightness: SLIDER_START,
-            dark: false,
-            lang: Lang::Hans,
-            screen_off: 3,
-            vibrate: true,
-            vibration: SLIDER_START,
-        }
-    }
-}
-
 /// How far up the glass a finger must swipe for the AOD to believe it
 /// meant to wake the panel, in dp: farther than a pocket shifts.
 const WAKE_SWIPE_DP: f32 = 64.0;
@@ -2922,9 +2895,6 @@ pub struct App {
     /// while other pages show.
     term: Option<Term>,
     display_on: bool,
-    /// Whether the user has picked the AOD's clock style this boot; what
-    /// the owner's storage kept only counts before they have.
-    aod_style_chosen: bool,
     /// Settings the user has changed since the owner's storage was last
     /// written; the write comes a moment after the last change.
     settings_dirty: bool,
@@ -2993,7 +2963,6 @@ pub struct App {
 impl App {
     pub fn new(start: Screen, w: u32, h: u32, px_per_dp: f32) -> Self {
         App {
-            aod_style_chosen: false,
             settings_dirty: false,
             settings_due_at: None,
             state: State::default(),
@@ -4138,33 +4107,6 @@ impl App {
 
     /// How turning the two checks the vbmeta blocks name off or on went, with
     /// what the blocks then said.
-    /// The settings the owner's storage kept, which only count where the
-    /// user has left each at the value it starts at this boot.
-    pub fn set_saved_settings(&mut self, saved: SavedSettings) {
-        if self.state.brightness == SLIDER_START {
-            self.state.brightness = saved.brightness;
-        }
-        if !self.state.dark && saved.dark {
-            self.state.dark = saved.dark;
-        }
-        if self.state.lang == Lang::Hans {
-            self.state.lang = saved.lang;
-        }
-        if self.state.screen_off == 3 {
-            self.state.screen_off = saved.screen_off;
-        }
-        if self.state.vibrate == State::default().vibrate {
-            self.state.vibrate = saved.vibrate;
-        }
-        if self.state.vibration == SLIDER_START {
-            self.state.vibration = saved.vibration;
-        }
-        if !self.aod_style_chosen && self.state.aod_style == AodStyle::Digits {
-            self.state.aod_style = saved.aod_style;
-        }
-        self.refresh();
-    }
-
     pub fn avb_written(&mut self, outcome: Result<Vec<AvbChange>, String>, readings: Result<Vec<AvbReading>, String>, now: u64) {
         match &outcome {
             Ok(changes) => {
@@ -5903,7 +5845,6 @@ impl App {
             }
             Action::AodStyle => {
                 self.state.aod_style = self.state.aod_style.next();
-                self.aod_style_chosen = true;
                 self.refresh();
                 self.settings_dirty = true;
                 return Vec::new();

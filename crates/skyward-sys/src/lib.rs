@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -212,6 +212,20 @@ static KEPT_LONG: OnceLock<Mutex<Option<(File, PathBuf)>>> = OnceLock::new();
 /// per line.
 static TRIED_LONG: AtomicU64 = AtomicU64::new(0);
 
+/// The bytes one session's lasting copy may take. The budget the sessions
+/// and kernel logs together keep ([`LOG_DISK_BUDGET`]) is shared with the
+/// kernel's logs of the sessions past, and a session that talks all day
+/// must not take the disk for itself.
+const SESSION_LOG_BUDGET: u64 = 1_000_000;
+
+/// The bytes this session has written to the lasting copy so far.
+static LONG_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the lasting copy has stopped for this session — it failed once,
+/// or it took its share — with the kernel and temporary logs carrying on
+/// without it.
+static LONG_STOPPED: AtomicBool = AtomicBool::new(false);
+
 /// Keep every line [`kmsg`] writes from now on in the file at `path` as
 /// well, after what an earlier run left there.
 pub fn keep_log(path: &Path) -> Result<()> {
@@ -223,6 +237,9 @@ pub fn keep_log(path: &Path) -> Result<()> {
 /// partition nor the bootloader's log disk can be written to, or between the
 /// attempts to open one.
 fn lasting_log() -> Option<(File, PathBuf)> {
+    if LONG_STOPPED.load(Ordering::Relaxed) {
+        return None;
+    }
     let held = KEPT_LONG.get_or_init(|| Mutex::new(None));
     let mut held = held.lock().ok()?;
     if held.is_none() {
@@ -248,18 +265,39 @@ fn lasting_log() -> Option<(File, PathBuf)> {
 }
 
 /// A file for this session in `folder`, opened after what earlier sessions
-/// left there and named by how long the phone had been up when it started,
-/// which is all the clock says before the system sets it from the RTC.
+/// left there and named by a tag of this boot and how long the phone had
+/// been up when it started, so two boots that reached the recovery the same
+/// seconds in keep files of their own.
 fn session_in(folder: &Path) -> Option<File> {
     std::fs::create_dir_all(folder).ok()?;
     let at = since_boot().map(|d| d.as_secs()).unwrap_or(0);
-    let name = format!("session-{at}.log");
+    let name = format!("session-{}-{at}.log", boot_tag());
     let mut file = OpenOptions::new().create(true).append(true).open(folder.join(name)).ok()?;
     // The lines are stamped with the same clock, which says nothing of the
     // day; how long the phone had been up when they started does.
     writeln!(file, "session started {at} s after the phone started").ok()?;
     forget_older_sessions(folder);
     Some(file)
+}
+
+/// A short tag that differs from one start of the phone to the next: the
+/// kernel gives each boot of its own an id, and a draw from the random pool
+/// stands in where the kernel keeps none.
+fn boot_tag() -> String {
+    static TAG: OnceLock<String> = OnceLock::new();
+    TAG.get_or_init(|| {
+        if let Ok(id) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+            let hex: String = id.chars().filter(|c| c.is_ascii_hexdigit()).take(8).collect();
+            if hex.len() == 8 {
+                return hex;
+            }
+        }
+        use std::io::Read;
+        let mut raw = [0u8; 4];
+        let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut raw));
+        raw.iter().map(|b| format!("{b:02x}")).collect()
+    })
+    .clone()
 }
 
 /// Keep the kernel's own log of this session beside the session's lines.
@@ -278,6 +316,7 @@ pub fn keep_kernel_log() -> Result<()> {
     };
     std::fs::create_dir_all(&folder).ok();
     let at = since_boot().map(|d| d.as_secs()).unwrap_or(0);
+    let name = format!("kernel-{}-{at}.log", boot_tag());
     let read = std::process::Command::new("/system/bin/dmesg").output().context("read the kernel log")?;
     let text = String::from_utf8_lossy(&read.stdout);
     // A phone that has just started says much before we arrive; the last
@@ -291,7 +330,7 @@ pub fn keep_kernel_log() -> Result<()> {
         out.push_str(line);
         out.push('\n');
     }
-    std::fs::write(folder.join(format!("kernel-{at}.log")), out).with_context(|| format!("write the kernel log to {}", folder.display()))?;
+    std::fs::write(folder.join(name), out).with_context(|| format!("write the kernel log to {}", folder.display()))?;
     forget_older_sessions(&folder);
     Ok(())
 }
@@ -411,7 +450,9 @@ pub fn log_disk_mounted() -> bool {
 /// Append a line to the kernel log, where it survives until the next boot
 /// and shows in `dmesg`, to the file [`keep_log`] opened, and to the lasting
 /// copy once the data partition is writable, stamped with the seconds since
-/// the phone started as the kernel log stamps it.
+/// the phone started as the kernel log stamps it. The lasting copy is a
+/// convenience the business does not stand on: its failing — a full disk,
+/// a disk gone — ends its part in the session, and does not fail the call.
 pub fn kmsg(line: &str) -> Result<()> {
     let mut f = OpenOptions::new().write(true).open("/dev/kmsg")?;
     f.write_all(format!("<6>skyward: {line}\n").as_bytes())?;
@@ -424,10 +465,27 @@ pub fn kmsg(line: &str) -> Result<()> {
         let mut kept = kept.lock().expect("nothing panics while writing the log");
         write!(kept, "{stamped}").with_context(|| format!("write {LOG}"))?;
     }
-    if let Some((mut lasting, at)) = lasting_log() {
-        write!(lasting, "{stamped}").with_context(|| format!("write {}", at.display()))?;
+    if let Some((mut lasting, _)) = lasting_log() {
+        if LONG_BYTES.fetch_add(stamped.len() as u64, Ordering::Relaxed) >= SESSION_LOG_BUDGET {
+            stop_lasting(&format!("the lasting log has had its share of {SESSION_LOG_BUDGET} bytes"));
+        } else if let Err(e) = write!(lasting, "{stamped}") {
+            stop_lasting(&format!("the lasting log stopped: {e}"));
+        }
     }
     Ok(())
+}
+
+/// End the lasting copy's part in this session, saying once on the kernel
+/// log why. Nothing after this stands on the copy, so nothing after this
+/// fails for it; the lines the session goes on making stay in [`LOG`].
+fn stop_lasting(why: &str) {
+    LONG_STOPPED.store(true, Ordering::Relaxed);
+    if let Some(held) = KEPT_LONG.get() {
+        if let Ok(mut held) = held.lock() {
+            *held = None;
+        }
+    }
+    note(&format!("{why}; the session's lines stay in {LOG}"));
 }
 
 /// How long the phone has been running, on the clock the kernel stamps its

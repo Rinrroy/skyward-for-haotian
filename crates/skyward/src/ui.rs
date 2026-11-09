@@ -35,9 +35,9 @@ use skyward_sys::sleep::{Sleeper, Slept};
 use skyward_sys::uevent;
 use skyward_systems::Who;
 use skyward_ui::app::{
-    App, AodStyle, Asked, Asking, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop,
+    App, Asked, Asking, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop,
     FileKind, FileOp, FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop,
-    Place, RenameRefused, SavedSettings, Screen, Shot, Starter, State, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION,
+    Place, RenameRefused, Screen, Shot, Starter, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION,
     DOWNLOADS, INSTALL_UNFINISHED, USB_DRIVE, SkywardEnd, SkywardStage,
 };
 use skyward_ui::settings::Keeper;
@@ -1001,88 +1001,6 @@ fn set_avb(on: bool) -> Result<Vec<skyward_vab::avb::Change>, String> {
         Ok(changes)
     };
     write().map_err(|e| format!("{e:#}"))
-}
-
-/// Where the chosen settings are kept: the owner's storage, beside the
-/// logs and the backups, where they survive a restart of the recovery and
-/// show in the file manager too.
-const SETTINGS_FILE: &str = "/sdcard/Skyward/settings";
-
-/// Read the settings the previous boots kept, once the owner's storage has
-/// opened; a key the file does not name stays at the value it starts at.
-fn saved_settings() -> SavedSettings {
-    let mut saved = SavedSettings::default();
-    let Ok(text) = fs::read_to_string(SETTINGS_FILE) else { return saved };
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else { continue };
-        match key.trim() {
-            "aod_style" => {
-                saved.aod_style = match value.trim() {
-                    "offset" => AodStyle::Offset,
-                    "dial" => AodStyle::Dial,
-                    _ => AodStyle::Digits,
-                }
-            }
-            "brightness" => {
-                if let Ok(v) = value.trim().parse() {
-                    saved.brightness = v;
-                }
-            }
-            "dark" => saved.dark = value.trim() == "true",
-            "language" => {
-                saved.lang = match value.trim() {
-                    "hant" => Lang::Hant,
-                    "en" => Lang::En,
-                    _ => Lang::Hans,
-                }
-            }
-            "screen_off" => {
-                if let Ok(v) = value.trim().parse() {
-                    saved.screen_off = v;
-                }
-            }
-            "vibrate" => saved.vibrate = value.trim() == "true",
-            "vibration" => {
-                if let Ok(v) = value.trim().parse() {
-                    saved.vibration = v;
-                }
-            }
-            _ => {}
-        }
-    }
-    saved
-}
-
-/// Write the settings as they stand, for the boots to come. A storage that
-/// cannot be written — the data partition still closed — keeps them only
-/// until it opens, and keeps this from failing either way.
-fn write_settings(state: &State) {
-    let look = match state.aod_style {
-        AodStyle::Digits => "digits",
-        AodStyle::Offset => "offset",
-        AodStyle::Dial => "dial",
-    };
-    let language = match state.lang {
-        Lang::Hans => "hans",
-        Lang::Hant => "hant",
-        Lang::En => "en",
-    };
-    let text = format!(
-        "aod_style = {look}\nbrightness = {:.3}\ndark = {}\nlanguage = {language}\nscreen_off = {}\nvibrate = {}\nvibration = {:.3}\n",
-        state.brightness, state.dark, state.screen_off, state.vibrate, state.vibration
-    );
-    let kept = (|| -> Result<()> {
-        fs::create_dir_all("/sdcard/Skyward").context("make /sdcard/Skyward")?;
-        fs::write(SETTINGS_FILE, text).context("write the settings")
-    })();
-    match kept {
-        Ok(()) => {
-            let _ = skyward_sys::kmsg("the settings are kept where the owner's storage keeps them");
-        }
-        Err(e) => {
-            let _ = skyward_sys::kmsg(&format!("the settings are not kept: {e:#}"));
-        }
-    }
 }
 
 /// What the bootloader message in misc asks for, in the shape the page that
@@ -2228,10 +2146,6 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     if let Some(mounted) = &opening.mounted {
                         log_mounted(mounted)?;
                     }
-                    // The owner's storage is open: the settings the previous
-                    // boots kept count, where the user has left each at the
-                    // value it starts at.
-                    app.set_saved_settings(saved_settings());
                     closed = opening.closed;
                     show_closed(&mut app, &closed)?;
                 }

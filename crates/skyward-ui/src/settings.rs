@@ -5,7 +5,7 @@
 //! a time zone, a part or a place by its name, so a later version that lists
 //! them otherwise reads them the same.
 
-use crate::app::{Place, State, SCREEN_OFF, TIME_ZONES};
+use crate::app::{AodStyle, Place, State, SCREEN_OFF, TIME_ZONES};
 use crate::Lang;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,8 @@ pub struct Settings {
     pub vibrate: bool,
     /// The vibration slider's place, from 0 at its left end to 1.
     pub vibration: f32,
+    /// The look the always-on panel's clock takes.
+    pub aod_style: AodStyle,
     /// A computer connected over USB is offered internal storage.
     pub file_transfer: bool,
     pub install: Install,
@@ -125,6 +127,7 @@ impl Settings {
             time_zone: TIME_ZONES[state.time_zone].2.to_string(),
             vibrate: state.vibrate,
             vibration: state.vibration,
+            aod_style: state.aod_style,
             file_transfer: state.file_transfer,
             install: Install { check_signature: state.check_signature, keep_recovery: state.keep_recovery },
             backup: Backup {
@@ -183,6 +186,7 @@ impl Settings {
         if (0.0..=1.0).contains(&self.vibration) {
             state.vibration = self.vibration;
         }
+        state.aod_style = self.aod_style;
         state.file_transfer = self.file_transfer;
         state.check_signature = self.install.check_signature;
         state.keep_recovery = self.install.keep_recovery;
@@ -307,6 +311,7 @@ mod tests {
             time_zone: 7,
             vibrate: false,
             vibration: 0.4,
+            aod_style: AodStyle::Dial,
             file_transfer: false,
             check_signature: true,
             keep_recovery: false,
@@ -327,11 +332,12 @@ mod tests {
 
     #[test]
     fn each_value_is_kept_as_what_it_means() {
-        let state = State { screen_off: 3, time_zone: 1, backup: [true, false, false, true, false], ..State::default() };
+        let state = State { screen_off: 3, time_zone: 1, aod_style: AodStyle::Dial, backup: [true, false, false, true, false], ..State::default() };
         let text = Settings::of(&state).text();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(json["screen_off"], 120, "two minutes, in seconds");
         assert_eq!(json["time_zone"], "Asia/Hong_Kong");
+        assert_eq!(json["aod_style"], "dial");
         assert_eq!(json["backup"]["parts"], serde_json::json!(["boot", "modem"]));
         assert_eq!(json["logs"]["to"], "temporary");
         assert_eq!(json["spoken"], "zh-Hans");
