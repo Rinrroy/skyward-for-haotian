@@ -186,7 +186,13 @@ impl Settings {
         state.file_transfer = self.file_transfer;
         state.check_signature = self.install.check_signature;
         state.keep_recovery = self.install.keep_recovery;
-        state.backup = picked(&self.backup.parts, &PARTS);
+        // The settings file holds the four togglable parts; the bootloader
+        // chain the backup keeps beside them is not a choice here.
+        state.backup = {
+            let mut on = [false; 5];
+            on[..4].copy_from_slice(&picked(&self.backup.parts, &PARTS));
+            on
+        };
         match self.backup.to.as_str() {
             STORAGE => state.backup_to = Place::Storage,
             USB_DRIVE => state.backup_to = Place::UsbDrive,

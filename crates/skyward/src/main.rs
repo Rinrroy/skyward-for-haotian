@@ -32,6 +32,10 @@ mod secure;
 #[cfg(target_os = "android")]
 mod services;
 #[cfg(target_os = "android")]
+mod settings;
+#[cfg(target_os = "android")]
+mod systems;
+#[cfg(target_os = "android")]
 mod ui;
 #[cfg(target_os = "android")]
 mod updates;
@@ -62,7 +66,7 @@ enum AvbAction {
 enum Cmd {
     /// Print what the About page shows, plus a partition summary.
     Info {
-        /// Device configuration, e.g. devices/nuwa.toml.
+        /// Device configuration, e.g. devices/nezha.toml.
         #[arg(long)]
         config: String,
     },
@@ -170,8 +174,8 @@ enum Cmd {
         #[arg(long, default_value = "/dev/dri/card0")]
         card: String,
     },
-    /// Play the vibration motor's click once, saying how strongly and for
-    /// how long.
+    /// Play the vibration motor's click once, or the ticks of the screen
+    /// going off by the power key, saying how strongly and for how long.
     #[cfg(target_os = "android")]
     Haptic {
         #[arg(long, default_value = "/skyward/device.toml")]
@@ -180,6 +184,9 @@ enum Cmd {
         /// right.
         #[arg(long, default_value_t = skyward_ui::app::SLIDER_START)]
         position: f32,
+        /// Play the ticks of the screen going off instead of the click.
+        #[arg(long)]
+        ticks: bool,
     },
     /// Save what the panel shows, as raw RGBA files cap-000.rgba onwards.
     #[cfg(target_os = "android")]
@@ -265,6 +272,12 @@ fn main() -> Result<()> {
     if !asked_for_a_command && Path::new(&started_as).file_name().is_some_and(|n| n == "recovery") {
         return recovery();
     }
+    // Install scripts run the commands linked to this binary by their names.
+    let name = Path::new(&started_as).file_name().unwrap_or_default();
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let Some(code) = skyward_install::commands::run(&name, &args) {
+        std::process::exit(code);
+    }
     match Cli::parse().cmd {
         Cmd::Info { config } => info(&config),
         Cmd::Slot => slot(),
@@ -345,9 +358,9 @@ fn main() -> Result<()> {
             Ok(())
         }
         #[cfg(target_os = "android")]
-        Cmd::Haptic { config, position } => {
+        Cmd::Haptic { config, position, ticks } => {
             let haptics = DeviceConfig::load(&config)?.haptics.context("the configuration describes no vibration motor")?;
-            haptics::probe(&haptics, position)
+            haptics::probe(&haptics, position, ticks)
         }
         #[cfg(target_os = "android")]
         Cmd::Capture { out, count, interval, card } => {
@@ -641,8 +654,9 @@ fn load_modules(cfg: &DeviceConfig, names: &[String]) -> Result<Vec<PathBuf>> {
 /// Start the recovery's own logd where it needs libraries of the installed
 /// system, make the phone's firmware reachable to its drivers, mount the
 /// partitions its own programs and drivers use where it mounts them, load
-/// the configured kernel modules and start the phone's own programs, read
-/// from the partitions just mounted: on the 13 Ultra, the touchscreen
+/// the configured kernel modules, hand the files the phone's init hands
+/// over as it boots to their accounts, and start the phone's own programs,
+/// read from the partitions just mounted: on the 13 Ultra, the touchscreen
 /// driver and the touch processing. Of the programs the configuration
 /// names, only those this phone's build of the hardware runs are started.
 /// The device nodes ueventd makes for the partitions take a moment past the
@@ -741,6 +755,29 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
     }
     started?;
     agree_on_the_notes_key(&registering)
+}
+
+/// Give each file the phone's own init hands over as it boots to the
+/// account it names, with the mode it gives, as its chown and chmod lines
+/// do. The files are the ones the modules just loaded made, which the
+/// phone's own programs open as those accounts.
+#[cfg(target_os = "android")]
+fn hand_over(owners: &[skyward_config::Owners]) -> Result<usize> {
+    use skyward_sys::ueventd;
+    use std::os::unix::fs::PermissionsExt;
+    let known = ueventd::accounts(&ueventd::PASSWD_FILES.iter().chain(&ueventd::GROUP_FILES).copied().collect::<Vec<_>>());
+    let id = |name: &str| ueventd::account(&known, name).with_context(|| format!("the phone has no account named {name}"));
+    let mut handed = 0;
+    for run in owners {
+        let (uid, gid) = (id(&run.user)?, id(&run.group)?);
+        for path in &run.paths {
+            std::os::unix::fs::chown(path, Some(uid), Some(gid)).with_context(|| format!("give {path} to {}:{}", run.user, run.group))?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(run.mode))
+                .with_context(|| format!("give {path} the mode {:o}", run.mode))?;
+            handed += 1;
+        }
+    }
+    Ok(handed)
 }
 
 /// The folder the recovery's own programs load their libraries from.
@@ -844,15 +881,22 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
     Ok(())
 }
 
-/// The recovery service. Its log is kept from the start, and adb comes up
-/// first so a failure later on can be inspected, file transfer joining it
+/// The recovery service. Its own folder is made and its log kept there from
+/// the start, and adb comes up first so a failure later on can be
+/// inspected, file transfer joining it
 /// once the screen starts; then the boot request in misc is read. A
 /// request whose work
 /// goes on stays in misc until the work is done; any other is cleared at
 /// once, so that any reboot from here boots the system. Failures go to the
 /// kernel log and still end the process, which init then starts again.
 fn recovery() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let run = || -> Result<()> {
+        // Open to the programs the recovery runs as other users, the
+        // supplicant among them, whatever the umask.
+        std::fs::create_dir_all(skyward_sys::RUN).with_context(|| format!("make {}", skyward_sys::RUN))?;
+        std::fs::set_permissions(skyward_sys::RUN, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("open {} to the recovery's other users", skyward_sys::RUN))?;
         skyward_sys::keep_log(Path::new(skyward_sys::LOG))?;
         // This recovery is a program swapped into the phone's own ramdisk, so
         // what it can do rests on files that ramdisk brings. Where a maker
@@ -909,6 +953,16 @@ fn recovery() -> Result<()> {
         match skyward_sys::clock::set_from_rtc() {
             Ok(ms) => skyward_sys::kmsg(&format!("clock set to {} ms from the RTC and persist", ms))?,
             Err(e) => skyward_sys::kmsg(&format!("clock not set: {e:#}"))?,
+        }
+        // The kernel starts every core at its top frequency, and keeps idle
+        // ones from powering down, until the phone's own system boots and
+        // changes that; left so, the phone drains its battery with the
+        // screen off. The recovery works either way, so a failure goes to
+        // the kernel log.
+        #[cfg(target_os = "android")]
+        match skyward_sys::cpu::run_as_system() {
+            Ok(done) => skyward_sys::kmsg(&format!("the CPUs run as the system runs them: {}", done.join(", ")))?,
+            Err(e) => skyward_sys::kmsg(&format!("the CPUs run as the kernel started them: {e:#}"))?,
         }
         #[cfg(target_os = "android")]
         {
@@ -1127,6 +1181,14 @@ fn identify(path: &Path) -> Result<()> {
         }
         Package::Image(kind) => println!("{kind:?}, for {}", kind.partitions().join(" or ")),
         Package::Script => println!("a zip that installs itself with a script"),
+        Package::System(c) => {
+            println!("the system {} {} ({}), to install beside the installed one", c.manifest.name, c.manifest.version, c.manifest.id);
+            println!("a boot image of {} bytes, a root image of {} bytes ({}), starting {}", c.boot, c.root, c.manifest.filesystem, c.manifest.init);
+            println!("its root takes at least {} bytes", c.least());
+            if c.init_boot {
+                println!("it brings its own init_boot image");
+            }
+        }
         Package::Unknown => println!("nothing this recovery installs"),
     }
     Ok(())

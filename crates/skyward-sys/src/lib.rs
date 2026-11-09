@@ -12,6 +12,8 @@ pub mod control;
 pub mod cpu;
 #[cfg(target_os = "android")]
 pub mod sleep;
+#[cfg(target_os = "android")]
+pub mod uevent;
 pub mod ueventd;
 pub mod usb;
 
@@ -159,10 +161,16 @@ pub fn power(target: Power) -> Result<()> {
     set_prop("sys.powerctl", target.command())
 }
 
+/// The folder the recovery service keeps what it makes for itself in, for
+/// as long as the phone stays in recovery: its logs, the screenshots that
+/// wait for internal storage, the supplicant's settings. Install scripts
+/// written for other recoveries often empty /tmp before they start; this
+/// folder is out of their way.
+pub const RUN: &str = "/skyward/run";
+
 /// Where the recovery service keeps the lines it writes to the kernel log
-/// for as long as the phone stays in recovery, as the stock recovery keeps
-/// its own log there.
-pub const LOG: &str = "/tmp/recovery.log";
+/// for as long as the phone stays in recovery.
+pub const LOG: &str = "/skyward/run/recovery.log";
 
 /// The folder a session's lines are also kept in, once the data partition can
 /// be written to. [`LOG`] lives in a memory filesystem and goes with the next

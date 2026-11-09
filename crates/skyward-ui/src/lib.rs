@@ -1,5 +1,6 @@
 pub mod app;
 pub mod canvas;
+pub mod charge;
 pub mod color;
 pub mod editor;
 pub mod files;
@@ -14,6 +15,7 @@ pub mod lang;
 pub mod motion;
 pub mod pages;
 pub mod search;
+pub mod settings;
 pub mod sprite;
 pub mod surface;
 pub mod term;

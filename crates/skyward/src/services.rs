@@ -9,7 +9,6 @@ use std::io;
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -430,46 +429,6 @@ fn said(path: String, stream: impl io::Read + Send + 'static, refused: Arc<Atomi
     })
 }
 
-
-/// Create an Android-init-style socket bound and listening under
-/// /dev/socket, for the program to accept connections on over the file
-/// descriptor it is handed through the environment.
-fn create_init_socket(name: &str) -> anyhow::Result<i32> {
-    use std::os::unix::net::UnixListener;
-    let path = format!("/dev/socket/{name}");
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path)
-        .with_context(|| format!("bind {path}"))?;
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660));
-    let listener = Box::leak(Box::new(listener));
-    let fd = std::os::unix::io::AsRawFd::as_raw_fd(listener);
-    unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
-    const O_NONBLOCK: i32 = 0o4000;
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !O_NONBLOCK) };
-    // drain the connections the peers make, or their writes fail
-    let named = name.to_string();
-    std::thread::Builder::new().name(format!("sock-{named}")).spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(c) => {
-                    std::thread::Builder::new().name(format!("sockc-{named}")).spawn(move || {
-                        let mut buf = [0u8; 4096];
-                        loop {
-                            match std::io::Read::read(&mut &c, &mut buf) {
-                                Ok(0) | Err(_) => return,
-                                Ok(_) => {}
-                            }
-                        }
-                    }).ok();
-                }
-                Err(_) => return,
-            }
-        }
-    }).with_context(|| format!("spawn the accept thread for {path}"))?;
-    Ok(fd)
-}
-
 /// The program as it is started: with what it is given, from the top of the
 /// tree, reading and writing nothing of the recovery's, finding its
 /// libraries where it names them, and as `who`.
@@ -500,21 +459,6 @@ fn command_with(s: &Service, who: &Credentials, runner: Option<&Path>) -> Comman
     cmd.current_dir("/").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     if runner.is_none() && !s.libraries.is_empty() {
         cmd.env("LD_LIBRARY_PATH", s.libraries.join(":"));
-    }
-    // Android-init-style sockets: create each one bound and listening under
-    // /dev/socket, leave its file descriptor open over the exec, and say its
-    // number the way init does, through ANDROID_SOCKET_<name>.
-    for name in &s.sockets {
-        match create_init_socket(name) {
-            Ok(fd) => {
-                let env = format!("ANDROID_SOCKET_{}", name.replace('-', "_"));
-                cmd.env(&env, fd.to_string());
-                let _ = skyward_sys::kmsg(&format!("socket {name} listening on fd {fd}"));
-            }
-            Err(e) => {
-                let _ = skyward_sys::kmsg(&format!("socket {name}: {e:#}"));
-            }
-        }
     }
     let who = who.clone();
     // Only system calls run between the fork and the exec, on what was

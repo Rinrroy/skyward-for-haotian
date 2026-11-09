@@ -21,10 +21,13 @@ skyward-block = { path = "../skyward-block" }
 skyward-config = { path = "../skyward-config" }
 skyward-info = { path = "../skyward-info" }
 skyward-sys = { path = "../skyward-sys" }
+skyward-systems = { path = "../skyward-systems" }
 skyward-vab = { path = "../skyward-vab" }
 x509-cert = "0.2.5"
 zerocopy = { version = "0.8.63", features = ["derive"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zstd = { version = "0.14.3", default-features = false }
 
 [dev-dependencies]
+skyward-bootimg = { path = "../skyward-bootimg" }
 tempfile = "3.27.0"

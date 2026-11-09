@@ -5,7 +5,6 @@
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -62,16 +61,6 @@ const BUNDLE_LOADER: &str = "bin/linker64";
 const SERVICE_LABELS: &str = "/mnt/system/system/etc/selinux/plat_hwservice_contexts";
 const RECOVERY_LABELS: &str = "/system/etc/selinux";
 
-/// The vendor's own service labels: the folder they live in and the file
-/// among them that says which interfaces may register with the hardware
-/// directory.
-const VENDOR_LABELS: &str = "/vendor/etc/selinux";
-const VENDOR_LABEL_FILE: &str = "vendor_hwservice_contexts";
-
-/// Every hardware service's interface chain ends here, and the directory
-/// checks the whole chain before it lets one register.
-const BASE_INTERFACE: &str = "android.hidl.base::IBase";
-
 /// The driver the phone's hardware services talk over, as they expect to
 /// find it and as a recovery has it.
 const HARDWARE_DRIVER: &str = "/dev/hwbinder";
@@ -111,12 +100,11 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
         .with_context(|| format!("the installed system carries no {RUNTIME_BUNDLE}, which holds the loader its own programs ask for"))?;
     let dir = loader.parent().expect("the loader is in a directory");
     fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
-    // create_dir_all takes the process's umask, and the recovery service starts
-    // with 077: the directory would be one only root may walk into, and the
-    // programs that register with this one run as users, so the kernel would
-    // refuse to load them their loader (EACCES on the exec, reported against
-    // the program rather than against the loader).
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).with_context(|| format!("open {} to the services", dir.display()))?;
+    // Made under the recovery's own umask the folder is root's alone, and
+    // the programs that ask for this loader run as the users their init
+    // scripts name: as the system's own folder is, it is open to all.
+    fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .with_context(|| format!("open {} to every user", dir.display()))?;
     if loader.exists() {
         fs::remove_file(loader).with_context(|| format!("take away {}", loader.display()))?;
     }
@@ -126,33 +114,24 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
         std::os::unix::fs::symlink(HARDWARE_DRIVER_NODE, driver)
             .with_context(|| format!("point {HARDWARE_DRIVER} at {HARDWARE_DRIVER_NODE}"))?;
     }
-    // The driver's own filesystem makes its nodes root-only, where the
-    // installed system's ueventd rules open them to every program; the
-    // services that talk over this one run as users.
-    let node = Path::new(HARDWARE_DRIVER_NODE);
-    if node.exists() {
-        fs::set_permissions(node, fs::Permissions::from_mode(0o666)).with_context(|| format!("open {} to the services", node.display()))?;
-    }
+    // The system's own init opens the driver to every program, as it does
+    // /dev/binder; a recovery's, which uses none of it, leaves it root's
+    // alone, and the directory and the services that register with it run
+    // as the users their init scripts name.
+    fs::set_permissions(driver, std::os::unix::fs::PermissionsExt::from_mode(0o666))
+        .with_context(|| format!("open {HARDWARE_DRIVER} to every program"))?;
     let from = Path::new(SERVICE_LABELS);
     let into = Path::new(RECOVERY_LABELS).join(from.file_name().expect("a named file"));
     fs::create_dir_all(RECOVERY_LABELS).with_context(|| format!("make {RECOVERY_LABELS}"))?;
+    // The directory reads both of these as the user its init script names,
+    // and what the recovery makes under its own umask is root's alone: they
+    // are given the modes the system's own copies have.
+    fs::set_permissions(RECOVERY_LABELS, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .with_context(|| format!("open {RECOVERY_LABELS} to every user"))?;
     fs::copy(from, &into).with_context(|| format!("copy {} to {}", from.display(), into.display()))?;
-    declare_service_labels(wanted)?;
     fs::write(RECOVERY_MANIFEST, describe_hardware(wanted)?).with_context(|| format!("write {RECOVERY_MANIFEST}"))?;
-    // The recovery service starts with umask 077, so the file is left one
-    // only root may read. The programs that register with the directory run
-    // as users, and each reads this before registering to learn whether the
-    // phone allows it; finding it unreadable, they refuse to register and
-    // the credential service never comes up. Leave the file open and the
-    // folder above it walkable.
-    let manifest = Path::new(RECOVERY_MANIFEST);
-    if let Some(dir) = manifest.parent() {
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("open {} to the services", dir.display()))?;
-    }
-    fs::set_permissions(manifest, fs::Permissions::from_mode(0o644))
-        .with_context(|| format!("open {RECOVERY_MANIFEST} to the services"))?;
-    open_descriptions(Path::new(RECOVERY_DESCRIPTIONS))?;
+    fs::set_permissions(RECOVERY_MANIFEST, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+        .with_context(|| format!("let every user read {RECOVERY_MANIFEST}"))?;
     // The directory turns itself off when it cannot find its own
     // description, and a run of it before this was written may have left
     // that behind.
@@ -170,136 +149,14 @@ fn describe_hardware(wanted: &[String]) -> Result<String> {
         let (package, rest) = name
             .split_once('@')
             .with_context(|| format!("{name} does not read as a hardware service's name"))?;
-        // A description holds the version and the interface as elements of
-        // their own; the one-line name alone is not read as either, and a
-        // service it names is then refused as undescribed.
-        let (version, rest) = rest
-            .split_once("::")
-            .with_context(|| format!("{name} does not name a version"))?;
-        let (interface, instance) = rest
-            .split_once('/')
-            .with_context(|| format!("{name} does not name an instance"))?;
         out.push_str("    <hal format=\"hidl\">\n");
         out.push_str(&format!("        <name>{package}</name>\n"));
         out.push_str("        <transport>hwbinder</transport>\n");
-        out.push_str(&format!("        <version>{version}</version>\n"));
-        out.push_str("        <interface>\n");
-        out.push_str(&format!("            <name>{interface}</name>\n"));
-        out.push_str(&format!("            <instance>{instance}</instance>\n"));
-        out.push_str("        </interface>\n");
-        out.push_str(&format!("        <fqname>@{version}::{interface}/{instance}</fqname>\n"));
+        out.push_str(&format!("        <fqname>@{rest}</fqname>\n"));
         out.push_str("    </hal>\n");
     }
     out.push_str("</manifest>\n");
     Ok(out)
-}
-
-/// Let the services read the descriptions. They run as users, and the
-/// recovery service writes under umask 077, so every description it wrote
-/// is one only root may read. That is not a local failure: a single
-/// unreadable fragment fails the whole framework manifest, and the services
-/// are then told the phone describes nothing at all.
-fn open_descriptions(dir: &Path) -> Result<()> {
-    if !dir.is_dir() {
-        return Ok(());
-    }
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("open {} to the services", dir.display()))?;
-    for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o644))
-                .with_context(|| format!("open {} to the services", entry.path().display()))?;
-        }
-    }
-    Ok(())
-}
-
-/// Give the vendor's service labels the lines for the services this phone
-/// still carries. hwservicemanager decides whether one may register by
-/// looking its interface up in this file; a lookup that finds nothing is a
-/// refusal of its own, not a policy decision, so a phone in permissive mode
-/// refuses just the same. Android 17's file no longer names the older
-/// services, so a copy with the lines added is shown in its place.
-fn declare_service_labels(wanted: &[String]) -> Result<()> {
-    let dir = Path::new(VENDOR_LABELS);
-    let labels = dir.join(VENDOR_LABEL_FILE);
-    if !labels.is_file() {
-        return Ok(());
-    }
-    let have = fs::read_to_string(&labels).with_context(|| format!("read {}", labels.display()))?;
-    let mut missing = Vec::new();
-    if !have.contains(BASE_INTERFACE) {
-        missing.push(BASE_INTERFACE.to_string());
-    }
-    for name in wanted {
-        if let Some(interface) = interface_of(name) {
-            if !have.contains(&interface) {
-                missing.push(interface);
-            }
-        }
-    }
-    if missing.is_empty() {
-        return Ok(());
-    }
-    // The installed system's own file still names them, so the lines are
-    // taken from there rather than written out here: each carries the label
-    // the system's policy gives that service.
-    let plat = fs::read_to_string(SERVICE_LABELS).with_context(|| format!("read {SERVICE_LABELS}"))?;
-    let mut add = String::new();
-    for interface in missing {
-        if let Some(line) = plat.lines().find(|line| line.starts_with(&interface)) {
-            add.push_str(line);
-            add.push('\n');
-        }
-    }
-    if add.is_empty() {
-        return Ok(());
-    }
-    let staged = Path::new("/tmp/selinux");
-    if staged.exists() {
-        fs::remove_dir_all(staged).with_context(|| format!("clear {}", staged.display()))?;
-    }
-    copy_labels(dir, staged)?;
-    let staged_labels = staged.join(VENDOR_LABEL_FILE);
-    let mut text = fs::read_to_string(&staged_labels).with_context(|| format!("read {}", staged_labels.display()))?;
-    text.push_str(&add);
-    fs::write(&staged_labels, text).with_context(|| format!("add the services to {}", staged_labels.display()))?;
-    fs::set_permissions(&staged_labels, fs::Permissions::from_mode(0o644))?;
-    skyward_block::mount::bind(staged, dir).with_context(|| format!("show {} at {}", staged.display(), dir.display()))?;
-    Ok(())
-}
-
-/// The interface a service's name belongs to, without the version or the
-/// instance: `pkg@1.2::IFace/default` becomes `pkg::IFace`.
-fn interface_of(name: &str) -> Option<String> {
-    let (package, rest) = name.split_once('@')?;
-    let (_, rest) = rest.split_once("::")?;
-    let (interface, _) = rest.split_once('/')?;
-    Some(format!("{package}::{interface}"))
-}
-
-/// Copy the labels folder, keeping it readable: the directory and every
-/// file in it are read by services that run as users, and the recovery
-/// service writes under umask 077.
-fn copy_labels(from: &Path, to: &Path) -> Result<()> {
-    fs::create_dir_all(to).with_context(|| format!("make {}", to.display()))?;
-    fs::set_permissions(to, fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("open {} to the services", to.display()))?;
-    for entry in fs::read_dir(from).with_context(|| format!("read {}", from.display()))? {
-        let entry = entry?;
-        let target = to.join(entry.file_name());
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
-            copy_labels(&entry.path(), &target)?;
-        } else if kind.is_file() {
-            fs::copy(entry.path(), &target)
-                .with_context(|| format!("copy {} to {}", entry.path().display(), target.display()))?;
-            fs::set_permissions(&target, fs::Permissions::from_mode(0o644))
-                .with_context(|| format!("open {} to the services", target.display()))?;
-        }
-    }
-    Ok(())
 }
 
 /// Open the bundle of libraries the phone's own partitions were built
@@ -505,10 +362,19 @@ pub fn publish_descriptions(wanted: &[String], files: &[String], texts: &[String
     let mut declared = BTreeSet::new();
     let into = Path::new(RECOVERY_DESCRIPTIONS);
     fs::create_dir_all(into).with_context(|| format!("make {}", into.display()))?;
+    // Both directories read these as the users their init scripts name,
+    // and what the recovery makes under its own umask is root's alone: the
+    // folder and each description are given the modes the system's own
+    // copies have.
+    fs::set_permissions(into, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .with_context(|| format!("open {} to every user", into.display()))?;
     let mut copied = 0;
     let mut take = |from: &Path, text: &str| -> Result<()> {
         let name = from.file_name().with_context(|| format!("{} names no file", from.display()))?;
-        fs::write(into.join(name), as_framework(text)).with_context(|| format!("copy {}", from.display()))?;
+        let to = into.join(name);
+        fs::write(&to, as_framework(text)).with_context(|| format!("copy {}", from.display()))?;
+        fs::set_permissions(&to, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .with_context(|| format!("let every user read {}", to.display()))?;
         copied += 1;
         Ok(())
     };
@@ -546,7 +412,6 @@ pub fn publish_descriptions(wanted: &[String], files: &[String], texts: &[String
         copied += 1;
     }
     let rewritten = say_framework(into)?;
-    open_descriptions(into)?;
     if copied > 0 || rewritten > 0 {
         // The directory reads the descriptions once and keeps to them, so
         // it has to start again to see these. It comes back knowing nothing

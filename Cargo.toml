@@ -19,13 +19,16 @@ members = [
     "crates/skyward-pack",
     "crates/skyward-sys",
     "crates/skyward-lp",
+    "crates/skyward-bootimg",
+    "crates/skyward-system-init",
+    "crates/skyward-systems",
 ]
 
 [workspace.package]
 # Upstream's number, raised for what this fork adds: the bootloader message
 # page, the log kept where it outlasts a restart, the backup of the
 # bootloader chain, a queue of packages, and a keyboard that is felt.
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 

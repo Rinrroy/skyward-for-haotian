@@ -1,4 +1,5 @@
 use crate::canvas::{Canvas, Run};
+use crate::charge;
 use crate::color::Rgba;
 use crate::editor::{self, Editor};
 use crate::files::{self, FileType};
@@ -13,6 +14,7 @@ use crate::motion::{self, Spring};
 use crate::pages::{self, Band, Ctx};
 use crate::sprite::{Blurs, Sprite};
 use crate::search;
+use crate::settings::Settings;
 use crate::term::{self, Term, TermKey};
 use crate::theme::Theme;
 use crate::tr;
@@ -20,10 +22,12 @@ use crate::widgets::{self, Bar, Bolt, Cap, Layer, WlanMark};
 use skyward_info::DeviceInfo;
 use skyward_install::{Event, ImageKind, Outcome, Reflash, Refusal, Stage};
 use skyward_net::download::{Failure, Progress};
+use skyward_net::github::{Build, Newest};
 use skyward_net::release::{Release, Unanswered};
 use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Joined, Network, Power, Stage as Joining, Traffic, Wlan};
 use skyward_vab::avb::{Change as AvbChange, Reading as AvbReading};
+use skyward_systems::{Overview, Who};
 use skyward_vab::{BootSlots, Hold, Slot, SnapshotState, Standing};
 
 /// The pages of the recovery.
@@ -95,12 +99,18 @@ pub enum Screen {
     /// Where an update the system installed stands, and merging it into
     /// the slot it went to.
     Update,
+    /// Skyward's newest release, and updating to it: its build for the
+    /// phone downloaded and written into the recovery partitions.
+    SkywardUpdate,
     /// Skyward's own licence.
     License,
     /// The interface typeface and the terms it is used under.
     FontLicense,
     /// Which slot the phone starts from next.
     Slot,
+    /// The installed system and the one Skyward installed beside it: which
+    /// of them starts, switching between them, and taking the other away.
+    Systems,
     /// The phone's own fastbootd serving the computer's fastboot, and where
     /// to go from it. Its only page, worked with the keys: the partitions
     /// the touchscreen runs from are left out while fastbootd rewrites
@@ -176,6 +186,54 @@ pub enum DownloadEnd {
     Downloaded,
     Stopped,
     Failed(Failure),
+}
+
+/// How far asking GitHub for Skyward's newest release has come.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SkywardCheck {
+    #[default]
+    Idle,
+    Asking,
+    Failed(Unanswered),
+    Answered(Newest),
+}
+
+/// Updating Skyward, as its page shows it: downloading the newest release's
+/// build for the phone, then writing it into the recovery partitions, how
+/// far that has come, and how it ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkywardJob {
+    /// None until the download has begun.
+    pub stage: Option<SkywardStage>,
+    /// Bytes a second, while it downloads.
+    pub rate: u64,
+    pub outcome: Option<SkywardEnd>,
+    /// Stopping the download was asked for and is under way.
+    pub stopping: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkywardStage {
+    Download(Progress),
+    /// The build is written into the recovery partitions and read back:
+    /// bytes so far, of all.
+    Write { done: u64, total: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SkywardEnd {
+    /// The build is in the recovery partitions of these slots.
+    Updated(Vec<Slot>),
+    /// The download was stopped; what it downloaded is kept to go on from.
+    Stopped,
+    /// The download did not end with the build whole.
+    Download(Failure),
+    /// The build could not go in, or where it goes could not be told: why.
+    /// Nothing was written.
+    NotWritten(String),
+    /// Writing it into the recovery partitions of these slots failed, after
+    /// some of it was written: why.
+    WriteFailed(Vec<Slot>, String),
 }
 
 /// Where the full packages downloaded go, from the top of internal
@@ -510,6 +568,7 @@ pub enum Switch {
     /// Show the password typed rather than a dot for each character.
     ShowPassword,
 }
+
 /// What a backup can take, in the order the backup page lists it.
 pub const BACKUP_PARTS: [Text; 5] = [
     ["启动分区", "啟動分割區", "Boot partitions"],
@@ -834,6 +893,13 @@ pub enum Confirm {
     InstallQueue,
     /// Do to the partition the filesystem page shows what it chose.
     Filesystem,
+    /// Switch to the system picked on the systems page, and restart into
+    /// it.
+    SwitchSystem,
+    /// Take the other system away.
+    RemoveSystem,
+    /// Install the system the installer holds with the room chosen.
+    InstallSystem,
 }
 
 /// Whether a swipe-to-confirm control has to be slid twice.
@@ -993,6 +1059,11 @@ pub enum Install {
     Flashing { partition: &'static str, stage: Option<Stage> },
     /// A zip with an install script waits for the user to agree to run it.
     ConfirmingScript,
+    /// A system to install beside the installed one waits for the room its
+    /// root takes to be chosen.
+    SystemChoosing(SystemChoice),
+    /// The system is being installed: its name, and how far.
+    Systeming { name: String, stage: Option<Stage> },
     /// Its install script is made ready and then, once `running`, runs; how
     /// far it says it is, once it says.
     Scripting { stage: Option<Stage>, running: bool },
@@ -1029,6 +1100,37 @@ pub struct Choice {
     /// Which of them is chosen.
     pub partition: usize,
     pub pick: Pick,
+}
+
+/// A system to install beside the installed one, and the room its root
+/// takes so far.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SystemChoice {
+    pub name: String,
+    pub version: String,
+    /// The sizes there is room for, the least first.
+    pub sizes: Vec<u64>,
+    /// Which of them is chosen.
+    pub size: usize,
+}
+
+/// The system that starts, as the runtime last read the systems.
+pub fn starting(systems: &Overview) -> Who {
+    if systems.other_starts {
+        Who::Other
+    } else {
+        Who::Installed
+    }
+}
+
+/// Work on the systems the runtime carries out for the systems page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemsWork {
+    /// Writing this system's boot set into the boot partitions; the phone
+    /// restarts into it once that is done.
+    Switching(Who),
+    /// Taking the other system away.
+    Removing,
 }
 
 /// Where the reboot page sends the device, in the order it lists them.
@@ -1224,12 +1326,17 @@ pub enum Action {
     StopBackup,
     /// Tick or untick a log to export: the recovery's, the kernel's.
     LogPart(usize),
-    /// Save the logs to /tmp, or to internal storage.
+    /// Save the logs to the temporary folder, or to internal storage.
     LogsTo(usize),
     /// Save the logs ticked where they are to go.
     ExportLogs,
     /// Pick this slot to start next; a swipe then switches to it.
     PickSlot(Slot),
+    /// Pick this system to start next; a swipe then switches to it.
+    PickSystem(Who),
+    /// Give the root of the system being installed the size at this place
+    /// in those offered.
+    SystemSize(usize),
     /// A key of the on-screen keyboard.
     Type(Cap),
     /// A key of the row above the keyboard, the terminal's or the editor's.
@@ -1317,6 +1424,13 @@ pub enum Action {
     StopDownload,
     /// Install the full package downloaded.
     InstallDownloaded,
+    /// Ask GitHub for Skyward's newest release.
+    CheckSkyward,
+    /// Download the newest release's build for the phone and write it into
+    /// the recovery partitions.
+    UpdateSkyward,
+    /// Stop downloading the build.
+    StopSkywardUpdate,
     /// A control whose work is not wired up yet; touching it says so.
     Unavailable(&'static str),
 }
@@ -1646,6 +1760,9 @@ pub struct Queued {
 pub struct State {
     /// The language the pages speak.
     pub lang: Lang,
+    /// The language was chosen on the language page, now or at an earlier
+    /// start, where otherwise it is the one the system names.
+    pub language_chosen: bool,
     pub dark: bool,
     pub brightness: f32,
     /// How long the screen stays on with nothing touched, by its place in
@@ -1726,7 +1843,8 @@ pub struct State {
     pub backup_job: Option<BackupJob>,
     /// Which logs to export: the recovery's, the kernel's.
     pub logs: [bool; 2],
-    /// Where the logs go: 0 for /tmp, 1 for internal storage.
+    /// Where the logs go: 0 for the temporary folder, 1 for internal
+    /// storage.
     pub logs_to: usize,
     /// What the phone's boot control holds of the slots, as the runtime
     /// last read it for the slot or reboot page, or why it could not.
@@ -1749,6 +1867,21 @@ pub struct State {
     /// The slot picked on the slot page to start next; with none picked,
     /// the page shows the one the boot control starts next.
     pub next_slot: Option<Slot>,
+    /// The phone has what a second system needs: boot and init_boot
+    /// partitions in both slots, which a switch writes, and recovery
+    /// partitions apart from them, which keep Skyward through it.
+    pub dual_boot: bool,
+    /// The systems, as the runtime last read them, or why it could not;
+    /// none until it has.
+    pub systems: Option<Result<Overview, String>>,
+    /// The system picked on the systems page to start next; with none
+    /// picked, the page shows the one that starts.
+    pub system_pick: Option<Who>,
+    /// Work on the systems under way.
+    pub systems_work: Option<SystemsWork>,
+    /// Why the second system's start stopped, as its first program told
+    /// it, which the systems page shows.
+    pub system_notice: Option<String>,
     /// Where the data partition stands, and what is typed at the screen
     /// lock its users' own files wait on.
     pub data: Data,
@@ -1827,6 +1960,9 @@ pub struct State {
     /// Downloading the newest system's full package, or how that last
     /// ended.
     pub download: Option<DownloadJob>,
+    pub skyward_check: SkywardCheck,
+    /// Updating Skyward, or how that last ended.
+    pub skyward_job: Option<SkywardJob>,
     /// How fast data went over the network joined in the last second.
     pub traffic: Traffic,
 }
@@ -1834,14 +1970,15 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         State {
+            aod_date: String::new(),
+            aod_style: AodStyle::Digits,
             lang: Lang::Hans,
+            language_chosen: false,
             dark: false,
             brightness: SLIDER_START,
             // Two minutes.
             screen_off: 3,
             time_zone: 0,
-            aod_date: String::new(),
-            aod_style: AodStyle::Digits,
             vibrate: true,
             vibration: SLIDER_START,
             file_transfer: true,
@@ -1881,6 +2018,11 @@ impl Default for State {
             starter: None,
             starter_cleared: None,
             next_slot: None,
+            dual_boot: false,
+            systems: None,
+            system_pick: None,
+            systems_work: None,
+            system_notice: None,
             data: Data::Closed,
             code: String::new(),
             search: String::new(),
@@ -1916,6 +2058,8 @@ impl Default for State {
             check: Check::Idle,
             have: Have::Nothing,
             download: None,
+            skyward_check: SkywardCheck::Idle,
+            skyward_job: None,
             traffic: Traffic::default(),
         }
     }
@@ -1976,6 +2120,31 @@ impl State {
     pub fn downloading(&self) -> bool {
         self.download.as_ref().is_some_and(|d| d.outcome.is_none())
     }
+
+    /// Skyward's newest release, as GitHub told of it.
+    pub fn skyward_newest(&self) -> Option<&Newest> {
+        match &self.skyward_check {
+            SkywardCheck::Answered(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Whether Skyward is being updated.
+    pub fn updating_skyward(&self) -> bool {
+        self.skyward_job.as_ref().is_some_and(|j| j.outcome.is_none())
+    }
+
+    /// Whether the phone has the page `screen`: the WLAN page where the
+    /// recovery brings the phone's WLAN up, and updating Skyward where the
+    /// phone also keeps its recovery in a partition of each slot.
+    pub fn offers(&self, screen: Screen) -> bool {
+        match screen {
+            Screen::Wlan => self.wlan.is_some(),
+            Screen::SkywardUpdate => self.wlan.is_some() && self.recovery_partitions,
+            Screen::Systems => self.dual_boot,
+            _ => true,
+        }
+    }
 }
 
 /// One finger, in screen pixels.
@@ -2010,6 +2179,10 @@ pub enum Effect {
     Reboot(Target),
     /// A short tap of the vibration motor.
     Haptic,
+    /// The motor's two quick ticks as the power key turns the screen off,
+    /// as strong as the phone's own system plays them whatever the
+    /// vibration settings say.
+    Ticks,
     /// Save what the panel shows as a picture: into the gallery's
     /// screenshots in the owner's shared storage where `storage` says it is
     /// open, and otherwise held until it is, telling how it went with
@@ -2051,6 +2224,18 @@ pub enum Effect {
     /// Have the bootloader start this slot next, telling how it went with
     /// [`App::slot_switched`].
     SetSlot(Slot),
+    /// Read the systems for the systems page, telling them with
+    /// [`App::set_systems`].
+    ReadSystems,
+    /// Write this system's boot set into the boot partitions and restart
+    /// into it, telling of a switch that did not go with
+    /// [`App::systems_work_failed`].
+    SwitchSystem(Who),
+    /// Take the other system away, telling how it went with
+    /// [`App::set_systems`] or [`App::systems_work_failed`].
+    RemoveSystem,
+    /// Install the system the installer holds with a root of `size` bytes.
+    InstallSystem { size: u64 },
     /// Mount the slot's partition with this base name, such as `system`.
     Mount(String),
     /// Unmount the slot's partition with this base name.
@@ -2166,6 +2351,14 @@ pub enum Effect {
     /// goes with [`App::download_progress`] and [`App::download_ended`].
     Download(Release),
     StopDownload,
+    /// Ask GitHub for Skyward's newest release, telling what it answered
+    /// with [`App::skyward_checked`].
+    CheckSkyward,
+    /// Download `build` and write it into the recovery partitions, telling
+    /// how it goes with [`App::skyward_progress`] and
+    /// [`App::skyward_ended`].
+    UpdateSkyward(Build),
+    StopSkywardUpdate,
     /// Merge the update that waits in the slot the phone runs from,
     /// telling how it goes with [`App::set_update`].
     Merge,
@@ -2192,8 +2385,8 @@ enum Drag {
     /// the editor's text, `carry` being the part of a row not yet scrolled.
     History { last: f32, carry: f32, pitch: f32 },
     Pattern,
-    /// The finger that landed just after the panel lit by a key; nothing it
-    /// does counts until it lifts.
+    /// A finger that landed just after the panel lit; nothing it does
+    /// counts until it lifts.
     Waking,
     /// A finger on the glass of the AOD, from the `y` it came down at;
     /// swiped up far enough, it lights the panel.
@@ -2356,6 +2549,19 @@ const LIGHT_HELD_ALPHA: u8 = 72;
 /// How far past the screen, in screens, a long list keeps its rows drawn.
 const NEAR_SCREENS: f32 = 0.5;
 
+/// How the screen's content goes dark as the panel goes off, and comes up
+/// as it lights, as the phone's own system moves it: to black in 365 ms
+/// slowing as the cube of the time left, from black over 520 ms slowing as
+/// its square.
+const DARKEN: Ease = Ease::Out(365, 3);
+const BRIGHTEN: Ease = Ease::Out(520, 2);
+/// The charging screen comes over the page as the phone's own does, over
+/// 420 ms slowing as the square of the time left, shows this long from
+/// when the cable went in, and goes in 300 ms.
+const CHARGE_SHOW: Ease = Ease::Out(420, 2);
+const CHARGE_HIDE: Ease = Ease::Out(300, 2);
+const CHARGE_MS: u64 = 4000;
+
 /// How a part of the screen eases between shown and hidden.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Ease {
@@ -2363,6 +2569,9 @@ enum Ease {
     Spring(f32),
     /// A straight run over this many milliseconds.
     Linear(u64),
+    /// A run over this many milliseconds that slows to a stop, what is
+    /// left of the way going as this power of the time left.
+    Out(u64, i32),
 }
 
 impl Ease {
@@ -2370,8 +2579,17 @@ impl Ease {
         match self {
             Ease::Spring(period) => motion::settle(ms, period),
             Ease::Linear(span) => (ms as f32 / span as f32).min(1.0),
+            Ease::Out(span, power) => 1.0 - (1.0 - (ms as f32 / span as f32).min(1.0)).powi(power),
         }
     }
+}
+
+/// The charging screen: when the cable went in, how far it shows over the
+/// page, and whether the panel was dark then and goes dark again after.
+struct Charging {
+    since: u64,
+    shown: Fade,
+    dark_after: bool,
 }
 
 /// A part of the screen fading in or out: where it is headed, since when,
@@ -2714,6 +2932,16 @@ pub struct App {
     /// The panel at full brightness, or easing to the dim level it takes
     /// shortly before going off.
     bright: Fade,
+    /// The screen's content against black: it goes dark as the panel goes
+    /// off, under the backlight held then, and comes up as the panel lights.
+    curtain: Fade,
+    darkening: Option<f32>,
+    /// The charging screen, from when a cable goes in until it has gone,
+    /// with the level and what the charger does drawn for it, and the
+    /// screen it is drawn on while it comes or goes over the page.
+    charging: Option<Charging>,
+    charge_art: Option<charge::Art>,
+    charge_canvas: Option<Canvas>,
     /// While a text field's cursor is up: the page, how many edits had
     /// been typed, and when it came up whole on them. It shows for the
     /// first half of each blink from then on, so it is whole again at each
@@ -2758,6 +2986,9 @@ pub struct App {
 impl App {
     pub fn new(start: Screen, w: u32, h: u32, px_per_dp: f32) -> Self {
         App {
+            aod_style_chosen: false,
+            settings_dirty: false,
+            settings_due_at: None,
             state: State::default(),
             stack: vec![(start, 0.0, Focus::Unset)],
             frame: None,
@@ -2795,12 +3026,14 @@ impl App {
             glow: None,
             term: None,
             display_on: true,
-            aod_style_chosen: false,
-            settings_dirty: false,
-            settings_due_at: None,
             active: None,
             woke_at: None,
             bright: full_brightness(),
+            curtain: Fade::shown(BRIGHTEN, DARKEN),
+            darkening: None,
+            charging: None,
+            charge_art: None,
+            charge_canvas: None,
             blink: None,
             edits: 0,
             caret_shown: false,
@@ -2871,7 +3104,10 @@ impl App {
                 || self.turn.is_some()
                 || self.row_press.is_some_and(|p| p.changing(now) || p.gone(now))
                 || self.glowing());
-        if moving {
+        // The content going dark or coming up, and the charging screen's
+        // tide, move a frame at a time while the panel is lit.
+        let lit = self.panel(now).is_some();
+        if moving || (lit && (self.curtain.moving(now) || self.charging.is_some())) {
             return Some(0);
         }
         let darkens = self.row_press.map(|p| p.rise).filter(|&rise| rise > now);
@@ -2928,15 +3164,10 @@ impl App {
     /// deadline goes away.
     pub fn tick(&mut self, now: u64) -> Vec<Effect> {
         let mut fx = Vec::new();
-        // Settings the user has changed wait a moment for the last change,
-        // then go to the owner's storage once.
-        if self.settings_dirty && self.settings_due_at.is_none() {
-            self.settings_due_at = Some(now + SETTINGS_SAVE_DELAY);
-        }
         // The key waiting for its partner in a screenshot, left alone long
         // enough, does what it does alone.
         if self.chord.is_some_and(|(_, at)| now >= at + CHORD_MS) {
-            fx.extend(self.let_chord_go());
+            fx.extend(self.let_chord_go(now));
         }
         // An entry of the file manager held long enough, under a finger or
         // the power key, opens what can be done with it, a folder as much as
@@ -2957,10 +3188,32 @@ impl App {
         if let (true, Some(after)) = (self.display_on, SCREEN_OFF[self.state.screen_off]) {
             let idle = now.saturating_sub(active);
             if idle >= after {
-                self.sleep();
+                self.sleep(now);
             } else if idle >= after - dim_span(after) {
                 self.bright.set(false, now);
             }
+        }
+        // The charging screen goes once it has shown long enough: on a
+        // panel lit for it, with the panel, else for the page.
+        if self.display_on && self.charging.as_ref().is_some_and(|c| c.shown.on && now >= c.since + CHARGE_MS) {
+            let c = self.charging.as_mut().expect("the charging screen shows");
+            if c.dark_after {
+                self.sleep(now);
+            } else {
+                c.shown.set(false, now);
+            }
+        }
+        if self.charging.as_ref().is_some_and(|c| !c.shown.on && !c.shown.moving(now)) {
+            self.end_charging();
+        }
+        // Once the content is dark, the panel is off, and what showed goes
+        // with it.
+        if !self.display_on && self.darkening.is_some() && self.curtain.level(now) <= 0.0 {
+            self.darkening = None;
+            self.end_charging();
+        }
+        if self.curtain.moving(now) || self.charging.is_some() {
+            self.dirty = true;
         }
         if self.toast.as_ref().is_some_and(|m| now >= m.1) {
             self.toast = None;
@@ -3108,10 +3361,11 @@ impl App {
     }
 
     /// The backlight at `now`: off, or this share of the brightness at the
-    /// slider's top; the AOD holds the dark panel at its own low light.
+    /// slider's top, which holds as the content goes dark after the panel
+    /// is told to go off.
     pub fn panel(&self, now: u64) -> Option<f32> {
         if !self.display_on {
-            return Some(AOD_LEVEL);
+            return self.darkening.filter(|_| self.curtain.level(now) > 0.0);
         }
         let (full, level) = (self.state.brightness, self.bright.level(now));
         Some(full * level + dim_level(full) * (1.0 - level))
@@ -3124,58 +3378,62 @@ impl App {
         self.bright.set(true, now);
     }
 
-    /// Light the panel, as if just touched.
+    /// Light the panel, as if just touched: the content comes up from as
+    /// dark as it is.
     fn wake(&mut self, now: u64) {
         if !self.display_on {
             self.display_on = true;
             self.dirty = true;
+            self.darkening = None;
+            self.curtain.set(true, now);
         }
         self.woke_at = Some(now);
         self.stir(now);
     }
 
-    /// The settings the owner's storage kept, which only count where the
-    /// user has left each at the value it starts at this boot.
-    pub fn set_saved_settings(&mut self, saved: SavedSettings) {
-        if self.state.brightness == SLIDER_START {
-            self.state.brightness = saved.brightness;
+    /// A charger or a computer was attached, `cable_in`, or taken away: the
+    /// dark panel lights, and a lit one stays at full brightness for the
+    /// screen-off time from now, as on the phone's own system. A cable
+    /// going in brings up the charging screen, over the page or on the
+    /// panel lit for it, which then goes dark again.
+    pub fn plugged(&mut self, now: u64, cable_in: bool) {
+        if cable_in {
+            let dark = !self.display_on;
+            let mut shown = self.charging.take().map_or(Fade::hidden(CHARGE_SHOW, CHARGE_HIDE), |c| c.shown);
+            if dark {
+                shown.jump(true);
+            } else {
+                shown.set(true, now);
+            }
+            self.charging = Some(Charging { since: now, shown, dark_after: dark });
+            self.dirty = true;
         }
-        if !self.state.dark && saved.dark {
-            self.state.dark = saved.dark;
+        if self.display_on {
+            self.stir(now);
+        } else {
+            self.wake(now);
         }
-        if self.state.lang == Lang::Hans {
-            self.state.lang = saved.lang;
-        }
-        if self.state.screen_off == 3 {
-            self.state.screen_off = saved.screen_off;
-        }
-        if self.state.vibrate == State::default().vibrate {
-            self.state.vibrate = saved.vibrate;
-        }
-        if self.state.vibration == SLIDER_START {
-            self.state.vibration = saved.vibration;
-        }
-        if !self.aod_style_chosen && self.state.aod_style == AodStyle::Digits {
-            self.state.aod_style = saved.aod_style;
-        }
-        self.refresh();
     }
 
-    /// Whether the changed settings are due to be written now; the write
-    /// comes a moment after the last change, so a slider dragged across
-    /// the page writes once, not at every step.
-    pub fn settings_due(&mut self, now: u64) -> bool {
-        if !self.settings_dirty {
-            return false;
+    /// The charging screen has gone, and what was drawn for it with it.
+    fn end_charging(&mut self) {
+        self.charging = None;
+        self.charge_art = None;
+        self.charge_canvas = None;
+    }
+
+    /// Whether the charging screen shows, or is coming up.
+    fn charge_shown(&self) -> bool {
+        self.charging.as_ref().is_some_and(|c| c.shown.on)
+    }
+
+    /// Send the charging screen away for the page, and keep the panel lit.
+    fn dismiss_charging(&mut self, now: u64) {
+        if let Some(c) = &mut self.charging {
+            c.shown.set(false, now);
+            c.dark_after = false;
         }
-        match self.settings_due_at {
-            Some(due) if now >= due => {
-                self.settings_dirty = false;
-                self.settings_due_at = None;
-                true
-            }
-            _ => false,
-        }
+        self.stir(now);
     }
 
     /// Whether the panel lit so recently that a touch or key should only
@@ -3184,9 +3442,12 @@ impl App {
         self.woke_at.is_some_and(|w| now.saturating_sub(w) < WAKE_GUARD_MS)
     }
 
-    /// Turn the panel off. A finger on the glass lets go of what it held,
-    /// and the page stops where it is.
-    fn sleep(&mut self) {
+    /// Turn the panel off: the content goes dark under the backlight it has
+    /// now, then the panel goes off. A finger on the glass lets go of what
+    /// it held, and the page stops where it is.
+    fn sleep(&mut self, now: u64) {
+        self.darkening = self.panel(now);
+        self.curtain.set(false, now);
         self.display_on = false;
         self.bright = full_brightness();
         match std::mem::replace(&mut self.drag, Drag::Idle) {
@@ -3224,6 +3485,26 @@ impl App {
     /// Something laid over the page changed (the clock): compose again.
     pub fn redraw(&mut self) {
         self.dirty = true;
+    }
+
+    /// The settings the pages show, as they are kept between starts.
+    pub fn settings(&self) -> Settings {
+        Settings::of(&self.state)
+    }
+
+    /// Take the settings `kept` from the starts before, and speak the
+    /// language chosen then, or else the one the system `named`, or else
+    /// the one the pages last spoke.
+    pub fn take_settings(&mut self, kept: Option<&Settings>, named: Option<Lang>) {
+        if let Some(kept) = kept {
+            kept.apply(&mut self.state);
+        }
+        if !self.state.language_chosen {
+            if let Some(lang) = named.or(kept.and_then(Settings::spoken)) {
+                self.state.lang = lang;
+            }
+        }
+        self.refresh();
     }
 
     /// The page's readings changed (battery, storage): render it again.
@@ -3564,7 +3845,7 @@ impl App {
             return;
         }
         self.state.wlan = Some(w);
-        if matches!(self.screen(), Screen::Home | Screen::Wlan | Screen::WlanNetwork | Screen::Update) {
+        if matches!(self.screen(), Screen::Home | Screen::Wlan | Screen::WlanNetwork | Screen::Update | Screen::SkywardUpdate) {
             self.refresh();
         }
         // The status bar shows the network joined over every page.
@@ -3639,6 +3920,38 @@ impl App {
         job.stopping = false;
         job.outcome = Some(end);
         self.state.have = have;
+        self.wake(now);
+        self.refresh();
+    }
+
+    /// What GitHub answered of Skyward's newest release.
+    pub fn skyward_checked(&mut self, answer: Result<Newest, Unanswered>) {
+        self.state.skyward_check = match answer {
+            Ok(newest) => SkywardCheck::Answered(newest),
+            Err(why) => SkywardCheck::Failed(why),
+        };
+        if matches!(self.screen(), Screen::Settings | Screen::SkywardUpdate) {
+            self.refresh();
+        }
+    }
+
+    /// How far updating Skyward has come, and how fast the download goes,
+    /// in bytes a second.
+    pub fn skyward_progress(&mut self, stage: SkywardStage, rate: u64) {
+        let job = self.state.skyward_job.as_mut().expect("only an update under way moves on");
+        job.stage = Some(stage);
+        job.rate = rate;
+        if self.screen() == Screen::SkywardUpdate {
+            self.refresh();
+        }
+    }
+
+    /// Updating Skyward has ended: its page says how, lit for the user to
+    /// read.
+    pub fn skyward_ended(&mut self, end: SkywardEnd, now: u64) {
+        let job = self.state.skyward_job.as_mut().expect("only an update under way ends");
+        job.stopping = false;
+        job.outcome = Some(end);
         self.wake(now);
         self.refresh();
     }
@@ -3818,6 +4131,33 @@ impl App {
 
     /// How turning the two checks the vbmeta blocks name off or on went, with
     /// what the blocks then said.
+    /// The settings the owner's storage kept, which only count where the
+    /// user has left each at the value it starts at this boot.
+    pub fn set_saved_settings(&mut self, saved: SavedSettings) {
+        if self.state.brightness == SLIDER_START {
+            self.state.brightness = saved.brightness;
+        }
+        if !self.state.dark && saved.dark {
+            self.state.dark = saved.dark;
+        }
+        if self.state.lang == Lang::Hans {
+            self.state.lang = saved.lang;
+        }
+        if self.state.screen_off == 3 {
+            self.state.screen_off = saved.screen_off;
+        }
+        if self.state.vibrate == State::default().vibrate {
+            self.state.vibrate = saved.vibrate;
+        }
+        if self.state.vibration == SLIDER_START {
+            self.state.vibration = saved.vibration;
+        }
+        if !self.aod_style_chosen && self.state.aod_style == AodStyle::Digits {
+            self.state.aod_style = saved.aod_style;
+        }
+        self.refresh();
+    }
+
     pub fn avb_written(&mut self, outcome: Result<Vec<AvbChange>, String>, readings: Result<Vec<AvbReading>, String>, now: u64) {
         match &outcome {
             Ok(changes) => {
@@ -3877,6 +4217,40 @@ impl App {
             }
             Err(why) => self.say(&tr!(self.state.lang, "切换失败：{why}", "切換失敗：{why}", "Couldn't switch: {why}"), now),
         }
+    }
+
+    /// The systems, as the runtime read them, or why it could not; work on
+    /// them that was under way has ended.
+    pub fn set_systems(&mut self, systems: Result<Overview, String>) {
+        self.state.systems = Some(systems);
+        self.state.systems_work = None;
+        self.refresh();
+    }
+
+    /// Why the work on the systems the page asked for did not go: the
+    /// switch did not happen, or the other system was not taken away.
+    pub fn systems_work_failed(&mut self, why: &str, now: u64) {
+        let l = self.state.lang;
+        let said = match self.state.systems_work.take() {
+            Some(SystemsWork::Removing) => tr!(l, "删除失败：{why}", "刪除失敗：{why}", "Couldn't remove: {why}"),
+            _ => tr!(l, "切换失败：{why}", "切換失敗：{why}", "Couldn't switch: {why}"),
+        };
+        self.say(&said, now);
+        self.refresh();
+    }
+
+    /// The second system's start stopped, for `why`, as its first program
+    /// told it: the systems page shows it, over the home page.
+    pub fn system_stopped(&mut self, why: String) {
+        self.state.system_notice = Some(why);
+        self.open(Screen::Systems);
+    }
+
+    /// A switch to `to` a system asked for before the recovery started is
+    /// under way: the systems page shows it, over the home page.
+    pub fn switch_asked(&mut self, to: Who) {
+        self.state.systems_work = Some(SystemsWork::Switching(to));
+        self.open(Screen::Systems);
     }
 
     /// What was found in the places looked in for backups: the newest
@@ -4190,17 +4564,45 @@ impl App {
         top.1 = top.1.clamp(0.0, max);
     }
 
-    /// Draw what the panel shows now: the visible part of the page, pulled
-    /// past an end if it is, its large title fading as it scrolls, the bar
-    /// and its title over a scrolled page, the `<`, the page sliding in or
-    /// out over or under the page left, the status bar, any message, and
-    /// the back cue while a swipe from an edge is under way.
+    /// Draw what the panel shows now: the page, the charging screen over it
+    /// while a cable has just gone in, both as dark as the content stands
+    /// as the panel goes off or comes up.
     pub fn compose(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64) {
-        // Asleep, the panel shows the AOD instead of the pages.
-        if !self.display_on {
-            self.compose_aod(out, f, info, clock);
-            return;
+        let charge = self.charging.as_ref().map_or(0.0, |c| c.shown.level(now));
+        if charge < 1.0 {
+            self.compose_page(out, f, info, clock, now);
         }
+        if charge > 0.0 {
+            self.compose_charging(out, f, info, charge, now);
+        }
+        out.dim(self.curtain.level(now));
+    }
+
+    /// The charging screen, `level` of the way over the page drawn on `out`.
+    fn compose_charging(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, level: f32, now: u64) {
+        let battery = info.battery.as_ref().expect("a cable went in on a phone whose battery is read");
+        let (t, lang) = (self.theme(), self.state.lang);
+        if !self.charge_art.as_ref().is_some_and(|a| a.shows(lang, battery)) {
+            self.charge_art = Some(charge::Art::new(f, &t.m, lang, battery).expect("the screens' face takes the charging screen's weight"));
+        }
+        let since = self.charging.as_ref().map_or(now, |c| c.since);
+        let dither = self.dither.get_or_insert_with(|| glow::Dither::new(out.w as usize, out.h as usize));
+        let art = self.charge_art.as_ref().expect("drawn above");
+        if level >= 1.0 {
+            charge::draw(out, art, &t.m, battery.level, now.saturating_sub(since), dither);
+        } else {
+            let screen = self.charge_canvas.get_or_insert_with(|| Canvas::new(out.w, out.h));
+            charge::draw(screen, art, &t.m, battery.level, now.saturating_sub(since), dither);
+            out.lay(screen, 0, 0, level);
+        }
+    }
+
+    /// The visible part of the page, pulled past an end if it is, its large
+    /// title fading as it scrolls, the bar and its title over a scrolled
+    /// page, the `<`, the page sliding in or out over or under the page
+    /// left, the status bar, any message, and the back cue while a swipe
+    /// from an edge is under way.
+    fn compose_page(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64) {
         // A page opened is drawn from its left edge as it slides in.
         let opening = self.turn.as_ref().is_some_and(|t| !t.back);
         self.render(f, info, if opening { 0 } else { self.w });
@@ -4845,6 +5247,16 @@ impl App {
             Screen::Bcb => self.state.starter_cleared = None,
             // A slot picked and not switched to is put down.
             Screen::Slot => self.state.next_slot = None,
+            // So is a system; the page stays while the boot partitions are
+            // being written, which nothing may cut short.
+            Screen::Systems => {
+                if self.state.systems_work.is_some() {
+                    self.say(l.pick(["正在写入，请等待写入完成", "正在寫入，請等待寫入完成", "Writing. Wait for it to finish"]), now);
+                    return fx;
+                }
+                self.state.system_pick = None;
+                self.state.asking_delete = false;
+            }
             Screen::Files => {
                 if let Some(up) = self.state.files.up() {
                     return vec![Effect::ReadDir(up)];
@@ -4920,6 +5332,19 @@ impl App {
                 self.state.restore = None;
                 self.state.asking_delete = false;
             }
+            // The page stays while Skyward is updated: once downloaded, the
+            // build is written at once, which nothing may cut short.
+            Screen::SkywardUpdate => match self.state.skyward_job.as_ref().filter(|j| j.outcome.is_none()).map(|j| j.stage) {
+                Some(Some(SkywardStage::Write { .. })) => {
+                    self.say(l.pick(["正在写入，请等待写入完成", "正在寫入，請等待寫入完成", "Writing. Wait for it to finish"]), now);
+                    return fx;
+                }
+                Some(_) => {
+                    self.say(l.pick(WAIT_OR_STOP), now);
+                    return fx;
+                }
+                None => {}
+            },
             // A restore that has begun writing cannot be stopped.
             Screen::BackupJob => {
                 let job = self.state.backup_job.as_ref().expect("the backup page shows work");
@@ -4953,6 +5378,10 @@ impl App {
                     self.say(l.pick(["正在刷入，请等待刷入完成", "正在刷入，請等待刷入完成", "Flashing. Wait for it to finish"]), now);
                     return fx;
                 }
+                Install::Systeming { .. } => {
+                    self.say(l.pick(["正在安装，请等待安装完成", "正在安裝，請等待安裝完成", "Installing. Wait for it to finish"]), now);
+                    return fx;
+                }
                 Install::Opening => {
                     self.say(l.pick(DATA_OPENING), now);
                     return fx;
@@ -4965,6 +5394,7 @@ impl App {
                 | Install::Locked(_)
                 | Install::Waiting
                 | Install::Choosing(_)
+                | Install::SystemChoosing(_)
                 | Install::Confirming { .. }
                 | Install::ConfirmingScript => {
                     self.state.install = Install::Ending;
@@ -5015,7 +5445,7 @@ impl App {
         if matches!(ev, Event::Wipe | Event::Reboot(_)) {
             return;
         }
-        if matches!(ev, Event::Image { .. } | Event::Ready { .. } | Event::Script | Event::Done(_) | Event::Finished(_)) {
+        if matches!(ev, Event::Image { .. } | Event::Ready { .. } | Event::Script | Event::System { .. } | Event::Done(_) | Event::Finished(_)) {
             self.wake(now);
         }
         let install = &mut self.state.install;
@@ -5033,6 +5463,7 @@ impl App {
                 *install = Install::Choosing(Choice { kind, size, partitions, partition: 0, pick: Pick::Current })
             }
             Event::Script => *install = Install::ConfirmingScript,
+            Event::System { name, version, sizes } => *install = Install::SystemChoosing(SystemChoice { name, version, sizes, size: 0 }),
             Event::Running => {
                 *install = Install::Scripting { stage: None, running: true };
                 self.state.script_output.clear();
@@ -5048,7 +5479,8 @@ impl App {
                 Install::Checking { stage: shown, .. }
                 | Install::Updating { stage: shown, .. }
                 | Install::Flashing { stage: shown, .. }
-                | Install::Scripting { stage: shown, .. } => *shown = Some(stage),
+                | Install::Scripting { stage: shown, .. }
+                | Install::Systeming { stage: shown, .. } => *shown = Some(stage),
                 _ => {}
             },
             Event::Reflashed(reflash) => self.state.reflash = Some(reflash),
@@ -5135,6 +5567,7 @@ impl App {
             Screen::Advanced | Screen::Avb => vec![Effect::ReadAvb],
             Screen::Bcb => vec![Effect::ReadStarter],
             Screen::Slot | Screen::Reboot => vec![Effect::ReadSlots],
+            Screen::Systems => vec![Effect::ReadSystems],
             Screen::Restore => vec![self.find_backups()],
             Screen::Files => vec![Effect::ReadDir(self.state.files.path.clone())],
             Screen::Choose(place) if self.state.place_open(place) => vec![Effect::ReadPlace(place, self.state.folder(s).path.clone())],
@@ -5162,6 +5595,11 @@ impl App {
                     fx.push(Effect::CheckUpdate);
                 }
                 fx
+            }
+            // Skyward's own page asks GitHub the same way.
+            Screen::SkywardUpdate if matches!(self.state.skyward_check, SkywardCheck::Idle | SkywardCheck::Failed(_)) && self.state.online() => {
+                self.state.skyward_check = SkywardCheck::Asking;
+                vec![Effect::CheckSkyward]
             }
             Screen::Wlan if self.state.wlan.as_ref().is_some_and(|w| w.power == Power::On) => vec![Effect::ScanWlan],
             _ => Vec::new(),
@@ -5314,6 +5752,20 @@ impl App {
                     self.refresh();
                 }
             }
+            Action::SystemSize(k) => {
+                if let Install::SystemChoosing(choice) = &mut self.state.install {
+                    choice.size = k;
+                    self.refresh();
+                }
+            }
+            Action::PickSystem(who) => {
+                if self.state.systems_work.is_none() {
+                    self.state.system_pick = Some(who);
+                    self.state.asking_delete = false;
+                    self.state.confirm = 0.0;
+                    self.refresh();
+                }
+            }
             Action::RebootTo(target) => return vec![Effect::Reboot(target)],
             Action::EnterRecovery => return vec![Effect::EnterRecovery],
             Action::Dismiss => {
@@ -5431,8 +5883,8 @@ impl App {
             }
             Action::Language(l) => {
                 self.state.lang = l;
+                self.state.language_chosen = true;
                 self.refresh();
-                self.settings_dirty = true;
             }
             Action::BackupPart(k) => {
                 self.state.backup[k] = !self.state.backup[k];
@@ -5711,6 +6163,46 @@ impl App {
                 let Have::Whole(size) = self.state.have else { unreachable!("only a whole package is offered to install") };
                 return self.install_file(Place::Storage, format!("{DOWNLOADS}/{name}"), size, now);
             }
+            // Asking takes a network, which the WLAN page joins.
+            Action::CheckSkyward => {
+                if !self.state.online() {
+                    self.open(Screen::Wlan);
+                    return self.arrive_at(Screen::Wlan);
+                }
+                if self.state.skyward_check != SkywardCheck::Asking {
+                    self.state.skyward_check = SkywardCheck::Asking;
+                    self.refresh();
+                    return vec![Effect::CheckSkyward];
+                }
+            }
+            // The build goes into the recovery partitions an install may
+            // write too, so one waits for the other.
+            Action::UpdateSkyward => {
+                let build = self.state.skyward_newest().and_then(|n| n.build.clone()).expect("the update is offered for the newest release's build");
+                if !self.state.online() {
+                    self.open(Screen::Wlan);
+                    return self.arrive_at(Screen::Wlan);
+                }
+                if !matches!(self.state.install, Install::Idle | Install::Finished { .. }) {
+                    self.say(l.pick(INSTALL_UNFINISHED), now);
+                    return Vec::new();
+                }
+                if !self.state.updating_skyward() {
+                    self.state.skyward_job = Some(SkywardJob { stage: None, rate: 0, outcome: None, stopping: false });
+                    self.refresh();
+                    return vec![Effect::UpdateSkyward(build)];
+                }
+            }
+            // Only the download stops: writing, once begun, goes on to its
+            // end.
+            Action::StopSkywardUpdate => {
+                let job = self.state.skyward_job.as_mut().expect("only an update under way is stopped");
+                if job.outcome.is_none() && !job.stopping && !matches!(job.stage, Some(SkywardStage::Write { .. })) {
+                    job.stopping = true;
+                    self.refresh();
+                    return vec![Effect::StopSkywardUpdate];
+                }
+            }
             Action::Unavailable(text) => self.say(text, now),
         }
         Vec::new()
@@ -5927,7 +6419,7 @@ impl App {
             Cap::Show(layer) => self.state.layer = layer,
             Cap::Enter => match self.screen() {
                 Screen::Search => {
-                    if let Some(first) = search::find_on(&self.state.search, l, self.state.wlan.is_some()).first() {
+                    if let Some(first) = search::find_on(&self.state.search, l, |screen| self.state.offers(screen)).first() {
                         return self.act(Action::Open(first.screen), now);
                     }
                 }
@@ -6014,23 +6506,17 @@ impl App {
     }
 
     pub fn touch(&mut self, ev: Touch, f: &Fonts, now: u64) -> Vec<Effect> {
+        // A finger on the dark panel lights nothing, as on the phone's own
+        // system, where the power key lights it.
         if !self.display_on {
-            // The dark panel shows the AOD, and a stray touch leaves it as
-            // it is: a recovery rides in a pocket or a bag, and among the
-            // things a stray tap could reach is wiping the phone. A swipe
-            // up far enough to have been meant brings the pages back, as a
-            // button does.
-            match ev {
-                Touch::Down(_, y) => self.drag = Drag::Aod { y },
-                Touch::Move(_, y) => {
-                    if let Drag::Aod { y: y0 } = self.drag {
-                        if y0 - y >= self.theme().m.dp(WAKE_SWIPE_DP) {
-                            self.drag = Drag::Idle;
-                            self.wake(now);
-                        }
-                    }
-                }
-                Touch::Up => self.drag = Drag::Idle,
+            return Vec::new();
+        }
+        // A finger on the charging screen sends it away for the page, and
+        // does nothing else until it lifts.
+        if self.charge_shown() {
+            if matches!(ev, Touch::Down(..)) {
+                self.dismiss_charging(now);
+                self.drag = Drag::Waking;
             }
             return Vec::new();
         }
@@ -6391,10 +6877,20 @@ impl App {
                 return self.screenshot(key, now);
             }
         }
-        let mut fx = self.let_chord_go();
+        let mut fx = self.let_chord_go(now);
         if !self.display_on {
-            // Any button lights the dark panel, and does only that.
-            self.wake(now);
+            // The power key lights the dark panel, and does only that, as on
+            // the phone's own system; the other keys leave it dark.
+            if key == Key::Power {
+                self.wake(now);
+            }
+            self.button = Some((key, Press::Spent));
+            return fx;
+        }
+        // A key other than power sends the charging screen away for the
+        // page, and does nothing else.
+        if key != Key::Power && self.charge_shown() {
+            self.dismiss_charging(now);
             self.button = Some((key, Press::Spent));
             return fx;
         }
@@ -6410,7 +6906,7 @@ impl App {
             self.chord = Some((key, now));
             return fx;
         }
-        fx.extend(self.key_down(key, now));
+        fx.extend(self.key_down(key, now, now));
         fx
     }
 
@@ -6430,25 +6926,26 @@ impl App {
     }
 
     /// The key waiting for its partner in a screenshot does what it does
-    /// alone, as pressed when it went down.
-    fn let_chord_go(&mut self) -> Vec<Effect> {
+    /// alone `now`, as pressed when it went down.
+    fn let_chord_go(&mut self, now: u64) -> Vec<Effect> {
         match self.chord.take() {
-            Some((key, at)) => self.key_down(key, at),
+            Some((key, at)) => self.key_down(key, at, now),
             None => Vec::new(),
         }
     }
 
-    /// What a button going down does on its own.
-    fn key_down(&mut self, key: Key, now: u64) -> Vec<Effect> {
+    /// What a button that went down `at` does on its own, `now`: a key
+    /// held is timed from when it went down, the screen goes off from now.
+    fn key_down(&mut self, key: Key, at: u64, now: u64) -> Vec<Effect> {
         match key {
             Key::Back => {
                 self.button = Some((key, Press::Spent));
-                self.act(Action::Back, now)
+                self.act(Action::Back, at)
             }
             Key::VolumeUp | Key::VolumeDown => {
                 let down = key == Key::VolumeDown;
-                self.button = Some((key, Press::Volume { down, next: now + REPEAT_DELAY_MS }));
-                self.volume(down, now)
+                self.button = Some((key, Press::Volume { down, next: at + REPEAT_DELAY_MS }));
+                self.volume(down, at)
             }
             // A press before the page it lands on is drawn is lost, rather
             // than taken for one on nothing.
@@ -6457,19 +6954,21 @@ impl App {
                 Vec::new()
             }
             Key::Power => {
+                self.dirty = true;
                 match self.keys.then(|| self.lit()).flatten() {
                     // Held on a swipe-to-confirm control, the key slides
                     // its knob along as a finger would.
                     Some(Spot { stop: Stop::Hit(Action::Confirm(which)), rect, .. }) => {
-                        self.button = Some((key, Press::Slide { which, track: rect, at: now }))
+                        self.button = Some((key, Press::Slide { which, track: rect, at }))
                     }
-                    Some(spot) => self.button = Some((key, Press::Power { spot, at: now })),
+                    Some(spot) => self.button = Some((key, Press::Power { spot, at })),
+                    // Turning the screen off, the key ticks the motor.
                     None => {
                         self.button = Some((key, Press::Spent));
-                        self.sleep();
+                        self.sleep(now);
+                        return vec![Effect::Ticks];
                     }
                 }
-                self.dirty = true;
                 Vec::new()
             }
         }
@@ -6481,7 +6980,7 @@ impl App {
     /// it does alone.
     pub fn key_up(&mut self, key: Key, now: u64) -> Vec<Effect> {
         let mut fx = match self.chord {
-            Some((first, _)) if first == key => self.let_chord_go(),
+            Some((first, _)) if first == key => self.let_chord_go(now),
             _ => Vec::new(),
         };
         let Some((down, press)) = self.button else { return fx };
@@ -6669,6 +7168,30 @@ impl App {
                     let partition = choice.partitions[choice.partition];
                     fx.push(Effect::Flash { partition, pick: choice.pick });
                     self.state.install = Install::Flashing { partition, stage: None };
+                    self.refresh();
+                }
+            }
+            Confirm::SwitchSystem => {
+                if let (Some(Ok(systems)), Some(pick)) = (&self.state.systems, self.state.system_pick) {
+                    if pick != starting(systems) {
+                        fx.push(Effect::SwitchSystem(pick));
+                        self.state.systems_work = Some(SystemsWork::Switching(pick));
+                        self.state.system_pick = None;
+                        self.refresh();
+                    }
+                }
+            }
+            Confirm::RemoveSystem => {
+                fx.push(Effect::RemoveSystem);
+                self.state.systems_work = Some(SystemsWork::Removing);
+                self.state.asking_delete = false;
+                self.state.system_pick = None;
+                self.refresh();
+            }
+            Confirm::InstallSystem => {
+                if let Install::SystemChoosing(choice) = &self.state.install {
+                    fx.push(Effect::InstallSystem { size: choice.sizes[choice.size] });
+                    self.state.install = Install::Systeming { name: choice.name.clone(), stage: None };
                     self.refresh();
                 }
             }
@@ -7211,6 +7734,7 @@ mod tests {
             Screen::TimeZone,
             Screen::Logs,
             Screen::Update,
+            Screen::SkywardUpdate,
             Screen::License,
             Screen::FontLicense,
             Screen::Slot,
@@ -7398,9 +7922,11 @@ mod tests {
         assert_eq!(app.screen(), Screen::Mount);
     }
 
-    /// A battery at `level`, as `charge` has it, 35.2 °C.
+    /// A battery at `level`, as `charge` has it, 35.2 °C, on a charger
+    /// unless it discharges.
     fn battery_at(level: u8, charge: Charge) -> skyward_info::Battery {
-        skyward_info::Battery { level, charge, temp: Some(352), health: None, cycles: None, design: None, full: None, voltage: None, quick: false }
+        let plugged = charge != Charge::Discharging;
+        skyward_info::Battery { level, charge, temp: Some(352), health: None, cycles: None, design: None, full: None, voltage: None, quick: false, plugged }
     }
 
     #[test]
@@ -8245,6 +8771,7 @@ mod tests {
             full: Some(5_095_000),
             voltage: Some(4_200_000),
             quick: false,
+            plugged: false,
         };
         let i = DeviceInfo {
             os_version: Some("OS3.0.305.0.WMACNXM".into()),
@@ -8575,6 +9102,52 @@ mod tests {
         assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("A partition in use can't be unmounted"), "as do its messages");
     }
 
+    #[test]
+    fn a_language_chosen_is_kept_and_spoken_over_the_one_the_system_names() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Settings, &f, &i);
+        app.take_settings(None, Some(Lang::Hant));
+        assert_eq!((app.state.lang, app.settings().language), (Lang::Hant, None), "the system's, until one is chosen");
+        tap(&mut app, &f, &i, Action::Open(Screen::Language));
+        tap(&mut app, &f, &i, Action::Language(Lang::En));
+        let kept = app.settings();
+        assert_eq!(kept.language.as_deref(), Some("en"));
+
+        let mut next = App::new(Screen::Home, W, H, PPD);
+        next.take_settings(Some(&kept), Some(Lang::Hans));
+        assert_eq!(next.state.lang, Lang::En, "the next start speaks the language chosen");
+        assert_eq!(next.settings(), kept, "and keeps it chosen");
+    }
+
+    #[test]
+    fn with_no_language_chosen_a_start_speaks_the_system_s_or_else_the_one_last_spoken() {
+        let spoke_english = Settings { spoken: Some("en".into()), ..Settings::default() };
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.take_settings(Some(&spoke_english), Some(Lang::Hant));
+        assert_eq!(app.state.lang, Lang::Hant, "the one the system names");
+        let mut fastboot = App::new(Screen::Fastboot, W, H, PPD);
+        fastboot.take_settings(Some(&spoke_english), None);
+        assert_eq!(fastboot.state.lang, Lang::En, "a start that names none, as fastboot's");
+        let mut first = App::new(Screen::Fastboot, W, H, PPD);
+        first.take_settings(None, None);
+        assert_eq!(first.state.lang, State::default().lang, "and with nothing kept, the pages' own");
+    }
+
+    #[test]
+    fn the_other_pages_choices_are_kept_too() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Settings, &f, &i);
+        tap(&mut app, &f, &i, Action::Toggle(Switch::Vibrate));
+        app.state.check_signature = true;
+        app.state.backup_to = Place::UsbDrive;
+        app.state.logs_to = 1;
+        let kept = app.settings();
+        let mut next = App::new(Screen::Home, W, H, PPD);
+        next.take_settings(Some(&kept), None);
+        assert!(!next.state.vibrate && next.state.check_signature);
+        assert_eq!((next.state.backup_to, next.state.logs_to), (Place::UsbDrive, 1));
+    }
+
     /// The installing page, opened from the install page, with the
     /// installer started and waiting for the computer.
     fn sideloading(f: &Fonts, i: &DeviceInfo) -> App {
@@ -8783,114 +9356,8 @@ mod tests {
         assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::Search))), "the keys go on working the pages");
         app.touch(Touch::Down(W as f32 / 2.0, 200.0), &f, 0);
         app.touch(Touch::Up, &f, 0);
-        assert!(press(&mut app, Key::Power, 0).is_empty());
+        assert_eq!(press(&mut app, Key::Power, 0), vec![Effect::Ticks]);
         assert!(!app.display_on(), "with the light put out, power turns the panel off");
-    }
-
-    #[test]
-    fn a_touch_leaves_a_dark_panel_dark_and_a_key_lights_it() {
-        let (f, i) = (fonts(), info());
-        let mut app = App::new(Screen::Home, W, H, PPD);
-        app.frame(&f, &i);
-        assert!(press(&mut app, Key::Power, 0).is_empty());
-        assert!(!app.display_on(), "the light is out");
-        app.touch(Touch::Down(W as f32 / 2.0, H as f32 / 2.0), &f, 0);
-        app.touch(Touch::Up, &f, 0);
-        assert!(!app.display_on(), "a stray touch in a pocket lights nothing");
-        assert!(app.touch(Touch::Down(W as f32 / 2.0, H as f32 / 2.0), &f, 8).is_empty());
-        assert!(!app.display_on(), "nor does holding it");
-        assert!(press(&mut app, Key::Power, 16).is_empty());
-        assert!(app.display_on(), "a key brings the panel back");
-    }
-
-    #[test]
-    fn the_dark_panel_shows_the_aod_and_a_swipe_up_lights_it() {
-        let (f, i) = (fonts(), info());
-        let mut app = App::new(Screen::Home, W, H, PPD);
-        app.frame(&f, &i);
-        assert!(press(&mut app, Key::Power, 0).is_empty());
-        assert!(!app.display_on(), "the light is out");
-        assert_eq!(app.panel(0), Some(AOD_LEVEL), "the AOD holds the panel at its own low light");
-        let mut out = Canvas::new(W, H);
-        app.compose(&mut out, &f, &i, "09:32", 0);
-        assert!(out.data.iter().any(|px| *px != 0), "the AOD draws the time on the black panel");
-        // A tap, and a shift of the cloth, leave the AOD as it is.
-        let x = W as f32 / 2.0;
-        app.touch(Touch::Down(x, H as f32 * 0.8), &f, 0);
-        app.touch(Touch::Move(x, H as f32 * 0.8 - 20.0), &f, 8);
-        app.touch(Touch::Up, &f, 16);
-        assert!(!app.display_on(), "a touch that is no swipe does not wake it");
-        // A swipe up far enough brings the pages back.
-        let far = app.theme().m.dp(WAKE_SWIPE_DP) + 1.0;
-        app.touch(Touch::Down(x, H as f32 * 0.8), &f, 1000);
-        app.touch(Touch::Move(x, H as f32 * 0.8 - far), &f, 1010);
-        assert!(app.display_on(), "a swipe up lights the panel");
-        app.touch(Touch::Up, &f, 1020);
-    }
-
-    #[test]
-    fn the_aod_shows_each_clock_style_the_settings_cycle_through() {
-        let (f, i) = (fonts(), info());
-        let mut app = App::new(Screen::Settings, W, H, PPD);
-        app.frame(&f, &i);
-        assert_eq!(app.state.aod_style, AodStyle::Digits, "the AOD starts on the digits");
-        // The switch sits below the fold on the settings page; scroll it on.
-        app.top_mut().1 = app.max_scroll();
-        tap(&mut app, &f, &i, Action::AodStyle);
-        assert_eq!(app.state.aod_style, AodStyle::Offset, "a tap asks for the offset digits");
-        tap(&mut app, &f, &i, Action::AodStyle);
-        assert_eq!(app.state.aod_style, AodStyle::Dial, "another asks for the clock face");
-        tap(&mut app, &f, &i, Action::AodStyle);
-        assert_eq!(app.state.aod_style, AodStyle::Digits, "and a third comes back to the digits");
-        // Asleep, each style draws, and no two draw the same.
-        press(&mut app, Key::Power, 1000);
-        assert!(!app.display_on(), "the light is out");
-        app.state.aod_date = "10月26日周一".into();
-        let mut out = Canvas::new(W, H);
-        let mut frames = Vec::new();
-        for style in [AodStyle::Digits, AodStyle::Offset, AodStyle::Dial] {
-            app.state.aod_style = style;
-            app.compose(&mut out, &f, &i, "10:08", 1000);
-            assert!(out.data.iter().any(|px| *px != 0), "{style:?} draws on the black panel");
-            frames.push(out.data.clone());
-        }
-        assert_ne!(frames[0], frames[1], "the digits and the offset digits draw differently");
-        assert_ne!(frames[1], frames[2], "the offset digits and the dial draw differently");
-        assert_ne!(frames[0], frames[2], "the digits and the dial draw differently");
-    }
-
-    #[test]
-    fn the_saved_settings_count_only_before_the_user_picks_theirs() {
-        let (f, i) = (fonts(), info());
-        let mut app = App::new(Screen::Settings, W, H, PPD);
-        app.frame(&f, &i);
-        app.set_saved_settings(SavedSettings {
-            aod_style: AodStyle::Dial,
-            brightness: 0.9,
-            dark: true,
-            lang: Lang::En,
-            screen_off: 0,
-            vibrate: false,
-            vibration: 0.9,
-        });
-        assert_eq!(app.state.aod_style, AodStyle::Dial, "the saved style shows before the user picks one");
-        assert_eq!(app.state.brightness, 0.9, "the saved brightness shows too");
-        assert!(app.state.dark, "the saved theme shows too");
-        assert_eq!(app.state.lang, Lang::En, "the saved language shows too");
-        assert_eq!(app.state.screen_off, 0, "the saved screen-off shows too");
-        assert!(!app.state.vibrate, "the saved switch shows too");
-        assert_eq!(app.state.vibration, 0.9, "the saved vibration shows too");
-        app.top_mut().1 = app.max_scroll();
-        tap(&mut app, &f, &i, Action::AodStyle);
-        assert_eq!(app.state.aod_style, AodStyle::Digits, "a tap cycles from the saved style on");
-        app.set_saved_settings(SavedSettings::default());
-        assert_eq!(app.state.aod_style, AodStyle::Digits, "the saved style does not overrule the user's pick");
-        assert_eq!(app.state.brightness, 0.9, "nor does it overrule the brightness the user left");
-        assert!(app.state.dark, "nor the theme the user left");
-        assert_eq!(app.state.lang, Lang::En, "nor the language the user left");
-        assert_eq!(app.state.screen_off, 0, "nor the screen-off the user left");
-        assert!(!app.state.vibrate, "nor the switch the user left");
-        assert_eq!(app.state.vibration, 0.9, "nor the vibration the user left");
     }
 
     #[test]
@@ -9152,7 +9619,9 @@ mod tests {
         press(&mut app, Key::Power, 0);
         assert!(!app.display_on(), "with the light out, power turns the panel off");
         press(&mut app, Key::VolumeDown, 1000);
-        assert!(app.display_on(), "a button lights the panel");
+        assert!(!app.display_on(), "a volume key leaves the panel dark");
+        press(&mut app, Key::Power, 1100);
+        assert!(app.display_on(), "the power key lights it");
         assert!(!app.keys, "and does only that");
     }
 
@@ -9802,6 +10271,150 @@ mod tests {
         let mut app = App::new(Screen::Slot, W, H, PPD);
         app.set_boot_slots(Ok(BootSlots { active: Slot::A, bootable: [true, true], successful: [false, true] }));
         assert!(app.frame(&f, &i).hits.iter().all(|h| !matches!(h.action, Action::Confirm(_))), "nothing to swipe");
+    }
+
+    /// The systems with a second one installed, the main one starting.
+    fn two_systems() -> Overview {
+        Overview {
+            installed: skyward_systems::Named { name: "HyperOS 3".into(), version: Some("OS3.0.308.0.WMACNXM".into()) },
+            other: Some(skyward_systems::Other { id: "ubuntu".into(), name: "Ubuntu Touch".into(), version: "24.04".into(), size: 16 << 30 }),
+            other_starts: false,
+            changed: false,
+        }
+    }
+
+    /// The systems page opened from the home page of a phone that can hold
+    /// a second system, with the systems read.
+    fn systems_page(f: &Fonts, i: &DeviceInfo, systems: Overview) -> App {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.dual_boot = true;
+        assert_eq!(tap(&mut app, f, i, Action::Open(Screen::Systems)), vec![Effect::ReadSystems], "read as the page opens");
+        app.set_systems(Ok(systems));
+        app
+    }
+
+    fn swipes(app: &mut App, f: &Fonts, i: &DeviceInfo) -> bool {
+        app.frame(f, i).hits.iter().any(|h| matches!(h.action, Action::Confirm(_)))
+    }
+
+    #[test]
+    fn the_home_page_offers_the_systems_where_the_phone_can_hold_a_second() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::Open(Screen::Systems)), "no init_boot partitions in both slots");
+        let app = systems_page(&f, &i, two_systems());
+        assert_eq!(app.screen(), Screen::Systems);
+        let named = |systems| {
+            let mut app = App::new(Screen::Home, W, H, PPD);
+            (app.state.dual_boot, app.state.systems) = (true, Some(Ok(systems)));
+            let t = app.theme();
+            let cx = Ctx { t: &t, f: &f, info: &i, state: &app.state, term: None, band: None };
+            pages::render(Screen::Home, &cx).canvas.data.clone()
+        };
+        assert!(named(two_systems()) != named(Overview { other_starts: true, ..two_systems() }), "the home page names the one that starts");
+    }
+
+    #[test]
+    fn the_systems_page_switches_to_the_system_picked() {
+        let (f, i) = (fonts(), info());
+        let mut app = systems_page(&f, &i, two_systems());
+        assert!(!swipes(&mut app, &f, &i), "the main system starts already");
+        tap(&mut app, &f, &i, Action::PickSystem(Who::Other));
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Other)]);
+        assert_eq!((app.state.systems_work, app.state.system_pick), (Some(SystemsWork::Switching(Who::Other)), None));
+        assert!(app.frame(&f, &i).hits.is_empty(), "nothing to tap while the boot partitions are written");
+        // The card tapped darkens and comes back, as a row of a list does.
+        app.tick(1000);
+        app.key(Key::Back, 1000);
+        assert_eq!((app.screen(), app.deadline(1000)), (Screen::Systems, Some(1000 + TOAST_MS)), "the page stays until they are, and says why");
+        app.systems_work_failed("the store's header does not check", 0);
+        assert_eq!(app.state.systems_work, None);
+        app.set_systems(Ok(Overview { other_starts: true, ..two_systems() }));
+        tap(&mut app, &f, &i, Action::PickSystem(Who::Installed));
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Installed)]);
+        app.set_systems(Ok(two_systems()));
+        tap(&mut app, &f, &i, Action::PickSystem(Who::Other));
+        app.key(Key::Back, 0);
+        assert_eq!((app.screen(), app.state.system_pick), (Screen::Home, None), "a pick left unswitched is put down");
+    }
+
+    #[test]
+    fn the_second_system_waits_for_an_update_in_flight_and_the_main_one_does_not() {
+        let (f, i) = (fonts(), DeviceInfo { snapshot: SnapshotState::Snapshotted, ..info() });
+        let mut app = systems_page(&f, &i, two_systems());
+        tap(&mut app, &f, &i, Action::PickSystem(Who::Other));
+        assert!(!swipes(&mut app, &f, &i), "nothing to swipe");
+        app.set_systems(Ok(Overview { other_starts: true, ..two_systems() }));
+        tap(&mut app, &f, &i, Action::PickSystem(Who::Installed));
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Installed)], "back to the main system to merge it");
+    }
+
+    #[test]
+    fn the_second_system_is_removed_once_asked_and_swiped() {
+        let (f, i) = (fonts(), info());
+        let mut app = systems_page(&f, &i, two_systems());
+        assert!(app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Open(Screen::Decrypt)), "the data partition is opened first");
+        app.state.data = Data::Open;
+        app.refresh();
+        tap(&mut app, &f, &i, Action::AskDelete);
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::RemoveSystem), vec![Effect::RemoveSystem]);
+        assert_eq!((app.state.systems_work, app.state.asking_delete), (Some(SystemsWork::Removing), false));
+        app.set_systems(Ok(Overview { other: None, ..two_systems() }));
+        assert_eq!(app.state.systems_work, None);
+        assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::AskDelete), "nothing left to remove");
+        tap(&mut app, &f, &i, Action::Open(Screen::Install));
+        assert_eq!(app.screen(), Screen::Install, "the empty place opens the install page");
+    }
+
+    #[test]
+    fn a_system_installs_beside_the_main_one_in_the_room_chosen() {
+        let (f, i) = (fonts(), info());
+        let mut app = sideloading(&f, &i);
+        app.install(Event::Checking { size: 3 << 30 }, 0);
+        app.install(Event::System { name: "Ubuntu Touch".into(), version: "24.04".into(), sizes: vec![3 << 30, 8 << 30, 16 << 30] }, 0);
+        // The package lit the panel, so the user looks and taps past the
+        // wake guard.
+        tap_at(&mut app, &f, &i, Action::SystemSize(1), 1000);
+        let track = app.frame(&f, &i).hits.iter().find(|h| h.action == Action::Confirm(Confirm::InstallSystem)).unwrap().rect;
+        let y = track.centre().1 - app.top().1;
+        app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
+        app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
+        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::InstallSystem { size: 8 << 30 }]);
+        assert_eq!(app.state.install, Install::Systeming { name: "Ubuntu Touch".into(), stage: None });
+        app.install(Event::Progress(Stage::Root { done: 1 << 30, total: 6 << 30 }), 1000);
+        assert_eq!(app.state.install, Install::Systeming { name: "Ubuntu Touch".into(), stage: Some(Stage::Root { done: 1 << 30, total: 6 << 30 }) });
+        app.key(Key::Back, 1000);
+        assert_eq!(app.screen(), Screen::Installing, "the root being written keeps the page");
+        app.install(Event::Finished(Outcome::SystemInstalled { name: "Ubuntu Touch".into() }), 1000);
+        assert_eq!(tap_at(&mut app, &f, &i, Action::Open(Screen::Systems), 2000), vec![Effect::ReadSystems]);
+        assert_eq!(app.screen(), Screen::Systems);
+    }
+
+    #[test]
+    fn a_switch_asked_for_shows_before_the_systems_are_read() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.dual_boot = true;
+        app.switch_asked(Who::Installed);
+        assert_eq!((app.screen(), app.state.systems_work), (Screen::Systems, Some(SystemsWork::Switching(Who::Installed))));
+        assert!(app.frame(&f, &i).hits.is_empty());
+    }
+
+    #[test]
+    fn a_stopped_second_system_says_why_on_its_page_and_from_the_home_card() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.dual_boot = true;
+        app.system_stopped("no partition userdata showed within 15s".into());
+        assert_eq!(app.screen(), Screen::Systems);
+        app.set_systems(Ok(Overview { other_starts: true, ..two_systems() }));
+        let page = app.frame(&f, &i);
+        assert!(page.hits.iter().any(|h| h.action == Action::PickSystem(Who::Installed)), "the main system is there to switch back to");
+        assert!(!page.hits.iter().any(|h| h.action == Action::Confirm(Confirm::SwitchSystem)), "nothing is switched until one is picked");
+        app.key(Key::Back, 0);
+        assert_eq!(app.screen(), Screen::Home);
+        let opens = app.frame(&f, &i).hits.iter().filter(|h| h.action == Action::Open(Screen::Systems)).count();
+        assert_eq!(opens, 2, "the card says so above the entry to the systems");
     }
 
     /// Whether the page shows a key of the keypad or keyboard to tap.
@@ -11015,6 +11628,80 @@ mod tests {
         assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Update)), vec![Effect::ReadUpdate, Effect::CheckUpdate], "a failed check is tried again");
     }
 
+    fn skyward_newest(newer: bool) -> Newest {
+        Newest {
+            version: "0.1.4".into(),
+            newer,
+            build: Some(Build {
+                name: "skyward-v0.1.4-ishtar-OS3.0.308.0.WMACNXM.zip".into(),
+                url: "https://api.github.com/repos/kirklin/skyward/releases/assets/719751598".into(),
+                link: "https://github.com/kirklin/skyward/releases/download/v0.1.4/skyward-v0.1.4-ishtar-OS3.0.308.0.WMACNXM.zip".into(),
+                size: 42_739_608,
+                sha256: "62b66f7d13a0eb6c9af3359b5ec6f9c223fd9a86b1f8abab3e9d2646cb2ce534".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn skyward_updates_from_its_newest_release_and_its_page_stays_until_the_build_is_in() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Settings, W, H, PPD);
+        app.refresh();
+        let offered = |app: &mut App| app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Open(Screen::SkywardUpdate));
+        assert!(!offered(&mut app), "a phone whose WLAN the recovery does not bring up");
+        app.state.wlan = Some(Wlan::default());
+        app.refresh();
+        assert!(!offered(&mut app), "a phone that keeps no recovery partition in each slot");
+        app.state.recovery_partitions = true;
+        app.refresh();
+        assert!(tap(&mut app, &f, &i, Action::Open(Screen::SkywardUpdate)).is_empty(), "nothing is asked without a network");
+        assert!(tap(&mut app, &f, &i, Action::CheckSkyward).is_empty());
+        assert_eq!(app.screen(), Screen::Wlan, "asking takes a network, which the WLAN page joins");
+        app.key(Key::Back, 0);
+        app.set_wlan(connected("Skyward"));
+        assert_eq!(tap(&mut app, &f, &i, Action::CheckSkyward), vec![Effect::CheckSkyward]);
+        assert_eq!(app.state.skyward_check, SkywardCheck::Asking);
+        app.skyward_checked(Ok(skyward_newest(true)));
+        let build = skyward_newest(true).build.unwrap();
+        app.state.install = Install::Waiting;
+        assert!(tap(&mut app, &f, &i, Action::UpdateSkyward).is_empty(), "an install under way goes first");
+        app.state.install = Install::Idle;
+        assert_eq!(tap(&mut app, &f, &i, Action::UpdateSkyward), vec![Effect::UpdateSkyward(build.clone())]);
+        app.skyward_progress(SkywardStage::Download(Progress::Downloading { done: 10_000_000, total: 42_739_608 }), 2_000_000);
+        app.key(Key::Back, 0);
+        assert_eq!(app.screen(), Screen::SkywardUpdate, "the page stays while the build downloads");
+        assert_eq!(tap(&mut app, &f, &i, Action::StopSkywardUpdate), vec![Effect::StopSkywardUpdate]);
+        assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::StopSkywardUpdate), "stopping, it is not asked again");
+        // An end lights the panel, and a touch just after only keeps it lit.
+        app.skyward_ended(SkywardEnd::Stopped, 0);
+        assert_eq!(tap_at(&mut app, &f, &i, Action::UpdateSkyward, 2000), vec![Effect::UpdateSkyward(build.clone())], "a download stopped carries on");
+        app.skyward_progress(SkywardStage::Write { done: 1 << 20, total: 4 << 20 }, 0);
+        assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::StopSkywardUpdate), "writing goes on to its end");
+        app.key(Key::Back, 2100);
+        assert_eq!(app.screen(), Screen::SkywardUpdate, "nor is the page left while the build is written");
+        app.skyward_ended(SkywardEnd::Updated(vec![Slot::A, Slot::B]), 3000);
+        assert_eq!(tap_at(&mut app, &f, &i, Action::RebootTo(Target::Recovery), 5000), vec![Effect::Reboot(Target::Recovery)]);
+        app.key(Key::Back, 5100);
+        assert_eq!(app.screen(), Screen::Settings);
+    }
+
+    #[test]
+    fn the_skyward_page_asks_github_as_it_opens_once_a_network_is_joined() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Settings, W, H, PPD);
+        app.state.wlan = Some(connected("Skyward"));
+        app.state.recovery_partitions = true;
+        app.refresh();
+        assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::SkywardUpdate)), vec![Effect::CheckSkyward]);
+        app.skyward_checked(Err(Unanswered::Failed("GitHub answered 403 Forbidden: API rate limit exceeded".into())));
+        app.key(Key::Back, 0);
+        assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::SkywardUpdate)), vec![Effect::CheckSkyward], "a failed check is tried again");
+        app.skyward_checked(Ok(skyward_newest(false)));
+        assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::UpdateSkyward), "nothing newer to update to");
+        app.key(Key::Back, 0);
+        assert!(tap(&mut app, &f, &i, Action::Open(Screen::SkywardUpdate)).is_empty(), "an answer heard is not asked again");
+    }
+
     #[test]
     fn a_tap_on_the_text_moves_the_cursor_and_a_drag_or_a_flick_scrolls_it() {
         let (f, i) = (fonts(), info());
@@ -11225,15 +11912,30 @@ mod tests {
         assert!(app.key(Key::Power, 0).is_empty());
         assert_eq!(app.panel(0), Some(SLIDER_START), "it waits for volume down first");
         assert_eq!(app.deadline(0), Some(CHORD_MS));
-        assert!(app.tick(CHORD_MS).is_empty());
-        assert_eq!(app.panel(CHORD_MS), Some(AOD_LEVEL), "held on alone, it turns the panel off to the AOD");
+        assert_eq!(app.tick(CHORD_MS), vec![Effect::Ticks], "held on alone, it turns the panel off, ticking the motor");
+        assert!(!app.display_on());
         assert!(app.key_up(Key::Power, CHORD_MS + 50).is_empty());
         assert!(app.key(Key::Power, CHORD_MS + 60).is_empty());
         assert_eq!(app.panel(CHORD_MS + 60), Some(SLIDER_START));
         assert!(app.key_up(Key::Power, CHORD_MS + 100).is_empty());
         assert!(app.key(Key::Power, 1000).is_empty());
-        assert!(app.key_up(Key::Power, 1050).is_empty());
-        assert_eq!(app.panel(1050), Some(AOD_LEVEL), "let go sooner, it turns the panel off to the AOD then");
+        assert_eq!(app.key_up(Key::Power, 1050), vec![Effect::Ticks]);
+        assert!(!app.display_on(), "let go sooner, it turns the panel off then");
+    }
+
+    #[test]
+    fn the_power_key_turning_the_screen_off_ticks_the_motor_whatever_the_settings() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.tick(0);
+        assert_eq!(press(&mut app, Key::Power, 1000), vec![Effect::Ticks]);
+        assert!(app.tick(1400).is_empty(), "once");
+        app.state.vibrate = false;
+        press(&mut app, Key::Power, 2000);
+        assert_eq!(press(&mut app, Key::Power, 3000), vec![Effect::Ticks], "with vibration off too");
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.tick(0);
+        assert!(app.tick(OFF).is_empty(), "but not the screen going off by itself");
+        assert!(!app.display_on());
     }
 
     #[test]
@@ -11316,9 +12018,11 @@ mod tests {
         assert_eq!(app.panel(DIMS + 500), Some(dim_level(SLIDER_START)));
         assert_eq!(app.deadline(DIMS + 500), Some(OFF), "dim until it goes off");
         app.tick(OFF);
-        assert_eq!(app.panel(OFF), Some(AOD_LEVEL), "the AOD takes the dark panel at its own low light");
         assert!(!app.display_on());
-        assert_eq!(app.deadline(OFF), None, "nothing to wait for on a dark panel");
+        assert_eq!(app.panel(OFF), Some(dim_level(SLIDER_START)), "the content goes dark under the dim backlight");
+        app.tick(OFF + 365);
+        assert_eq!(app.panel(OFF + 365), None);
+        assert_eq!(app.deadline(OFF + 365), None, "nothing to wait for on a dark panel");
     }
 
     #[test]
@@ -11330,7 +12034,7 @@ mod tests {
         assert_eq!(app.panel(5_000_000), Some(SLIDER_START));
         assert_eq!(app.deadline(5_000_000), Some(5_000_000 + DIMS));
         app.tick(5_000_000 + OFF);
-        assert_eq!(app.panel(5_000_000 + OFF), Some(AOD_LEVEL));
+        assert!(!app.display_on());
     }
 
     #[test]
@@ -11359,27 +12063,177 @@ mod tests {
     }
 
     #[test]
-    fn a_touch_on_the_dark_panel_leaves_it_dark() {
+    fn a_touch_on_the_dark_panel_lights_nothing() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Home, W, H, PPD);
         let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
         press(&mut app, Key::Power, 0);
         assert!(app.touch(Touch::Down(x, y), &f, 100).is_empty());
-        assert_eq!(app.panel(100), Some(AOD_LEVEL), "the panel stays dark: a pocket touch lights nothing");
+        assert!(app.touch(Touch::Move(x, y - 300.0), &f, 120).is_empty());
         assert!(app.touch(Touch::Up, &f, 140).is_empty());
-        assert_eq!(app.screen(), Screen::Home, "nothing the stray touch did took hold");
-        assert!(press(&mut app, Key::Power, 600).is_empty());
-        assert!(app.display_on(), "a key brings the panel back");
-        tap_at(&mut app, &f, &i, Action::Open(Screen::Settings), 1500);
-        assert_eq!(app.screen(), Screen::Settings, "a touch on the lit panel acts");
+        assert!(!app.display_on(), "the panel stays dark");
+        assert_eq!(app.screen(), Screen::Home, "the tap pressed nothing");
+        assert_eq!(app.top().1, 0.0, "nor scrolled the page");
+        press(&mut app, Key::Power, 200);
+        assert!(app.display_on());
+        tap_at(&mut app, &f, &i, Action::Open(Screen::Settings), 700);
+        assert_eq!(app.screen(), Screen::Settings, "a tap on the lit panel does");
     }
 
     #[test]
-    fn a_key_lights_the_dark_panel_and_does_nothing_else() {
+    fn a_cable_coming_out_lights_the_dark_panel_and_keeps_a_lit_one_lit() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.tick(0);
+        app.tick(OFF);
+        app.tick(OFF + 365);
+        assert_eq!(app.panel(OFF + 365), None);
+        let pulled = OFF + 1000;
+        app.plugged(pulled, false);
+        assert!(app.display_on(), "the cable coming out lights the panel");
+        assert!(!app.charge_shown(), "and shows the page");
+        assert_eq!(app.panel(pulled), Some(SLIDER_START));
+        assert_eq!(app.deadline(pulled + 520), Some(pulled + DIMS), "for the screen-off time, once the content is up");
+        app.tick(pulled + DIMS);
+        assert_eq!(app.panel(pulled + DIMS + 500), Some(dim_level(SLIDER_START)));
+        let again = pulled + DIMS + 600;
+        app.plugged(again, false);
+        assert_eq!(app.panel(again + 150), Some(SLIDER_START), "a cable coming out brightens a lit panel");
+        assert_eq!(app.deadline(again + 150), Some(again + DIMS), "and the wait starts over");
+        press(&mut app, Key::Power, again + 200);
+        assert!(!app.display_on(), "the power key turns it off at once, as ever");
+    }
+
+    #[test]
+    fn a_cable_going_in_on_the_dark_panel_shows_the_charging_screen_and_goes_dark_again() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.tick(0);
+        press(&mut app, Key::Power, 0);
+        app.tick(365);
+        assert_eq!(app.panel(365), None);
+        let plugged = 1000;
+        app.plugged(plugged, true);
+        assert!(app.display_on() && app.charge_shown(), "the charging screen lights the panel");
+        assert_eq!(app.deadline(plugged + 1000), Some(0), "its tide moves a frame at a time");
+        app.tick(plugged + CHARGE_MS - 1);
+        assert!(app.display_on());
+        app.tick(plugged + CHARGE_MS);
+        assert!(!app.display_on(), "then the panel goes dark again");
+        assert!(app.panel(plugged + CHARGE_MS + 100).is_some(), "as the charging screen goes dark");
+        app.tick(plugged + CHARGE_MS + 365);
+        assert_eq!(app.panel(plugged + CHARGE_MS + 365), None);
+        assert!(app.charging.is_none(), "and goes with it");
+    }
+
+    #[test]
+    fn a_cable_going_in_on_a_lit_panel_brings_the_charging_screen_over_the_page_and_away() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.tick(0);
+        app.plugged(1000, true);
+        assert!(app.display_on() && app.charge_shown());
+        app.tick(1000 + CHARGE_MS);
+        assert!(app.display_on(), "the panel stays lit");
+        assert!(!app.charge_shown(), "as the charging screen goes for the page");
+        app.tick(1000 + CHARGE_MS + 300);
+        assert!(app.charging.is_none());
+    }
+
+    #[test]
+    fn a_touch_or_a_volume_key_sends_the_charging_screen_away_and_keeps_the_panel_lit() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
+        app.tick(0);
+        press(&mut app, Key::Power, 0);
+        app.tick(365);
+        app.plugged(1000, true);
+        app.touch(Touch::Down(x, y), &f, 1500);
+        app.touch(Touch::Up, &f, 1550);
+        assert!(!app.charge_shown(), "the touch sent it away");
+        assert_eq!(app.screen(), Screen::Home, "and pressed nothing");
+        app.tick(1000 + CHARGE_MS);
+        assert!(app.display_on(), "the panel stays lit for the page");
+        app.plugged(10_000, true);
+        press(&mut app, Key::VolumeDown, 10_500);
+        assert!(!app.charge_shown(), "a volume key sends it away too");
+        assert!(app.display_on());
+    }
+
+    #[test]
+    fn the_charging_screen_shows_the_level_over_a_tide_of_light() {
+        let (f, i) = (fonts(), DeviceInfo { battery: Some(battery_at(64, Charge::Charging)), ..info() });
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.tick(0);
+        press(&mut app, Key::Power, 0);
+        app.tick(365);
+        app.plugged(1000, true);
+        let mut c = Canvas::new(W, H);
+        app.compose(&mut c, &f, &i, "12:00", 3000);
+        let px = |x: u32, y: u32| {
+            let k = ((y * W + x) * 4) as usize;
+            [c.data[k], c.data[k + 1], c.data[k + 2]]
+        };
+        assert_eq!(px(0, 0), [0, 0, 0], "on black");
+        let foot = px(W / 2, H - 4);
+        assert!(foot[2] > 40 && foot[2] > foot[0] * 4 && foot[2] > foot[1] * 2, "the tide's light at the foot is blue: {foot:?}");
+    }
+
+    #[test]
+    fn the_content_goes_dark_under_the_backlight_it_had_before_the_panel_goes_off() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.tick(0);
+        press(&mut app, Key::Power, 1000);
+        assert!(!app.display_on(), "touches and keys take the screen as off at once");
+        assert_eq!(app.panel(1000), Some(SLIDER_START), "while its content goes dark under the backlight it had");
+        assert_eq!(app.deadline(1000), Some(0), "a frame at a time");
+        assert_eq!(app.panel(1300), Some(SLIDER_START));
+        app.tick(1365);
+        assert_eq!(app.panel(1365), None, "then the panel goes off");
+        assert_eq!(app.deadline(1365), None);
+    }
+
+    #[test]
+    fn the_power_key_as_the_content_goes_dark_brings_it_back() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.tick(0);
+        press(&mut app, Key::Power, 1000);
+        app.tick(1100);
+        press(&mut app, Key::Power, 1100);
+        assert!(app.display_on(), "the power key lit it again");
+        let level = app.curtain.level(1100);
+        assert!(level > 0.0 && level < 1.0, "from as dark as it had gone: {level}");
+        assert_eq!(app.curtain.level(1100 + 520), 1.0);
+    }
+
+    #[test]
+    fn the_content_comes_up_from_black_as_the_panel_lights() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.tick(0);
+        press(&mut app, Key::Power, 0);
+        app.tick(365);
+        press(&mut app, Key::Power, 1000);
+        let mut c = Canvas::new(W, H);
+        let light = |c: &Canvas| c.data.as_chunks::<4>().0.iter().map(|p| p[0] as u64 + p[1] as u64 + p[2] as u64).sum::<u64>();
+        app.compose(&mut c, &f, &i, "12:00", 1000);
+        let first = light(&c);
+        app.compose(&mut c, &f, &i, "12:00", 1260);
+        let halfway = light(&c);
+        app.compose(&mut c, &f, &i, "12:00", 1520);
+        let full = light(&c);
+        assert_eq!(first, 0, "black as the panel lights");
+        assert!(halfway > full / 2 && halfway < full, "{halfway} of {full} halfway through");
+    }
+
+    #[test]
+    fn only_the_power_key_lights_the_dark_panel_and_does_nothing_else() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Settings, &f, &i);
         press(&mut app, Key::Power, 0);
-        assert!(app.key(Key::Back, 10).is_empty());
+        for (key, at) in [(Key::Back, 10), (Key::VolumeUp, 20), (Key::VolumeDown, 30)] {
+            assert!(press(&mut app, key, at).is_empty());
+            assert!(!app.display_on(), "{key:?} leaves the panel dark");
+        }
+        assert!(press(&mut app, Key::Power, 40).is_empty());
         assert!(app.display_on());
         assert_eq!(app.screen(), Screen::Settings, "back did not go back");
     }
@@ -11456,7 +12310,8 @@ mod tests {
         assert!(!app.display_on(), "reading the package does not light it");
         app.install(Event::Image { kind: ImageKind::Dtbo, size: 1 << 20, partitions: vec!["dtbo"] }, 20);
         assert!(app.display_on(), "an image waiting for its partition does");
-        assert_eq!(app.deadline(20), Some(20 + DIMS));
+        app.tick(20 + 520);
+        assert_eq!(app.deadline(20 + 520), Some(20 + DIMS));
         app.state.install = Install::Flashing { partition: "dtbo", stage: None };
         press(&mut app, Key::Power, 500);
         app.install(Event::Progress(Stage::Flashing { done: 1, total: 2 }), 510);

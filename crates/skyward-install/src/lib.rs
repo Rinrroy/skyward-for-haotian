@@ -6,6 +6,7 @@
 pub mod adb;
 pub mod asked;
 pub mod blockmap;
+pub mod commands;
 pub mod fuse;
 pub mod image;
 pub mod keep;
@@ -13,6 +14,7 @@ pub mod ota;
 pub mod package;
 pub mod script;
 pub mod signature;
+pub mod upgrade;
 pub mod wipe;
 
 #[cfg(target_os = "android")]
@@ -49,12 +51,13 @@ pub fn battery_refusal(battery: &Battery) -> Option<Refusal> {
 }
 
 /// Where the installer keeps what update_engine wrote while it last
-/// installed an update.
-pub const ENGINE_LOG: &str = "/tmp/update_engine.log";
+/// installed an update, in the recovery service's own folder.
+pub const ENGINE_LOG: &str = "/skyward/run/update_engine.log";
 
 /// Where the installer keeps what the install script it last ran showed
-/// and asked for, with what it and the programs it ran wrote.
-pub const SCRIPT_LOG: &str = "/tmp/install-script.log";
+/// and asked for, with what it and the programs it ran wrote, in the
+/// recovery service's own folder.
+pub const SCRIPT_LOG: &str = "/skyward/run/install-script.log";
 
 /// What the screen asks of an install besides the package.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -95,6 +98,10 @@ pub enum Event {
     /// until [`Command::Install`]: a script may write over any partition,
     /// so it always waits.
     Script,
+    /// A system to install beside the installed one, held until
+    /// [`Command::InstallSystem`] says how much room its root takes: its
+    /// name, its version, and the sizes there is room for, the least first.
+    System { name: String, version: String, sizes: Vec<u64> },
     /// The install script has started.
     Running,
     /// A line the install script shows.
@@ -146,6 +153,13 @@ pub enum Stage {
     /// This recovery is written back into the recovery partitions the
     /// install wrote over, and read back: bytes so far, of all.
     Reflashing { done: u64, total: u64 },
+    /// Room for a system is set aside in the data partition: bytes so far,
+    /// of all.
+    Allocating { done: u64, total: u64 },
+    /// The system's root is written and read back: bytes so far, of all.
+    Root { done: u64, total: u64 },
+    /// The system's boot set is put in the store.
+    Storing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +172,8 @@ pub enum Outcome {
     /// The install script ran to its end; `wipe_cache` when it asked for
     /// the cache partition to be erased after.
     Ran { wipe_cache: bool },
+    /// The system of this name is installed beside the installed one.
+    SystemInstalled { name: String },
     /// Stopped before anything was written.
     Cancelled,
     /// Not installed, for this reason; nothing was written.
@@ -214,6 +230,18 @@ pub enum Refusal {
     /// the phone's update keys, or not of the zip as it is, where the
     /// screen asked for one made with them.
     Unverified,
+    /// A system to install beside the installed one, which only someone
+    /// at the screen installs, not the system.
+    SystemAsked,
+    /// A system to install while the data partition, where its root goes,
+    /// is not open.
+    DataClosed,
+    /// A system to install while the one of this name is installed beside
+    /// the installed system already.
+    SystemInstalled(String),
+    /// A system whose root takes `least` bytes, where the data partition
+    /// has room for `room`.
+    NoRoom { least: u64, room: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +273,9 @@ pub enum Command {
     /// Install the update held in [`Event::Ready`], or run the script held
     /// in [`Event::Script`].
     Install,
+    /// Install the system held in [`Event::System`] with a root of `size`
+    /// bytes, one of those it offered.
+    InstallSystem { size: u64 },
     /// The user data the computer asked to be erased in [`Event::Wipe`]
     /// was erased, or was not.
     Wiped(bool),
