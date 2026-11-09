@@ -3,6 +3,7 @@ name: Release aurora
 on:
   push:
     tags: ["aurora-v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -36,6 +37,7 @@ jobs:
           RECOVERY: ${{ steps.stock.outputs.recovery }}
         run: echo "$RECOVERY  stock/recovery.img" | sha256sum --check
       - name: Pack the recovery
+        id: pack
         env:
           VERSION: ${{ steps.stock.outputs.version }}
         run: |
@@ -46,25 +48,30 @@ jobs:
             --mono-license resources/fonts/KirkMono-OFL.txt --out "out/$name.img"
           (cd out && zip -9 "$name.zip" "$name.img")
           sha256sum "out/$name.zip" | sed 's|out/||' > SHA256SUMS.txt
-          echo "name=$name" >> "$GITHUB_ENV"
-      - name: Publish the release
-        env:
-          GH_TOKEN: ${{ github.token }}
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+      - name: Write release notes
         run: |
-          cat > notes.md <<NOTES
+          cat > notes.md << 'EOF'
           # Skyward for aurora · 小米 14 Ultra
 
           kirklin/skyward 的小米 14 Ultra（aurora）移植版。数据解密已启用。
 
           ## 刷入（前提：BL 已解锁）
 
-          \`\`\`
+          ```
           adb reboot bootloader
           fastboot flash recovery 解压出的 .img
-          \`\`\`
+          ```
 
           进入 recovery：关机后按住「电源 + 音量上」，或 adb reboot recovery。
           回滚：fastboot flash recovery 原厂备份.img
-          NOTES
-          gh release create "$GITHUB_REF_NAME" --title "Skyward for aurora · Xiaomi 14 Ultra" \
-            --notes-file notes.md "out/$name.zip#Xiaomi 14 Ultra (aurora)" SHA256SUMS.txt
+          EOF
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Skyward for aurora · Xiaomi 14 Ultra" \
+            --notes-file notes.md \
+            "out/${{ steps.pack.outputs.name }}.zip#Xiaomi 14 Ultra (aurora)" \
+            SHA256SUMS.txt
