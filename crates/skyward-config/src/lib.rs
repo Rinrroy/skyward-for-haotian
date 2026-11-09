@@ -212,10 +212,8 @@ pub struct Haptics {
     #[serde(default)]
     pub click: Option<i16>,
     /// The file the driver says the motor's resonant frequency in, in
-    /// tenths of a hertz whatever its label, on phones whose click is made
-    /// from samples.
-    #[serde(default)]
-    pub resonance: Option<String>,
+    /// tenths of a hertz whatever its label.
+    pub resonance: String,
     pub strength: Strength,
 }
 
@@ -571,9 +569,8 @@ impl DeviceConfig {
             ensure!(plain && !folder.is_empty(), "[backup] data_skipped: {folder} is not a path from the top of {DATA}");
         }
         if let Some(haptics) = &cfg.haptics {
-            if let Some(file) = &haptics.resonance {
-                ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
-            }
+            let file = &haptics.resonance;
+            ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
             let Strength { lightest, strongest } = haptics.strength;
             ensure!(
                 0.0 < lightest && lightest < strongest && strongest <= 1.0,

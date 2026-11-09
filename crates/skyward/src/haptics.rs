@@ -85,13 +85,7 @@ impl Haptics {
     /// only as it is played.
     pub fn open(cfg: &skyward_config::Haptics) -> Result<Haptics> {
         let (path, dev) = motor()?;
-        // The resonance file is optional: phones whose click is a waveform
-        // the driver keeps need no frequency. The ticks still want one to
-        // scale by, and the 17 Ultra's own is what the tick times name.
-        let hz = match &cfg.resonance {
-            Some(file) => resonance(file)?,
-            None => TICKS_HZ,
-        };
+        let hz = resonance(&cfg.resonance)?;
         let click = match cfg.click {
             Some(id) => {
                 eprintln!("haptics {}: clicks with waveform {id}, ticks made for a motor swinging at {hz} Hz", path.display());

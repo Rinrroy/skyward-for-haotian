@@ -267,15 +267,15 @@ fn main() -> Result<()> {
     // mean a command was asked for, even where the program is the recovery
     // itself: a second copy started to read what misc holds would take the
     // port and the screen with it.
-    let started_as = std::env::args().next().unwrap_or_default();
-    let asked_for_a_command = std::env::args().nth(1).is_some();
-    if !asked_for_a_command && Path::new(&started_as).file_name().is_some_and(|n| n == "recovery") {
+    let started_as = std::env::args_os().next().unwrap_or_default();
+    let asked_for_a_command = std::env::args_os().nth(1).is_some();
+    let name = Path::new(&started_as).file_name().unwrap_or_default();
+    if !asked_for_a_command && name == "recovery" {
         return recovery();
     }
     // Install scripts run the commands linked to this binary by their names.
-    let name = Path::new(&started_as).file_name().unwrap_or_default();
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if let Some(code) = skyward_install::commands::run(&name, &args) {
+    if let Some(code) = skyward_install::commands::run(name, &args) {
         std::process::exit(code);
     }
     match Cli::parse().cmd {
@@ -713,6 +713,10 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
     match skyward_sys::cpu::run_as_system() {
         Ok(done) => skyward_sys::kmsg(&format!("the CPUs run as the system runs them: {}", done.join(", ")))?,
         Err(e) => skyward_sys::kmsg(&format!("the CPUs run as the kernel started them: {e:#}"))?,
+    }
+    if !cfg.owners.is_empty() {
+        let handed = hand_over(&cfg.owners)?;
+        skyward_sys::kmsg(&format!("{handed} of the phone's own files handed to the accounts its init gives them"))?;
     }
     // The drivers have made their nodes and their files by now, and the phone's
     // own init would give them an owner and permissions here, in its `on boot`

@@ -2443,13 +2443,11 @@ dependencies = [
 name = "skyward-pack"
 version = "0.2.0"
 dependencies = [
- "abootimg-oxide",
  "anyhow",
  "clap",
- "cpio",
- "lz4_flex",
  "serde_json",
  "sha2 0.10.9",
+ "skyward-bootimg",
  "skyward-config",
  "tempfile",
  "unpayload",
@@ -2466,6 +2464,7 @@ dependencies = [
  "skyward-info",
  "skyward-install",
  "skyward-net",
+ "skyward-systems",
  "skyward-ui",
  "skyward-vab",
  "toml",

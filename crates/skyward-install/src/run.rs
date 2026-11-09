@@ -934,7 +934,8 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
     shim_volume_key()?;
     shell_at_sbin()?;
     let kept = hold(ctx, slot)?;
-    detach_for_script(ctx, slot)?;
+    installed_boot_set()?;
+    detach_once(ctx)?;
     // While an update is in flight, the slot's partitions in super are its
     // and stay unmapped.
     let mapped = match skyward_vab::snapshot_state()? {

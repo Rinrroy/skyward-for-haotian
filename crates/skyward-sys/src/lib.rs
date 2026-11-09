@@ -197,6 +197,7 @@ const SESSIONS_KEPT: usize = 20;
 /// write to it fail, which took the WLAN down with it.
 const LOG_DISK_BUDGET: u64 = 2_500_000;
 
+
 /// The file [`kmsg`] writes its lines to as well, once [`keep_log`] opened
 /// it.
 static KEPT: OnceLock<Mutex<File>> = OnceLock::new();

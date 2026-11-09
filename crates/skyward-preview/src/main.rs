@@ -3,14 +3,17 @@ use skyward_config::DeviceConfig;
 use skyward_info::{Battery, Boot, Charge, Cpu, DeviceInfo, PatchLevel, Storage};
 use skyward_install::{Failure, ImageKind, Outcome, Ramdisk, Reflash, Refusal, Stage};
 use skyward_net::download::{Failure as DownloadFailure, Progress};
+use skyward_net::github::{Build, Newest};
 use skyward_net::reach::Reach;
 use skyward_net::release::{Release, Unanswered};
 use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Bands, Joined, Link, Network, Power, Stage as Joining, Traffic, Wlan};
+use skyward_systems::{Named, Other, Overview, Who};
 use skyward_ui::app::{
     Action, Adding, App, Asked, Asking, BackupAt, BackupEnd, BackupEntry, BackupJob, BackupRefusal, Choice, Clip, Damage, Data, DownloadEnd,
     DownloadJob, EraseStop, Field, FileKind, FileOp, FileRow, FileTask, FsAction, FsRow, Have, Held, Install, ItemEnd, JobEnd, Key, Keys,
-    MountFailure, MountRow, Part, PartKind, PartStop, Pick, Place, Screen, Source, Starter, TermEnd, Touch, UsbDrive, UsbLink, SCREEN_OFF,
+    MountFailure, MountRow, Part, PartKind, PartStop, Pick, Place, Screen, SkywardEnd, SkywardJob, SkywardStage, Source, Starter,
+    SystemChoice, SystemsWork, TermEnd, Touch, UsbDrive, UsbLink, SCREEN_OFF,
 };
 use skyward_ui::widgets::{self, Bar, Bolt, Cap, Layer};
 use skyward_ui::{editor, fmt, pages, Canvas, Ctx, Fonts, Lang, Theme};
@@ -98,6 +101,17 @@ fn phone_filesystems(open: bool) -> Vec<FsRow> {
         },
         FsRow { name: "metadata".into(), mount_point: "/metadata".into(), filesystem: Some("f2fs".into()), size: 64 << 20, others: Vec::new() },
     ]
+}
+
+/// The systems of a 17 Ultra with a second system installed, HyperOS
+/// starting.
+fn two_systems() -> Overview {
+    Overview {
+        installed: Named { name: "HyperOS 3".into(), version: Some("OS3.0.308.0.WMACNXM".into()) },
+        other: Some(Other { id: "ubuntu-touch".into(), name: "Ubuntu Touch".into(), version: "24.04-1.x".into(), size: 32_000_000_000 }),
+        other_starts: false,
+        changed: false,
+    }
 }
 
 /// File name, page, dark theme, readings, where the data partition stands,
@@ -197,7 +211,7 @@ fn main() -> Result<()> {
 
     // The sideload page through an install, as the installer tells it.
     let recovery = ImageKind::Boot { kernel: false, ramdisk: Ramdisk::Recovery };
-    let installing: [(&str, bool, Install); 14] = [
+    let installing: [(&str, bool, Install); 17] = [
         ("30-sideload-waiting", false, Install::Waiting),
         ("31-sideload-checking", false, Install::Checking { size: 7_103_043_868, stage: None }),
         (
@@ -255,6 +269,22 @@ fn main() -> Result<()> {
                 damage: None,
             },
         ),
+        (
+            "199-sideload-system-choosing",
+            false,
+            Install::SystemChoosing(SystemChoice {
+                name: "Ubuntu Touch".into(),
+                version: "24.04-1.x".into(),
+                sizes: [5, 8, 16, 32, 64].map(|gb: u64| gb * 1_000_000_000).to_vec(),
+                size: 3,
+            }),
+        ),
+        (
+            "200-sideload-system-writing-dark",
+            true,
+            Install::Systeming { name: "Ubuntu Touch".into(), stage: Some(Stage::Root { done: 1_610_612_736, total: 9_663_676_416 }) },
+        ),
+        ("201-sideload-system-installed", false, Install::Finished { outcome: Outcome::SystemInstalled { name: "Ubuntu Touch".into() }, damage: None }),
     ];
     for (name, dark, install) in installing {
         let mut app = opened(Screen::Installing, w, h, ppd);
@@ -374,10 +404,11 @@ fn main() -> Result<()> {
     let adding = |app: &mut App, name: &str, security: Security, field: Field, choosing: bool| {
         app.state.adding = Some(Adding { name: name.into(), security, field, choosing });
     };
-    let pages: [PageShot; 167] = [
+    let pages: [PageShot; 185] = [
         ("11-install-light-locked", Screen::Install, false, &|app| {
             app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false };
         }),
+        ("11-install-light-dual-boot", Screen::Install, false, &|app| app.state.dual_boot = true),
         ("11-install-dark-usb", Screen::Install, true, &|app| {
             app.set_usb_drive(Some(UsbDrive::Shown));
         }),
@@ -814,6 +845,52 @@ fn main() -> Result<()> {
             online(app);
             app.update_checked(Err(Unanswered::Login), Have::Nothing);
         }),
+        ("190-skyward-update-light-offline", Screen::SkywardUpdate, false, &|app| {
+            app.state.recovery_partitions = true;
+            app.state.wlan = Some(Wlan::default());
+        }),
+        ("191-skyward-update-light-newer", Screen::SkywardUpdate, false, &|app| {
+            skyward_online(app);
+            app.skyward_checked(Ok(skyward_newest()));
+        }),
+        ("192-skyward-update-dark-downloading", Screen::SkywardUpdate, true, &|app| {
+            skyward_online(app);
+            app.skyward_checked(Ok(skyward_newest()));
+            let stage = Some(SkywardStage::Download(Progress::Downloading { done: 17_104_000, total: 43_145_196 }));
+            app.state.skyward_job = Some(SkywardJob { stage, rate: 3_260_000, outcome: None, stopping: false });
+        }),
+        ("193-skyward-update-light-writing", Screen::SkywardUpdate, false, &|app| {
+            skyward_online(app);
+            app.skyward_checked(Ok(skyward_newest()));
+            let stage = Some(SkywardStage::Write { done: 140_000_000, total: 419_430_400 });
+            app.state.skyward_job = Some(SkywardJob { stage, rate: 0, outcome: None, stopping: false });
+        }),
+        ("194-skyward-update-light-updated", Screen::SkywardUpdate, false, &|app| {
+            skyward_online(app);
+            app.skyward_checked(Ok(skyward_newest()));
+            let outcome = Some(SkywardEnd::Updated(vec![Slot::A, Slot::B]));
+            app.state.skyward_job = Some(SkywardJob { stage: None, rate: 0, outcome, stopping: false });
+        }),
+        ("195-skyward-update-dark-latest", Screen::SkywardUpdate, true, &|app| {
+            skyward_online(app);
+            app.skyward_checked(Ok(Newest { version: "0.1.3".into(), newer: false, ..skyward_newest() }));
+        }),
+        ("196-skyward-update-light-write-failed", Screen::SkywardUpdate, false, &|app| {
+            skyward_online(app);
+            app.skyward_checked(Ok(skyward_newest()));
+            let why = "/dev/block/by-name/recovery_a reads back different from what was written";
+            let outcome = Some(SkywardEnd::WriteFailed(vec![Slot::A], why.into()));
+            app.state.skyward_job = Some(SkywardJob { stage: None, rate: 0, outcome, stopping: false });
+        }),
+        ("197-skyward-update-light-unanswered", Screen::SkywardUpdate, false, &|app| {
+            skyward_online(app);
+            let why = "GitHub answered 403 Forbidden: API rate limit exceeded for 203.0.113.7. (But here's the good news: Authenticated requests get a higher rate limit.)";
+            app.skyward_checked(Err(Unanswered::Failed(why.into())));
+        }),
+        ("198-settings-light-skyward-newer", Screen::Settings, false, &|app| {
+            skyward_online(app);
+            app.skyward_checked(Ok(skyward_newest()));
+        }),
         ("75-terminal-light-ended", Screen::Terminal, false, &|app| {
             let (rows, cols) = app.term_size(&fonts);
             app.term_started(rows, cols);
@@ -843,6 +920,31 @@ fn main() -> Result<()> {
         }),
         ("60-slot-light-unread", Screen::Slot, false, &|app| {
             app.set_boot_slots(Err("android.hardware.boot.IBootControl/default is not running; the phone's boot control has to be started first".into()))
+        }),
+        ("202-systems-light", Screen::Systems, false, &|app| app.set_systems(Ok(two_systems()))),
+        ("202-systems-light-picked", Screen::Systems, false, &|app| {
+            app.set_systems(Ok(two_systems()));
+            app.state.system_pick = Some(Who::Other);
+        }),
+        ("202-systems-dark", Screen::Systems, true, &|app| app.set_systems(Ok(two_systems()))),
+        ("202-systems-dark-second-starts", Screen::Systems, true, &|app| {
+            app.set_systems(Ok(Overview { other_starts: true, changed: true, ..two_systems() }));
+            app.state.asking_delete = true;
+        }),
+        ("202-systems-light-empty", Screen::Systems, false, &|app| app.set_systems(Ok(Overview { other: None, ..two_systems() }))),
+        ("202-systems-dark-switching", Screen::Systems, true, &|app| {
+            app.set_systems(Ok(two_systems()));
+            app.state.systems_work = Some(SystemsWork::Switching(Who::Other));
+        }),
+        ("202-systems-light-stopped", Screen::Systems, false, &|app| {
+            app.set_systems(Ok(Overview { other_starts: true, ..two_systems() }));
+            app.state.system_notice = Some("the root holds no program /sbin/init to start".into());
+            app.state.data = Data::Closed;
+        }),
+        ("203-home-light-systems", Screen::Home, false, &|app| {
+            app.state.dual_boot = true;
+            app.set_systems(Ok(Overview { other_starts: true, ..two_systems() }));
+            app.state.system_notice = Some("the root holds no program /sbin/init to start".into());
         }),
         ("70-erase-light", Screen::Erase, false, &|app| {
             app.set_asked(reset_asked());
@@ -1423,6 +1525,29 @@ fn online(app: &mut App) {
     app.state.wlan = Some(joined(Joining::Connected(router_link())));
 }
 
+/// A newer release of Skyward than the one running, as GitHub tells of it,
+/// with its zip for the 17 Ultra.
+fn skyward_newest() -> Newest {
+    Newest {
+        version: "0.1.4".into(),
+        newer: true,
+        build: Some(Build {
+            name: "skyward-v0.1.4-nezha-OS4.0.4.0.XPACNXM.zip".into(),
+            url: "https://api.github.com/repos/kirklin/skyward/releases/assets/719751747".into(),
+            link: "https://github.com/kirklin/skyward/releases/download/v0.1.4/skyward-v0.1.4-nezha-OS4.0.4.0.XPACNXM.zip".into(),
+            size: 43_145_196,
+            sha256: "9f6165079529418d8f6635beddfdd9abf9a70c89d69eb467a9922b0db69bfaf1".into(),
+        }),
+    }
+}
+
+/// A phone that keeps its recovery in a partition of each slot, on a
+/// network joined.
+fn skyward_online(app: &mut App) {
+    app.state.recovery_partitions = true;
+    app.state.wlan = Some(joined(Joining::Connected(router_link())));
+}
+
 /// A page as most previews show it: on a phone whose data partition is
 /// open, its owner's own files with it.
 fn opened(screen: Screen, w: u32, h: u32, ppd: f32) -> App {
@@ -1491,6 +1616,7 @@ fn nuwa(cfg: &DeviceConfig) -> DeviceInfo {
             voltage: Some(4_442_000),
             // The recovery has no fast charging handshake with the charger.
             quick: false,
+            plugged: true,
         }),
         slot: Some(Slot::B),
         snapshot: SnapshotState::None,
