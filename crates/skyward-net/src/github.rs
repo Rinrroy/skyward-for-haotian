@@ -5,7 +5,7 @@ use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 
 /// Where GitHub answers which release of Skyward is the newest.
-pub const LATEST: &str = "https://api.github.com/repos/kirklin/skyward/releases/latest";
+pub const LATEST: &str = "https://api.github.com/repos/guobaoji-122/skyward-for-aurora/releases/latest";
 
 /// The version of GitHub's API the answer is read as.
 const API_VERSION: &str = "2022-11-28";
@@ -72,16 +72,31 @@ struct Message {
 /// The newest release that `answer`, GitHub's answer at [`LATEST`], tells
 /// of, and its zip for the phone `codename` names, as the build of version
 /// `running` sees it.
+///
+/// Supports two tag/asset naming conventions:
+/// - Upstream style: tag `v0.2.0`, asset `skyward-v0.2.0-<codename>-OS….zip`
+/// - Aurora fork style: tag `aurora-v0.2.0`, asset `skyward-aurora-v0.2.0-OS….zip`
+///
+/// The version is always the semver after the last `v` in the tag.
 pub fn newest(answer: &str, codename: &str, running: &str) -> Result<Newest> {
     let release: Release = serde_json::from_str(answer).context("read GitHub's answer")?;
     let tag = release.tag_name;
-    let version = tag.strip_prefix('v').with_context(|| format!("the newest release is tagged {tag}, which is not v and a version"))?;
+    // Find the version after the last "v" in the tag. This handles both
+    // upstream tags ("v0.2.0") and aurora fork tags ("aurora-v0.2.0").
+    let version = tag.rsplit_once('v')
+        .map(|(_, v)| v)
+        .filter(|v| !v.is_empty())
+        .with_context(|| format!("the newest release is tagged {tag}, which contains no version after 'v'"))?;
     let newest = semver::Version::parse(version).with_context(|| format!("the newest release is tagged {tag}"))?;
     let this = semver::Version::parse(running).with_context(|| format!("this build's version is {running}"))?;
-    // Each zip is named skyward-, the tag, the phone's codename, and the
-    // stock build the image is made on.
-    let start = format!("skyward-{tag}-{codename}-");
-    let build = match release.assets.into_iter().find(|a| a.name.starts_with(&start) && a.name.ends_with(".zip")) {
+    // Each zip is named skyward-<tag>-<codename>-… (upstream) or
+    // skyward-<codename>-<tag_without_prefix>-… (aurora fork style).
+    // Try the upstream pattern first, then the aurora pattern.
+    let upstream_start = format!("skyward-{tag}-{codename}-");
+    let aurora_start = format!("skyward-{codename}-v{version}-");
+    let build = match release.assets.into_iter().find(|a| {
+        (a.name.starts_with(&upstream_start) || a.name.starts_with(&aurora_start)) && a.name.ends_with(".zip")
+    }) {
         None => None,
         Some(a) => {
             let sha256 = a.digest.as_deref().and_then(|d| d.strip_prefix("sha256:")).with_context(|| format!("GitHub gives no SHA-256 of {}", a.name))?;
@@ -219,6 +234,27 @@ mod tests {
         assert!(!newest(ANSWERED_013, "ishtar", "0.2.0").unwrap().newer, "a build ahead of every release");
         assert!(newest(ANSWERED_013, "ishtar", "0.1.3-rc.1").unwrap().newer, "a build before the release it led to");
         assert!(newest(ANSWERED_013, "ishtar", "0.1").is_err(), "a version this build cannot have");
+    }
+
+    /// F07: aurora fork uses tag `aurora-v0.2.0` and asset names like
+    /// `skyward-aurora-v0.2.0-OS3.0.308.0.WNACNXM.zip` (codename before
+    /// the version, unlike upstream).
+    const AURORA_RELEASE: &str = r#"{"tag_name":"aurora-v0.2.0","assets":[{"name":"SHA256SUMS.txt","size":100,"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","browser_download_url":"https://example.com/SHA256SUMS.txt","url":"https://api.example.com/asset/1"},{"name":"skyward-aurora-v0.2.0-OS3.0.308.0.WNACNXM.zip","size":52428800,"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","browser_download_url":"https://example.com/skyward.zip","url":"https://api.example.com/asset/2"}]}"#;
+
+    #[test]
+    fn aurora_fork_tag_and_asset_names_are_parsed() {
+        let n = newest(AURORA_RELEASE, "aurora", "0.1.9").unwrap();
+        assert_eq!(n.version, "0.2.0");
+        assert!(n.newer, "0.2.0 is newer than 0.1.9");
+        let build = n.build.expect("aurora zip is found");
+        assert_eq!(build.name, "skyward-aurora-v0.2.0-OS3.0.308.0.WNACNXM.zip");
+        assert_eq!(build.size, 52428800);
+    }
+
+    #[test]
+    fn aurora_fork_same_version_is_not_newer() {
+        let n = newest(AURORA_RELEASE, "aurora", "0.2.0").unwrap();
+        assert!(!n.newer, "same version is not newer");
     }
 
     #[test]

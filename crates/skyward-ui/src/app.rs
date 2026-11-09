@@ -19,6 +19,7 @@ use crate::term::{self, Term, TermKey};
 use crate::theme::Theme;
 use crate::tr;
 use crate::widgets::{self, Bar, Bolt, Cap, Layer, WlanMark};
+use serde::{Deserialize, Serialize};
 use skyward_info::DeviceInfo;
 use skyward_install::{Event, ImageKind, Outcome, Reflash, Refusal, Stage};
 use skyward_net::download::{Failure, Progress};
@@ -1183,7 +1184,8 @@ pub const SCREEN_OFF: [Option<u64>; 7] = [Some(15_000), Some(30_000), Some(60_00
 pub const AOD_LEVEL: f32 = 0.02;
 
 /// The looks the AOD's clock shows in, as the settings cycle through them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AodStyle {
     /// `HH:MM` large, centered.
     #[default]
@@ -1808,6 +1810,10 @@ pub struct State {
     /// Whether the package being chosen from a place goes on the queue
     /// rather than starting at once.
     pub queue_picking: bool,
+    /// Whether the queue is actively running (i.e. started by the user
+    /// choosing "install queue", not by a standalone install). A normal
+    /// install must not advance a queue that the user never started.
+    pub queue_active: bool,
     /// The package whose install failed, which stopped the queue there.
     pub queue_stopped: Option<String>,
     /// What the install script last run showed, its latest lines.
@@ -1994,6 +2000,7 @@ impl Default for State {
             package_name: None,
             queue: Vec::new(),
             queue_picking: false,
+            queue_active: false,
             queue_stopped: None,
             script_output: Vec::new(),
             check_signature: false,
@@ -4175,7 +4182,13 @@ impl App {
                 }
             }
             Err(why) => {
-                let said = tr!(self.state.lang, "没有改动：{why}", "沒有改動：{why}", "Nothing changed: {why}");
+                // The operation stopped before finishing. Some blocks may
+                // already have been written (e.g. when disabling and a
+                // later block fails to stash or store), or none may have
+                // been touched yet. The re-read `readings` below shows the
+                // actual current state, so we describe the result as
+                // incomplete rather than claiming nothing changed.
+                let said = tr!(self.state.lang, "操作未完成：{why}", "操作未完成：{why}", "Operation incomplete: {why}");
                 self.say(&said, now);
             }
         }
@@ -5506,10 +5519,19 @@ impl App {
     /// through and another waits: taken off the queue and made the one being
     /// installed, with the path the runtime opens.
     ///
-    /// Where it did not go through, the queue stops at the package that is
-    /// still first, so the page can say which one stopped it and what waits
-    /// behind it.
+    /// Only advances when the queue was explicitly started by the user
+    /// (`queue_active`). A standalone (non-queued) install finishing must
+    /// not start packages sitting in the queue.
+    ///
+    /// Where the current package did not go through, the queue stops and
+    /// `queue_stopped` records the name of the package that actually failed
+    /// — the one that was just running, not the one still waiting in line.
     pub fn queued_next(&mut self) -> Option<String> {
+        // Only advance if the queue is actively running. A normal install
+        // that happened outside the queue must not pull items off it.
+        if !self.state.queue_active {
+            return None;
+        }
         let through = match &self.state.install {
             Install::Finished { outcome, .. } => {
                 matches!(outcome, Outcome::Installed { .. } | Outcome::Flashed { .. } | Outcome::Ran { .. })
@@ -5517,12 +5539,21 @@ impl App {
             _ => return None,
         };
         if !through {
-            if let Some(first) = self.state.queue.first() {
-                self.state.queue_stopped = Some(first.name.clone());
+            // The package that just failed is the one that was being
+            // installed — its name is in `package_name`, not the head of
+            // the waiting queue. Record that one as the stopper.
+            if let Some(name) = &self.state.package_name {
+                self.state.queue_stopped = Some(name.clone());
             }
+            self.state.queue_active = false;
             return None;
         }
-        let next = self.state.queue.first()?.clone();
+        // Success: if there is another package waiting, start it. If the
+        // queue is empty, the run is complete.
+        let Some(next) = self.state.queue.first().cloned() else {
+            self.state.queue_active = false;
+            return None;
+        };
         self.state.queue.remove(0);
         self.state.queue_stopped = None;
         let (path, name) = (next.path, next.name);
@@ -7145,6 +7176,7 @@ impl App {
             Confirm::InstallQueue => {
                 if let Some(next) = self.state.queue.first().cloned() {
                     self.state.queue.remove(0);
+                    self.state.queue_active = true;
                     self.state.queue_stopped = None;
                     let (path, name) = (next.path, next.name);
                     self.begin_install(Install::Checking { size: next.size, stage: None }, next.source, Some(name));

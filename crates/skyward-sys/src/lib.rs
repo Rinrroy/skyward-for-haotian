@@ -396,6 +396,18 @@ fn mount_log_disk() -> Option<PathBuf> {
     Some(at.to_path_buf())
 }
 
+/// Whether the log disk is actually mounted at its expected mount point.
+///
+/// The ramdisk leaves an empty directory where the log disk is meant to
+/// be mounted. Writing into that directory succeeds but goes away at the
+/// next boot, so callers that need a persistent copy must check this first
+/// rather than relying on writability alone.
+pub fn log_disk_mounted() -> bool {
+    std::fs::read_to_string("/proc/mounts")
+        .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some(LOG_DISK_AT)))
+        .unwrap_or(false)
+}
+
 /// Append a line to the kernel log, where it survives until the next boot
 /// and shows in `dmesg`, to the file [`keep_log`] opened, and to the lasting
 /// copy once the data partition is writable, stamped with the seconds since

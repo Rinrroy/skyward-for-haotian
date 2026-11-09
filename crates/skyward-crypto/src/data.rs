@@ -252,15 +252,29 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
     // A partition left in the clear keeps no mode file, and so no key for the
     // files shared between apps nor for any user's own: what it holds reads as
     // it is, and the owner's shared storage shows at once.
-    if wrapped_mode().is_none() {
-        show_owner_storage()?;
-        return Ok(Opening { mounted, closed: Vec::new() });
+    match wrapped_mode()? {
+        None => {
+            show_owner_storage()?;
+            return Ok(Opening { mounted, closed: Vec::new() });
+        }
+        Some(_) => {}
     }
     open_shared(service)?;
     let mut closed = Vec::new();
     let mut owner = Note::default();
     for user in open_users(service)? {
-        let protector = protectors(user)?.remove(0);
+        let ids = protector_ids(user)?;
+        let first_id = ids.first().expect("protector_ids returns at least one");
+        // Parse only the first (current) protector. An unparseable
+        // older entry must not block knowing whether the user has a
+        // lock at all.
+        let protector = match protector_of(user, first_id) {
+            Ok(p) => p,
+            Err(e) => {
+                closed.push(Closed { user, lock: crate::user::Lock::PASSWORD, made_up: false, why: Some(format!("primary protector unreadable: {e:#}")) });
+                continue;
+            }
+        };
         match protector.lock {
             None => {
                 let note = open_user_files(service, user, None, None)?;
@@ -330,7 +344,7 @@ const USER_KEYS: &str = "/data/misc/vold/user_keys";
 /// Let in the key for the files that belong to no one user. Until it is
 /// in, most of what the data partition holds reads as scrambled names.
 fn open_shared(service: &KeyMint) -> Result<()> {
-    let Some(wrapped) = wrapped_mode() else { return Ok(()) };
+    let Some(wrapped) = wrapped_mode()? else { return Ok(()) };
     let raw = hardware_key(service, Path::new(SHARED_KEY), wrapped)?;
     let name = crate::fscrypt::add_key(Path::new(MOUNT), &raw, wrapped)?;
     let recorded = crate::fscrypt::recorded_name(Path::new(SHARED_NAME))?;
@@ -356,18 +370,25 @@ fn users() -> Result<Vec<u32>> {
     Ok(users)
 }
 
-/// Whether the files the phone keeps are wrapped in hardware, as its mode
+/// Whether the data partition uses wrapped keys, as its `unencrypted/mode`
 /// file says, or `None` where it keeps no mode file: a partition left in the
 /// clear has none, and neither has one whose keys were never provisioned.
-fn wrapped_mode() -> Option<bool> {
-    let mode = std::fs::read_to_string(FILE_MODE).ok()?;
-    Some(crate::fscrypt::hardware_wrapped(mode.trim()))
+///
+/// Only a missing mode file yields `None`; any other error (permission,
+/// I/O, invalid text) is propagated so callers don't mistake a broken
+/// read for a plaintext partition.
+fn wrapped_mode() -> Result<Option<bool>> {
+    match std::fs::read_to_string(FILE_MODE) {
+        Ok(mode) => Ok(Some(crate::fscrypt::hardware_wrapped(mode.trim()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read {}", FILE_MODE)),
+    }
 }
 
 /// Let in the keys for the files of each user that are readable before
 /// that user signs in, and give the users they belong to.
 fn open_users(service: &KeyMint) -> Result<Vec<u32>> {
-    let Some(wrapped) = wrapped_mode() else { return Ok(Vec::new()) };
+    let Some(wrapped) = wrapped_mode()? else { return Ok(Vec::new()) };
     let users = users()?;
     for user in &users {
         let dir = Path::new(USER_KEYS).join("de").join(user.to_string());
@@ -383,13 +404,16 @@ const PROTECTORS: &str = "/data/system_de";
 /// Read every blob a user's own credential keeps their secret behind, the
 /// one the phone records as theirs first. A phone may keep more than one
 /// blob for a user: Android keeps one for each token some part of the
-/// phone was given to reach the secret with, and HyperOS, once the owner
-/// changes one screen lock for another with a fingerprint enrolled, keeps
-/// a second one for a while, so that the credential before can still be
-/// used. Which of them the user's current credential opens is the phone's
-/// own business, and it writes that down, so the recorded one goes first
-/// rather than a guess being made.
-fn protectors(user: u32) -> Result<Vec<crate::user::Protector>> {
+/// The protector ids for a user, in the order they should be tried.
+///
+/// The one the phone recorded as current goes first — that is the one
+/// the user's present credential opens. Any others trail behind it.
+///
+/// Only the ids are returned here, not the parsed protectors: old or
+/// leftover entries may have missing or damaged companion files, and
+/// failing to parse one must not keep the current — and intact — one
+/// from being tried.
+fn protector_ids(user: u32) -> Result<Vec<String>> {
     let dir = blobs(user);
     let mut ids = Vec::new();
     for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
@@ -403,7 +427,7 @@ fn protectors(user: u32) -> Result<Vec<crate::user::Protector>> {
     anyhow::ensure!(!ids.is_empty(), "{} holds none of user {user}'s blobs", dir.display());
     let recorded = crate::locksettings::current_protector(Path::new(crate::locksettings::DATABASE), user)?;
     ids.sort_by_key(|id| Some(id) != recorded.as_ref());
-    ids.iter().map(|id| protector_of(user, id)).collect()
+    Ok(ids)
 }
 
 /// Read one of a user's blobs by its name: the screen lock the phone
@@ -514,11 +538,43 @@ const TAG_BYTES: usize = 16;
 /// shows at /sdcard.
 fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owner: Option<&Token>) -> Result<Note> {
     // A user's secret may sit behind more than one blob, and which of them
-    // opens depends on which service chain is running here: try each in
-    // turn, the ones the weaver guards last, for the weaver waits on
-    // hardware that may not answer, and its refusal is slow.
-    let mut protectors = protectors(user)?;
-    protectors.sort_by_key(|p| matches!(p.bound, Bound::Weaver(_)));
+    // opens depends on which service chain is running here. The recorded
+    // current protector is tried first — that's the one the user's present
+    // credential opens. Weaver-backed protectors are tried last within each
+    // group because weaver waits on hardware that may not answer, and its
+    // refusal is slow.
+    let ids = protector_ids(user)?;
+    let mut protectors: Vec<crate::user::Protector> = Vec::with_capacity(ids.len());
+    let mut last_parse_error = None;
+    for id in &ids {
+        match protector_of(user, id) {
+            Ok(p) => protectors.push(p),
+            Err(e) => {
+                if last_parse_error.is_none() {
+                    last_parse_error = Some(e);
+                }
+            }
+        }
+    }
+    if protectors.is_empty() {
+        return Err(last_parse_error.with_context(|| format!("none of user {user}'s protectors could be parsed"))?);
+    }
+    // Partition into non-weaver (first) and weaver (last), preserving
+    // the order within each group — which keeps the recorded-current
+    // protector first among the non-weaver ones (and first among the
+    // weaver ones, if that's the type it uses). Weaver-backed ones go
+    // last because weaver waits on hardware that may not answer, and
+    // its refusal is slow.
+    let mut non_weaver: Vec<crate::user::Protector> = Vec::new();
+    let mut weaver: Vec<crate::user::Protector> = Vec::new();
+    for p in protectors {
+        match p.bound {
+            Bound::Weaver(_) => weaver.push(p),
+            _ => non_weaver.push(p),
+        }
+    }
+    protectors = non_weaver;
+    protectors.extend(weaver);
     let mut last = None;
     for protector in &protectors {
         match open_user_files_behind(service, user, protector, credential, owner) {
@@ -580,7 +636,7 @@ fn open_user_files_behind(service: &KeyMint, user: u32, protector: &crate::user:
     let synthetic_password = crate::user::open_inner(&secret, &inner)?;
     let file_secret = crate::user::file_secret(&synthetic_password);
 
-    let Some(wrapped) = wrapped_mode() else { return Ok(Note::default()) };
+    let Some(wrapped) = wrapped_mode()? else { return Ok(Note::default()) };
     let dir = Path::new(USER_KEYS).join("ce").join(user.to_string()).join("current");
     let stored = StoredKey::load(&dir).with_context(|| format!("read the key in {}", dir.display()))?;
     let raw = stored.unwrap(Unwrap::<KeyMint>::Secret(&file_secret)).with_context(|| format!("unwrap the key in {}", dir.display()))?;

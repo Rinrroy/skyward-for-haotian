@@ -23,12 +23,21 @@ const FOLDERS: [&str; 2] = ["/mnt/logfs/skyward/avb", "/sdcard/Skyward/avb"];
 /// recovery's own memory would be gone at the next start, which is exactly
 /// when it is wanted, so a phone that offers neither folder is not changed at
 /// all.
+///
+/// For the log disk path, we check that the partition is actually mounted at
+/// the expected point, not just that the directory is writable. The ramdisk
+/// leaves an empty folder where the log disk mounts; writing into it would
+/// succeed but the copy would be gone at the next boot.
 pub fn folder() -> Result<PathBuf> {
     let mut refused = Vec::new();
     for name in FOLDERS {
         let at = Path::new(name);
         if name.starts_with("/sdcard") && !skyward_sys::internal_storage_ready() {
             refused.push(format!("{name}: the data partition is not open"));
+            continue;
+        }
+        if name.starts_with("/mnt/logfs") && !skyward_sys::log_disk_mounted() {
+            refused.push(format!("{name}: the log disk is not mounted"));
             continue;
         }
         match write_and_take_away(at) {

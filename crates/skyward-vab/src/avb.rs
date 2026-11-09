@@ -132,6 +132,10 @@ pub fn store(block: &Block) -> Result<()> {
 /// before a change is not lost. The name carries the flags it was taken at
 /// and the second it was taken, so a later change keeps its own copy rather
 /// than writing over the one taken before the first.
+///
+/// The file and its parent directory are synced to disk before returning,
+/// so the copy is durable even if the subsequent partition write is
+/// interrupted by a power loss.
 pub fn stash(block: &Block, dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
     let at = std::time::SystemTime::now()
@@ -139,7 +143,21 @@ pub fn stash(block: &Block, dir: &Path) -> Result<PathBuf> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let path = dir.join(format!("{}-0x{:08x}-{at}.img", block.name(), block.flags()));
-    std::fs::write(&path, &block.bytes).with_context(|| format!("write {}", path.display()))?;
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("create {}", path.display()))?;
+        file.write_all(&block.bytes).with_context(|| format!("write {}", path.display()))?;
+        file.flush().with_context(|| format!("flush {}", path.display()))?;
+        file.sync_all().with_context(|| format!("sync {}", path.display()))?;
+    }
+    // Also sync the directory so the new directory entry is durable.
+    if let Ok(dir_file) = std::fs::OpenOptions::new().read(true).open(dir) {
+        let _ = dir_file.sync_all();
+    }
     Ok(path)
 }
 
@@ -212,24 +230,75 @@ pub fn read(slot: Slot) -> Result<Vec<Reading>> {
 /// writes: a build that ships its hashtree off and its verification on
 /// cannot be brought back by writing zeros. So undoing a change means
 /// writing the copy back whole, not a number chosen here.
+///
+/// Only blocks that are recognizably the same as the backup with only the
+/// flags flipped are restored: a different ROM's vbmeta with the same flag
+/// values must not be overwritten by an older backup.
+///
+/// All blocks that need restoration are checked for a valid matching
+/// backup before any write takes place, so a missing or mismatched backup
+/// on a later block does not leave earlier blocks partially changed.
+///
+/// Returns changes for blocks that were successfully restored. Blocks
+/// already in the target state are reported with `kept: None`. The first
+/// missing or mismatched backup stops further processing with no blocks
+/// written yet.
 pub fn restore_all(slot: Slot, dir: &Path) -> Result<Vec<Change>> {
-    let mut changes = Vec::new();
-    for mut block in blocks(slot)? {
+    let all_blocks = blocks(slot)?;
+
+    // First pass: identify blocks that need restoration and verify their
+    // backups exist and match. No writes happen in this pass, so a
+    // problem on the second or third block does not leave the first one
+    // half-changed.
+    let mut pending: Vec<(Block, Vec<u8>, PathBuf)> = Vec::new();
+    let mut noops: Vec<Change> = Vec::new();
+
+    for block in all_blocks {
         let name = block.name();
-        let Some(copy) = newest_copy(dir, &name)? else { continue };
+        let before = block.flags();
+        // A block whose flags are already both on needs no restore.
+        if before & (HASHTREE_DISABLED | VERIFICATION_DISABLED) == 0 {
+            noops.push(Change { name, before, after: before, kept: None });
+            continue;
+        }
+        let Some(copy) = newest_copy(dir, &name)? else {
+            bail!(
+                "{} has checks off but no backup is kept of what it held first; \
+                 cannot restore it",
+                name
+            );
+        };
         let kept = std::fs::read(&copy).with_context(|| format!("read {}", copy.display()))?;
         if kept.len() < HEADER || &kept[..4] != MAGIC {
             bail!("{} does not hold a vbmeta block", copy.display());
         }
-        let before = block.flags();
-        // Only a block that still says what this recovery left it saying is
-        // one this recovery may put back. An update package writes the
-        // blocks too, with a rollback counter of its own; dragging an older
-        // block over what it wrote would count the phone backwards, which a
-        // bootloader with anti-rollback refuses.
-        if before != (HASHTREE_DISABLED | VERIFICATION_DISABLED) {
-            continue;
+
+        // Verify the current block is the backup with only the flags
+        // changed to the "both off" value this recovery writes. If the
+        // rest of the block differs (e.g. another ROM was installed),
+        // the backup does not belong to the current system and must not
+        // be written back.
+        let mut expected = kept.clone();
+        expected[FLAGS_AT..FLAGS_AT + 4].copy_from_slice(
+            &(HASHTREE_DISABLED | VERIFICATION_DISABLED).to_be_bytes()
+        );
+        if block.bytes != expected {
+            bail!(
+                "the backup of {} does not match the current block beyond \
+                 the flags; it may belong to a different ROM and was not \
+                 restored",
+                name
+            );
         }
+
+        pending.push((block, kept, copy));
+    }
+
+    // Second pass: all backups verified; now actually restore each one.
+    let mut changes = noops;
+    for (mut block, kept, copy) in pending {
+        let name = block.name();
+        let before = block.flags();
         block.bytes = kept;
         let after = block.flags();
         store(&block)?;
@@ -243,10 +312,33 @@ pub fn restore_all(slot: Slot, dir: &Path) -> Result<Vec<Change>> {
 /// are unless every one already says both checks are on: the flags a
 /// phone's own build set are not always the two zeros this writes, and a
 /// build that ships its hashtree off cannot start with them on.
+///
+/// If `dir` is provided, all backups are verified before any block is
+/// written. After restoration, every block is checked to have both
+/// checks enabled; if any restored backup itself shipped with a check
+/// off, the operation fails rather than claiming success.
 pub fn enable(slot: Slot, dir: Option<&Path>) -> Result<Vec<Change>> {
     if let Some(dir) = dir {
         let restored = restore_all(slot, dir)?;
-        if !restored.is_empty() {
+        // After restoring from backup, verify every block actually has
+        // both checks on. A backup taken from a build that ships its
+        // hashtree off would not result in a fully enabled state.
+        let all_on = restored.iter().all(|c| {
+            c.after & (HASHTREE_DISABLED | VERIFICATION_DISABLED) == 0
+        });
+        if !all_on {
+            let still_off: Vec<&str> = restored
+                .iter()
+                .filter(|c| c.after & (HASHTREE_DISABLED | VERIFICATION_DISABLED) != 0)
+                .map(|c| c.name.as_str())
+                .collect();
+            bail!(
+                "restored backups of {} still have at least one check off; \
+                 cannot fully enable AVB",
+                still_off.join(", ")
+            );
+        }
+        if restored.iter().any(|c| c.kept.is_some()) {
             return Ok(restored);
         }
     }
@@ -419,6 +511,91 @@ mod tests {
         let untouched = enable(Slot::A, Some(&kept)).unwrap();
         assert!(untouched.is_empty(), "a block that does not say the recovery left it saying is skipped");
         assert_eq!(flags_of(&base.join("vbmeta_a")), 0);
+
+        std::env::remove_var("SKYWARD_VAB_TEST_BLOCKS");
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// F01: a different ROM's vbmeta with the same flags=3 must NOT be
+    /// overwritten by an older backup taken from another ROM. The backup
+    /// only matches if the entire block is identical except for the flags
+    /// word having been flipped to "both off" by this recovery.
+    #[test]
+    fn restore_rejects_foreign_rom_with_same_flags() {
+        let scratch = std::env::temp_dir().join(format!("skyward-avb-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let base = scratch.join("by-name");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // ROM A: original vbmeta (algorithm=2, flags=0).
+        let rom_a = shipped(&base, "vbmeta_a", 0);
+        std::env::set_var("SKYWARD_VAB_TEST_BLOCKS", &base);
+        let both = HASHTREE_DISABLED | VERIFICATION_DISABLED;
+
+        // Turn AVB off under ROM A — this creates the backup.
+        let kept = scratch.join("kept");
+        let changes = set_all(Slot::A, both, &kept).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(flags_of(&base.join("vbmeta_a")), both);
+
+        // ROM B is installed: same flags=3 but different body (algorithm=3
+        // instead of 2, and different rollback/index bytes further in).
+        let mut rom_b = vec![0u8; 4096];
+        rom_b[..4].copy_from_slice(MAGIC);
+        rom_b[ALGORITHM_AT..ALGORITHM_AT + 4].copy_from_slice(&3u32.to_be_bytes());
+        rom_b[FLAGS_AT..FLAGS_AT + 4].copy_from_slice(&both.to_be_bytes());
+        rom_b[200] = 0xAB; // different body content
+        std::fs::write(base.join("vbmeta_a"), &rom_b).unwrap();
+
+        // Enable AVB should fail: the backup belongs to ROM A, not ROM B.
+        let result = enable(Slot::A, Some(&kept));
+        assert!(result.is_err(), "foreign ROM block must not be overwritten by old backup");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("does not match"), "error should mention mismatch, got: {err}");
+
+        // The block must be unchanged — still ROM B's content.
+        let current = std::fs::read(&base.join("vbmeta_a")).unwrap();
+        assert_eq!(current, rom_b, "foreign block was not left untouched");
+
+        std::env::remove_var("SKYWARD_VAB_TEST_BLOCKS");
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// F16: when only some blocks have backups and others don't, the
+    /// operation must fail before writing any block, so we never end up
+    /// with a partial restore.
+    #[test]
+    fn partial_backup_fails_before_writing_anything() {
+        let scratch = std::env::temp_dir().join(format!("skyward-avb-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let base = scratch.join("by-name");
+        std::fs::create_dir_all(&base).unwrap();
+
+        let both = HASHTREE_DISABLED | VERIFICATION_DISABLED;
+        // Three blocks, all off.
+        let vbmeta = shipped(&base, "vbmeta_a", both);
+        let vbmeta_sys = shipped(&base, "vbmeta_system_a", both);
+        let _vbmeta_vnd = shipped(&base, "vbmeta_vendor_a", both);
+
+        std::env::set_var("SKYWARD_VAB_TEST_BLOCKS", &base);
+        let kept = scratch.join("kept");
+
+        // Make a backup for only the first two blocks (simulating a case
+        // where vendor was never backed up).
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("vbmeta_a-0x00000003-1000.img"), &vbmeta).unwrap();
+        std::fs::write(kept.join("vbmeta_system_a-0x00000003-1000.img"), &vbmeta_sys).unwrap();
+
+        // Enable should fail: vbmeta_vendor_a has checks off but no backup.
+        let result = enable(Slot::A, Some(&kept));
+        assert!(result.is_err(), "missing backup for a disabled block must fail");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("vbmeta_vendor_a"), "error should name the missing block, got: {err}");
+
+        // No block should have been written — all three are still flags=3.
+        assert_eq!(flags_of(&base.join("vbmeta_a")), both, "first block was written despite later failure");
+        assert_eq!(flags_of(&base.join("vbmeta_system_a")), both, "second block was written despite later failure");
+        assert_eq!(flags_of(&base.join("vbmeta_vendor_a")), both, "third block was changed");
 
         std::env::remove_var("SKYWARD_VAB_TEST_BLOCKS");
         std::fs::remove_dir_all(&scratch).unwrap();
