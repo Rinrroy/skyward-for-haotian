@@ -660,16 +660,16 @@ mod tests {
 
     #[test]
     fn nezha_gives_its_logd_the_libraries_its_recovery_leaves_out() {
-        let cfg = DeviceConfig::parse(include_str!("../../../devices/nezha.toml")).unwrap();
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/disabled/nezha.toml")).unwrap();
         let logd = cfg.logd.expect("the 17 Ultra's recovery leaves out what its logd loads");
         assert_eq!(logd.libraries, ["/mnt/system/system/lib64/libsysutils.so", "/mnt/system/system/lib64/libcap.so"]);
-        let ishtar = DeviceConfig::parse(include_str!("../../../devices/ishtar.toml")).unwrap();
+        let ishtar = DeviceConfig::parse(include_str!("../../../devices/disabled/ishtar.toml")).unwrap();
         assert_eq!(ishtar.logd, None, "the 13 Ultra's recovery carries both");
     }
 
     #[test]
     fn ishtar_clicks_with_a_waveform_its_driver_keeps() {
-        let cfg = DeviceConfig::parse(include_str!("../../../devices/ishtar.toml")).unwrap();
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/disabled/ishtar.toml")).unwrap();
         let haptics = cfg.haptics.expect("the 13 Ultra has a motor");
         assert_eq!((haptics.click, haptics.resonance.as_str()), (Some(0), "/sys/class/qcom-haptics/lra_frequency_hz"));
         assert_eq!(haptics.strength, Strength { lightest: 0.5, strongest: 1.0 });
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn parses_nezha() {
-        let cfg = DeviceConfig::parse(include_str!("../../../devices/nezha.toml")).unwrap();
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/disabled/nezha.toml")).unwrap();
         assert_eq!(cfg.device.codename, "nezha");
         assert_eq!(cfg.device.os_version_prop, "ro.mi.os.version.incremental");
         let soc = cfg.device.soc.expect("nezha names its SoC");
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn the_secure_element_of_each_build_runs_on_that_build_alone() {
-        let cfg = DeviceConfig::parse(include_str!("../../../devices/nezha.toml")).unwrap();
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/disabled/nezha.toml")).unwrap();
         let runs = |props: &[(&str, &str)]| -> Vec<String> {
             let props: HashMap<String, String> = props.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
             cfg.services.iter().filter(|s| s.runs_on(&props)).map(|s| s.path.clone()).collect()
@@ -833,8 +833,8 @@ mod tests {
 
     #[test]
     fn each_phones_programs_run_as_their_init_scripts_run_them() {
-        let nezha = DeviceConfig::parse(include_str!("../../../devices/nezha.toml")).unwrap();
-        let ishtar = DeviceConfig::parse(include_str!("../../../devices/ishtar.toml")).unwrap();
+        let nezha = DeviceConfig::parse(include_str!("../../../devices/disabled/nezha.toml")).unwrap();
+        let ishtar = DeviceConfig::parse(include_str!("../../../devices/disabled/ishtar.toml")).unwrap();
         for s in nezha.services.iter().chain(&ishtar.services) {
             assert!(s.user.is_some(), "{} names the user its init script does", s.path);
         }
@@ -854,27 +854,27 @@ mod tests {
     #[test]
     fn each_phone_names_the_stock_build_its_recovery_is_made_on() {
         for (text, version) in [
-            (include_str!("../../../devices/nezha.toml"), "OS4.0.4.0.XPACNXM"),
-            (include_str!("../../../devices/ishtar.toml"), "OS3.0.308.0.WMACNXM"),
-            (include_str!("../../../devices/pudding.toml"), "OS4.0.4.0.XPCCNXM"),
-            (include_str!("../../../devices/pandora.toml"), "OS4.0.4.0.XBLCNXM"),
-            (include_str!("../../../devices/popsicle.toml"), "OS4.0.4.0.XPBCNXM"),
-            (include_str!("../../../devices/myron.toml"), "OS4.0.4.0.XPMCNXM"),
-            (include_str!("../../../devices/songyuan.toml"), "OS4.0.4.0.XGNCNXM"),
-            (include_str!("../../../devices/athens.toml"), "OS4.0.4.0.XPICNXM"),
-            (include_str!("../../../devices/fuxi.toml"), "OS3.0.309.0.WMCCNXM"),
-            (include_str!("../../../devices/nuwa.toml"), "OS3.0.312.0.WMBCNXM"),
-            (include_str!("../../../devices/houji.toml"), "OS3.0.307.0.WNCCNXM"),
-            (include_str!("../../../devices/shennong.toml"), "OS3.0.309.0.WNBCNXM"),
+            (include_str!("../../../devices/disabled/nezha.toml"), "OS4.0.4.0.XPACNXM"),
+            (include_str!("../../../devices/disabled/ishtar.toml"), "OS3.0.308.0.WMACNXM"),
+            (include_str!("../../../devices/disabled/pudding.toml"), "OS4.0.4.0.XPCCNXM"),
+            (include_str!("../../../devices/disabled/pandora.toml"), "OS4.0.4.0.XBLCNXM"),
+            (include_str!("../../../devices/disabled/popsicle.toml"), "OS4.0.4.0.XPBCNXM"),
+            (include_str!("../../../devices/disabled/myron.toml"), "OS4.0.4.0.XPMCNXM"),
+            (include_str!("../../../devices/disabled/songyuan.toml"), "OS4.0.4.0.XGNCNXM"),
+            (include_str!("../../../devices/disabled/athens.toml"), "OS4.0.4.0.XPICNXM"),
+            (include_str!("../../../devices/disabled/fuxi.toml"), "OS3.0.309.0.WMCCNXM"),
+            (include_str!("../../../devices/disabled/nuwa.toml"), "OS3.0.312.0.WMBCNXM"),
+            (include_str!("../../../devices/disabled/houji.toml"), "OS3.0.307.0.WNCCNXM"),
+            (include_str!("../../../devices/disabled/shennong.toml"), "OS3.0.309.0.WNBCNXM"),
             (include_str!("../../../devices/aurora.toml"), "OS3.0.308.0.WNACNXM"),
-            (include_str!("../../../devices/dada.toml"), "OS3.0.307.0.WOCCNXM"),
-            (include_str!("../../../devices/haotian.toml"), "OS3.0.309.0.WOBCNXM"),
-            (include_str!("../../../devices/xuanyuan.toml"), "OS3.0.314.0.WOACNXM"),
-            (include_str!("../../../devices/byron.toml"), "OS3.0.310.0.WAFCNXM"),
-            (include_str!("../../../devices/zorn.toml"), "OS3.0.309.0.WOKCNXM"),
-            (include_str!("../../../devices/miro.toml"), "OS3.0.305.0.WOMCNXM"),
-            (include_str!("../../../devices/annibale.toml"), "OS3.0.307.0.WPKCNXM"),
-            (include_str!("../../../devices/warsaw.toml"), "OS3.0.309.0.WHPCNXM"),
+            (include_str!("../../../devices/disabled/dada.toml"), "OS3.0.307.0.WOCCNXM"),
+            (include_str!("../../../devices/disabled/haotian.toml"), "OS3.0.309.0.WOBCNXM"),
+            (include_str!("../../../devices/disabled/xuanyuan.toml"), "OS3.0.314.0.WOACNXM"),
+            (include_str!("../../../devices/disabled/byron.toml"), "OS3.0.310.0.WAFCNXM"),
+            (include_str!("../../../devices/disabled/zorn.toml"), "OS3.0.309.0.WOKCNXM"),
+            (include_str!("../../../devices/disabled/miro.toml"), "OS3.0.305.0.WOMCNXM"),
+            (include_str!("../../../devices/disabled/annibale.toml"), "OS3.0.307.0.WPKCNXM"),
+            (include_str!("../../../devices/disabled/warsaw.toml"), "OS3.0.309.0.WHPCNXM"),
         ] {
             let stock = DeviceConfig::parse(text).unwrap().stock.expect("a stock build to build on");
             assert_eq!(stock.version, version);
@@ -915,7 +915,7 @@ mod tests {
 
     #[test]
     fn parses_ishtar() {
-        let cfg = DeviceConfig::parse(include_str!("../../../devices/ishtar.toml")).unwrap();
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/disabled/ishtar.toml")).unwrap();
         assert_eq!(cfg.device.codename, "ishtar");
         assert_eq!((cfg.display.width, cfg.display.height, cfg.display.density), (1440, 3200, 560));
         assert_eq!(cfg.modules.load, ["fts_touch_spi"]);
@@ -963,7 +963,7 @@ mod tests {
 
     #[test]
     fn the_phone_is_read_from_a_configuration_this_build_cannot_read_whole() {
-        assert_eq!(codename(include_str!("../../../devices/ishtar.toml")).unwrap(), "ishtar");
+        assert_eq!(codename(include_str!("../../../devices/disabled/ishtar.toml")).unwrap(), "ishtar");
         let later = "[device]\ncodename = \"x\"\nab = \"no longer a switch\"\n[display]\nwidth = \"wide\"\n[aurora]\nnew = 1\n";
         assert!(DeviceConfig::parse(later).is_err());
         assert_eq!(codename(later).unwrap(), "x");
@@ -981,7 +981,7 @@ mod tests {
 
     #[test]
     fn the_phones_own_logs_are_folders_inside_the_data_partition() {
-        let cfg = DeviceConfig::parse(include_str!("../../../devices/ishtar.toml")).unwrap();
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/disabled/ishtar.toml")).unwrap();
         assert!(cfg.wipe.logs.contains(&"/data/vendor/diag".to_string()));
         assert!(DeviceConfig::parse("[device]\ncodename = \"x\"\n").unwrap().wipe.logs.is_empty(), "a phone may have none");
         for bad in ["/data", "/data/", "/metadata/logs", "data/log", "/data/../system"] {
@@ -992,7 +992,7 @@ mod tests {
 
     #[test]
     fn ishtar_brings_its_wlan_up_from_its_own_partitions() {
-        let cfg = DeviceConfig::parse(include_str!("../../../devices/ishtar.toml")).unwrap();
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/disabled/ishtar.toml")).unwrap();
         let wlan = cfg.wlan.expect("the 13 Ultra's WLAN is described");
         assert_eq!(wlan.modules, ["qca_cld3_kiwi_v2"]);
         assert_eq!(wlan.writes, [Write { path: "/sys/kernel/cnss/fs_ready".into(), value: "1".into() }]);
@@ -1007,7 +1007,7 @@ mod tests {
 
     #[test]
     fn nezha_brings_its_wlan_up_from_its_own_partitions() {
-        let cfg = DeviceConfig::parse(include_str!("../../../devices/nezha.toml")).unwrap();
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/disabled/nezha.toml")).unwrap();
         assert!(cfg.modules.sources.iter().any(|s| s == "system_dlkm"), "the kernel's own modules are a source");
         let wlan = cfg.wlan.expect("the 17 Ultra's WLAN is described");
         assert_eq!(wlan.modules, ["rfkill", "qca_cld3_peach_v2"]);
@@ -1041,7 +1041,7 @@ mod tests {
 
     #[test]
     fn services_use_the_partitions_they_run_from() {
-        let cfg = DeviceConfig::parse(include_str!("../../../devices/ishtar.toml")).unwrap();
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/disabled/ishtar.toml")).unwrap();
         let [report, sensor, listeners, ..] = &cfg.services[..] else { panic!("ishtar keeps several programs running") };
         assert!(report.uses(Path::new("/odm")));
         assert!(sensor.uses(Path::new("/odm")));
