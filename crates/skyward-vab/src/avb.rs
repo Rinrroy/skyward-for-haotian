@@ -492,7 +492,7 @@ mod tests {
         let back = enable(Slot::A, Some(&kept)).unwrap();
         assert_eq!(back.len(), 3, "every block is put back");
         for (name, was) in &factory {
-            assert_eq!(std::fs::read(&base.join(name)).unwrap(), *was, "{name} is as it shipped");
+            assert_eq!(std::fs::read(base.join(name)).unwrap(), *was, "{name} is as it shipped");
         }
 
         // With every block already on, a further enable has nothing to do.
@@ -528,7 +528,7 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
 
         // ROM A: original vbmeta (algorithm=2, flags=0).
-        let rom_a = shipped(&base, "vbmeta_a", 0);
+        shipped(&base, "vbmeta_a", 0);
         std::env::set_var("SKYWARD_VAB_TEST_BLOCKS", &base);
         let both = HASHTREE_DISABLED | VERIFICATION_DISABLED;
 
@@ -554,7 +554,7 @@ mod tests {
         assert!(err.contains("does not match"), "error should mention mismatch, got: {err}");
 
         // The block must be unchanged — still ROM B's content.
-        let current = std::fs::read(&base.join("vbmeta_a")).unwrap();
+        let current = std::fs::read(base.join("vbmeta_a")).unwrap();
         assert_eq!(current, rom_b, "foreign block was not left untouched");
 
         std::env::remove_var("SKYWARD_VAB_TEST_BLOCKS");
