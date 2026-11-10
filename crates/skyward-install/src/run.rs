@@ -601,7 +601,8 @@ fn detach_once(ctx: &mut Context) -> Result<()> {
 /// a script can safely write under: a partition still mounted read-only
 /// never writes back, so its blocks may be overwritten beneath it. One still
 /// mounted writable would put its own bytes back over the new ones, and
-/// stops the install.
+/// stops the install. Not wired into the script path yet.
+#[expect(dead_code)]
 fn detach_for_script(ctx: &mut Context, slot: skyward_vab::Slot) -> Result<()> {
     let Err(failure) = detach_once(ctx) else { return Ok(()) };
     let mut writable = Vec::new();

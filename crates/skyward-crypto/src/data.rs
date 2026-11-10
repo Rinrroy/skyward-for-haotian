@@ -252,12 +252,9 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
     // A partition left in the clear keeps no mode file, and so no key for the
     // files shared between apps nor for any user's own: what it holds reads as
     // it is, and the owner's shared storage shows at once.
-    match wrapped_mode()? {
-        None => {
-            show_owner_storage()?;
-            return Ok(Opening { mounted, closed: Vec::new() });
-        }
-        Some(_) => {}
+    if wrapped_mode()?.is_none() {
+        show_owner_storage()?;
+        return Ok(Opening { mounted, closed: Vec::new() });
     }
     open_shared(service)?;
     let mut closed = Vec::new();

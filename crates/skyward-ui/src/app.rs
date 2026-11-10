@@ -1210,21 +1210,28 @@ impl AodStyle {
 
 /// How far up the glass a finger must swipe for the AOD to believe it
 /// meant to wake the panel, in dp: farther than a pocket shifts.
+/// Waiting for the AOD to be wired into the panel loop.
+#[expect(dead_code)]
 const WAKE_SWIPE_DP: f32 = 64.0;
 
 /// Where the AOD sits, in dp from its usual place, one each minute in
 /// turn, so no pixel holds the light long enough to burn into the panel.
+#[expect(dead_code)]
 const AOD_SPOTS: [(f32, f32); 4] = [(0.0, 0.0), (5.0, -3.0), (0.0, 6.0), (-5.0, -3.0)];
 
 /// The AOD's inks on the black panel: the clock the brightest, the day
 /// and the charge left dimmer, the hint of how to leave it faintest.
+#[expect(dead_code)]
 const AOD_INK: Rgba = Rgba::rgb(0xC0, 0xC0, 0xC0);
+#[expect(dead_code)]
 const AOD_DIM: Rgba = Rgba::rgb(0x82, 0x82, 0x82);
+#[expect(dead_code)]
 const AOD_FAINT: Rgba = Rgba::rgb(0x52, 0x52, 0x52);
 
 /// How long changed settings wait after the last change before they are
 /// written to the owner's storage, so a slider dragged across the page
-/// writes once.
+/// writes once. Waiting for the AOD page to go through it.
+#[expect(dead_code)]
 const SETTINGS_SAVE_DELAY: u64 = 2000;
 
 /// The time zones the clock and the times on the pages can keep, in the
@@ -2370,6 +2377,8 @@ enum Drag {
     Waking,
     /// A finger on the glass of the AOD, from the `y` it came down at;
     /// swiped up far enough, it lights the panel.
+    /// Waiting for the AOD to be wired into the panel loop.
+    #[expect(dead_code)]
     Aod { y: f32 },
 }
 
@@ -2899,6 +2908,8 @@ pub struct App {
     /// written; the write comes a moment after the last change.
     settings_dirty: bool,
     /// When a pending settings write matures.
+    /// Waiting for the AOD page to go through it.
+    #[expect(dead_code)]
     settings_due_at: Option<u64>,
     /// When the screen was last touched or a key pressed; set on the first
     /// tick, so the time before the UI started does not count.
@@ -4896,6 +4907,8 @@ impl App {
     /// hint of how to leave it, all dim on black, and all aside from where
     /// they were the minute before, so no pixel holds the light long
     /// enough to burn into the panel.
+    /// Waiting for the AOD to be wired into the panel loop.
+    #[expect(dead_code)]
     fn compose_aod(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str) {
         out.fill_rect(0.0, 0.0, out.w as f32, out.h as f32, Rgba::rgb(0, 0, 0));
         let t = self.theme();
@@ -4942,6 +4955,8 @@ impl App {
     /// quarter hours named inside them, tapered hour and minute hands at
     /// the time `(hh, mm)` name, and the charge left as an arc of the
     /// battery's share just outside the ring.
+    /// Waiting for the AOD to be wired into the panel loop.
+    #[expect(dead_code)]
     fn aod_dial(&self, out: &mut Canvas, f: &Fonts, (cx, cy, r): (f32, f32, f32), clock: &str, level: Option<u8>) {
         let (hh, mm) = match clock.split_once(':').and_then(|(hh, mm)| hh.parse::<f32>().ok().zip(mm.parse::<f32>().ok())) {
             Some((hh, mm)) => (hh, mm),

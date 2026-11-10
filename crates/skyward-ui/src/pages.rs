@@ -1,5 +1,5 @@
 use crate::app::{
-    Action, AodStyle, Asking, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop,
+    Action, Asking, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop,
     Field, FileKind, FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick,
     Place, Rows, Screen, Slider, Source, SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, State, Switch, SystemsWork, Target, UsbDrive,
     UsbLink, Wipe, ADDABLE, BACKUP_PARTS, BACKUP_RESTORABLE, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF,
@@ -2529,7 +2529,7 @@ pub fn avb(cx: &Ctx) -> Frame {
                 .iter()
                 .zip(&states)
                 .zip(&subs)
-                .map(|((r, state), sub)| Row::new(&r.name).subtitle(sub).trail(Trail::Text(*state)))
+                .map(|((r, state), sub)| Row::new(&r.name).subtitle(sub).trail(Trail::Text(state)))
                 .collect();
             y = widgets::list(&mut c, t, f, y, &list).bottom;
         }
