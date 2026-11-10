@@ -11350,7 +11350,7 @@ mod tests {
         assert_eq!(toast(&app), Some("请输入 8 到 63 位密码"));
         tap(&mut app, &f, &i, Action::Type(Cap::Show(Layer::Digits)));
         type_in(&mut app, "12");
-        let fx = tap(&mut app, &f, &i, Action::Type(Cap::Enter));
+        let fx = acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter)));
         let join = Effect::JoinWlan { ssid: b"Skyward".to_vec(), name: "Skyward".into(), security: Security::Psk, password: Secret("secret12".into()) };
         assert_eq!(format!("{join:?}"), r#"JoinWlan { ssid: [83, 107, 121, 119, 97, 114, 100], name: "Skyward", security: Psk, password: Secret(8 characters) }"#, "what is printed leaves the password out");
         assert_eq!(fx, vec![join]);
@@ -11449,7 +11449,7 @@ mod tests {
         assert_eq!(app.state.adding.as_ref().unwrap().field, Field::Password, "the keyboard types into the field turned down");
         tap(&mut app, &f, &i, Action::Type(Cap::Show(Layer::Digits)));
         type_in(&mut app, "12");
-        let fx = tap(&mut app, &f, &i, Action::Type(Cap::Enter));
+        let fx = acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter)));
         let join = Effect::JoinWlan { ssid: b"skyward".to_vec(), name: "skyward".into(), security: Security::Psk, password: Secret("secret12".into()) };
         assert_eq!(fx, vec![join]);
         assert_eq!(app.screen(), Screen::Wlan, "the WLAN page shows how joining goes");
@@ -11476,7 +11476,7 @@ mod tests {
         assert!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))).is_empty());
         assert_eq!(toast(&app), Some("网络名称不能超过 32 个字符"));
         tap(&mut app, &f, &i, Action::Type(Cap::Backspace));
-        let fx = tap(&mut app, &f, &i, Action::Type(Cap::Enter));
+        let fx = acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter)));
         let name = "a".repeat(32);
         assert_eq!(fx, vec![Effect::JoinWlan { ssid: name.clone().into_bytes(), name, security: Security::Open, password: Secret::default() }]);
     }
