@@ -397,6 +397,12 @@ pub fn set_all(slot: Slot, flags: u32, kept: &Path) -> Result<Vec<Change>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// The stand-in blocks are named by an environment variable, and the
+    /// whole process shares one: the tests that set it take turns, or one
+    /// takes it away from under another.
+    static BLOCKS: Mutex<()> = Mutex::new(());
 
     fn header() -> Vec<u8> {
         let mut bytes = vec![0u8; 4096];
@@ -458,6 +464,7 @@ mod tests {
     /// already say both checks are on.
     #[test]
     fn the_change_is_made_and_taken_back_through_the_whole_chain() {
+        let _turn = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
         let scratch = std::env::temp_dir().join(format!("skyward-avb-chain-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         let base = scratch.join("by-name");
@@ -522,6 +529,7 @@ mod tests {
     /// word having been flipped to "both off" by this recovery.
     #[test]
     fn restore_rejects_foreign_rom_with_same_flags() {
+        let _turn = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
         let scratch = std::env::temp_dir().join(format!("skyward-avb-foreign-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         let base = scratch.join("by-name");
@@ -566,6 +574,7 @@ mod tests {
     /// with a partial restore.
     #[test]
     fn partial_backup_fails_before_writing_anything() {
+        let _turn = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
         let scratch = std::env::temp_dir().join(format!("skyward-avb-partial-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         let base = scratch.join("by-name");
