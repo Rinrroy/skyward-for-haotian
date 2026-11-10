@@ -233,18 +233,25 @@ user = "root"
 groups = ["root", "drmrpc"]
 optional = true
 
-# The native OMAPI provider that a weaver might ask the secure element
-# through. The phone's own recovery used to carry a binary-and-shim
-# borrowed from a TWRP port, linked against that port's own linker and
-# libc++, which no public source builds. The vendor HAL above already
-# describes the secure element instances the device manifest names, and
-# the recovery no longer tries to supply the framework's native OMAPI
-# provider here — if an optional daemon with no ready_service never
-# registers, nothing waits on it and the boot does not hold up. The
-# binary is gone from the build chain too: keeping the declaration would
-# only start a sh script that is not there, which the engine would log and
-# step past, costing nothing but a line of log and one more line of
-# dead configuration.
+# The native OMAPI service, taken byte for byte from the A14 port's TWRP
+# (the desktop 小米14u-twrp-安卓15.img, which is byte-identical to the
+# Durex port's images/recovery.img and works on both A14 and A17). It is a
+# sh script rather than the binary itself because the binary was linked
+# against that TWRP's own libc++/linker: start.sh runs the A14 linker64 on
+# the A14 se_omapi with the whole matched library set in /skyward/omapi and
+# an ld.config.txt whose [recovery] namespace is not isolated. Nothing from
+# that set replaces a recovery library, so the recovery's own program and
+# the other HALs keep the linker/libc pair they were built with.
+# Optional, and deliberately no ready_service: a registration that never
+# comes would cost 20 seconds here and add a name to publish_descriptions()'s
+# file list. The engine keeps the first lines of a daemon's streams, so this
+# one says "Secure Element AIDL service(omapi) running..." if it comes up.
+[[service]]
+path = "/skyward/omapi/start.sh"
+libraries = ["/skyward/omapi"]
+user = "root"
+groups = ["root"]
+optional = true
 
 # WLAN: the kiwi node in the device tree, driven by qca_cld3_kiwi_v2, the
 # one WLAN driver the phone's own modules.blocklist leaves of those its
