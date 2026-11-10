@@ -12,7 +12,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -140,6 +140,20 @@ pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
             }
             Err(e) => return Err(e),
         };
+        // Sockets the vendor's init script would have made for this
+        // daemon. They must exist before the child forks, and the Arc
+        // keeps them alive across any subsequent restarts. Missing a
+        // socket binding is not fatal for optional services (they skip),
+        // but for required ones the daemon simply cannot talk.
+        if !s.sockets.is_empty() {
+            if let Err(e) = prepare_sockets(&s, &who, &known) {
+                if s.optional {
+                    skyward_sys::kmsg(&format!("{e:#}; socket setup skipped"))?;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
         if s.oneshot {
             // What it said goes to the log. A step that fails names its
             // reason there and nowhere else, and one that finds nothing to
@@ -202,6 +216,25 @@ struct Credentials {
     /// The other groups it is in.
     groups: Vec<libc::gid_t>,
     kept: Option<Kept>,
+    /// Sockets to pre-create before fork and hand the child as
+    /// ANDROID_SOCKET_<name>. Each socket carries the mode and ownership
+    /// the phone's init script gives it, so Skyward's socket semantics
+    /// match the vendor's. The Arc keeps the fds alive between the
+    /// command build and the spawn() call — fork duplicates them, the
+    /// child dup2+closes at exec time, the parent drops them once the
+    /// child is gone.
+    sockets: Arc<Mutex<Vec<SocketInfo>>>,
+}
+
+/// One socket init would make for a daemon. `fd` is open before fork and
+/// must stay alive until spawn() returns, so it lives inside the Arc that
+/// Credentials hands off; the child takes it over at exec. The mode and
+/// ownership live on the filesystem node itself once bind+chmod+chown
+/// have run, so nothing needs to carry them past that point.
+#[derive(Debug)]
+struct SocketInfo {
+    name: String,
+    fd: OwnedFd,
 }
 
 /// The capabilities a program keeps, as masks.
@@ -232,7 +265,7 @@ impl Credentials {
             let last = last.trim().parse().with_context(|| format!("read the number in {CAP_LAST_CAP}"))?;
             Some(Kept { mask, dropping: mask | bit("SETPCAP")?, last })
         };
-        Ok(Self { uid, gid, groups, kept })
+        Ok(Self { uid, gid, groups, kept, sockets: Arc::new(Mutex::new(Vec::new())) })
     }
 
     /// Become who the program runs as, in the child about to run it, as
@@ -259,6 +292,110 @@ impl Credentials {
         }
         Ok(())
     }
+}
+
+/// Hard-coded socket ownerships Skyward Aurora services need, taken from
+/// the vendor's init scripts (see HANDOFF section F14). These are the
+/// only services the phone's own init creates sockets for and that
+/// Skyward boots itself in recovery. The mode and ownership must match or
+/// the vendor's daemons will fail to bind or other HALs will refuse to
+/// connect: Skyward must reproduce init's semantics, not invent new ones.
+fn socket_ownership(name: &str) -> Option<(libc::mode_t, &'static str, &'static str)> {
+    match name {
+        // qseecomd.rc: `socket notify-topology stream 660 system drmrpc`
+        "notify-topology" => Some((0o660, "system", "drmrpc")),
+        // ssgtzd.rc: `socket ssgtzd stream 0660 system oem_2912`
+        "ssgtzd" => Some((0o660, "system", "oem_2912")),
+        // ssgtzd.rc: `socket ssgtzd_opener stream 0660 system system`
+        "ssgtzd_opener" => Some((0o660, "system", "system")),
+        _ => None,
+    }
+}
+
+/// Create the sockets init would make for service `s`, bind them to
+/// `/dev/socket/<name>`, set their mode and ownership, then start
+/// listening. The fds are handed off through `who.sockets` (an Arc so
+/// they survive until the spawn()). If a socket has no ownership record
+/// the config is newer than what we can see and we bail; if the socket
+/// already exists from a prior boot we unlink and re-create it so the
+/// mode/ownership reflect the phone's init, not a stale path.
+fn prepare_sockets(s: &Service, who: &Credentials, known: &HashMap<String, u32>) -> Result<()> {
+    let mut slots = who.sockets.lock().unwrap();
+    for name in &s.sockets {
+        let Some((mode, owner_name, group_name)) = socket_ownership(name) else {
+            bail!("{}: socket {name} has no vendor ownership record in Aurora; add one to services.rs", s.path);
+        };
+        let uid = ueventd::account(known, owner_name)
+            .with_context(|| format!("{}: resolve uid for socket {name}", s.path))?;
+        let gid = ueventd::account(known, group_name)
+            .with_context(|| format!("{}: resolve gid for socket {name}", s.path))?;
+
+        let path = format!("/dev/socket/{name}");
+        // Unlink anything left behind from a previous boot or half-run.
+        let _ = fs::remove_file(&path);
+        // Make sure /dev/socket exists before bind(). On some devices the
+        // socket dir is a tmpfs mount that init sets up; in Skyward we
+        // just mkdir on it.
+        let _ = fs::create_dir_all("/dev/socket");
+
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                // No SOCK_CLOEXEC: the fd must survive exec() so the daemon
+                // sees ANDROID_SOCKET_<name> pointing at a live socket.
+                // Skyward forks and execs from the main process which owns
+                // these fds, so keeping them open past spawn() is what the
+                // ANDROID_SOCKET mechanism expects.
+                libc::SOCK_STREAM,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("{}: create socket {name}", s.path));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        // Android init binds sockets as filesystem paths under
+        // /dev/socket/<name>, not abstract namespace. Build a sockaddr_un
+        // with the path so bind() creates a real node that can be chmod'd
+        // and chown'd the vendor's init-script way. What lies past the
+        // path stays zero, and the whole struct is handed to bind, the
+        // way init itself does it.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as u16;
+        let path_bytes = path.as_bytes();
+        let copy_len = path_bytes.len().min(addr.sun_path.len() - 1);
+        addr.sun_path[..copy_len].copy_from_slice(
+            path_bytes[..copy_len].iter().map(|&b| b as libc::c_char).collect::<Vec<_>>().as_slice(),
+        );
+        let addr_len = std::mem::size_of::<libc::sockaddr_un>();
+        if unsafe { libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_un).cast(), addr_len as libc::socklen_t) } < 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("{}: bind socket {name}", s.path));
+        }
+        if unsafe { libc::chmod(path.as_ptr() as *const _, mode) } < 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("{}: chmod socket {name}", s.path));
+        }
+        if unsafe { libc::chown(path.as_ptr() as *const _, uid, gid) } < 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("{}: chown socket {name}", s.path));
+        }
+        if unsafe { libc::listen(fd.as_raw_fd(), 16) } < 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("{}: listen socket {name}", s.path));
+        }
+        let _ = skyward_sys::kmsg(&format!(
+            "{}: socket {name} bound ({path}, mode {:o}, {uid}:{gid})",
+            s.path, mode
+        ));
+        slots.push(SocketInfo {
+            name: name.clone(),
+            fd,
+        });
+    }
+    Ok(())
 }
 
 /// Make `mask` the capabilities the process has, may take up and hands on.
@@ -459,6 +596,17 @@ fn command_with(s: &Service, who: &Credentials, runner: Option<&Path>) -> Comman
     cmd.current_dir("/").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     if runner.is_none() && !s.libraries.is_empty() {
         cmd.env("LD_LIBRARY_PATH", s.libraries.join(":"));
+    }
+    // The sockets this program was given are handed over the way init
+    // hands them over: the fd number in ANDROID_SOCKET_<name>. The env has
+    // to be on the command itself, before it is started — execve replaces
+    // whatever environ the child has built by the time it runs, so nothing
+    // set between the fork and the exec survives it. The fd itself is
+    // inherited through the fork and kept through the exec, the sockets
+    // being created without close-on-exec for exactly that, so the number
+    // the program reads still names the live socket, however it restarts.
+    for slot in who.sockets.lock().unwrap().iter() {
+        cmd.env(format!("ANDROID_SOCKET_{}", slot.name), slot.fd.as_raw_fd().to_string());
     }
     let who = who.clone();
     // Only system calls run between the fork and the exec, on what was
