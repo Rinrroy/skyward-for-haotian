@@ -19,6 +19,7 @@ skyward-info = { path = "../skyward-info" }
 skyward-install = { path = "../skyward-install" }
 skyward-sys = { path = "../skyward-sys" }
 skyward-lp = { path = "../skyward-lp" }
+zip = { version = "8.6.0", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -31,7 +32,6 @@ skyward-backup = { path = "../skyward-backup" }
 skyward-binder = { path = "../skyward-binder" }
 skyward-crypto = { path = "../skyward-crypto" }
 skyward-files = { path = "../skyward-files" }
-zip = { version = "8.6.0", default-features = false }
 libc = { workspace = true }
 procfs = { version = "0.18.0", default-features = false }
 skyward-ui = { path = "../skyward-ui" }

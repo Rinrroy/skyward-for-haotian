@@ -53,9 +53,10 @@ use std::path::Path;
 
 /// Whether the mount table's line for `path` says read-only, if it has one:
 /// `None` where nothing is mounted there. Later lines are mounts stacked
-/// over earlier ones, so the last one for a path is what shows at it.
-/// Waiting to be wired into the callers that ask before they write.
-#[expect(dead_code)]
+/// over earlier ones, so the last one for a path is what shows at it. The
+/// phone's callers ask it before they write; the computer has none, so the
+/// check waits there.
+#[cfg_attr(not(target_os = "android"), expect(dead_code))]
 fn read_only_in(table: &str, path: &Path) -> Option<bool> {
     let mut found = None;
     for line in table.lines() {

@@ -5,7 +5,6 @@ use skyward_sys::{bcb, Power};
 use skyward_vab::SnapshotState;
 use std::path::{Path, PathBuf};
 
-#[cfg(target_os = "android")]
 mod avbkeep;
 #[cfg(target_os = "android")]
 mod backup;
@@ -125,6 +124,7 @@ enum Cmd {
     /// Write the partitions the bootloader chain lives in to files. They are
     /// for keeping, not for putting back: this recovery does not write them,
     /// because a mistake there is not one it can undo.
+    #[cfg(target_os = "android")]
     Firmware {
         /// Where the files go.
         #[arg(long, default_value = "/sdcard/Skyward/firmware")]
@@ -315,6 +315,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        #[cfg(target_os = "android")]
         Cmd::Firmware { out } => firmware(&out),
         #[cfg(target_os = "android")]
         Cmd::Discard { device } => skyward_block::erase::discard(&device),
@@ -504,6 +505,7 @@ fn booted_slot() -> Result<skyward_vab::Slot> {
 /// partitions with the checksums and the addresses to write them at, and a
 /// tool that writes without checking is worse than no tool. The backup page
 /// keeps the same partitions, with a manifest beside them.
+#[cfg(target_os = "android")]
 fn firmware(out: &Path) -> Result<()> {
     std::fs::create_dir_all(out).with_context(|| format!("make {}", out.display()))?;
     let slot = skyward_vab::current_slot()?.map(|s| s.suffix().to_string()).unwrap_or_default();
