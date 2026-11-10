@@ -665,7 +665,9 @@ fn load_modules(cfg: &DeviceConfig, names: &[String]) -> Result<Vec<PathBuf>> {
 /// kernel's own start: the coldboot that names them races this bring-up,
 /// and reading the installed system's version before the names are there
 /// left a phone looping inside its own recovery. Wait for the names, but
-/// not for long; whatever still fails afterwards fails as it did.
+/// not for long; whatever still fails afterwards fails as it did. The
+/// phone's bring-up asks; the computer has no partitions to wait for.
+#[cfg_attr(not(target_os = "android"), expect(dead_code))]
 fn wait_for_partition_nodes(slot: skyward_vab::Slot) {
     let expected = Path::new("/dev/block/by-name").join(format!("vendor{}", slot.suffix()));
     let began = std::time::Instant::now();
