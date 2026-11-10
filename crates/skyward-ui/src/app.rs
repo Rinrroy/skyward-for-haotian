@@ -9547,7 +9547,7 @@ mod tests {
         press(&mut app, Key::VolumeDown, 0);
         assert!(press(&mut app, Key::Power, 0).is_empty(), "a dot joined already is not joined again");
         press(&mut app, Key::VolumeUp, 0);
-        assert_eq!(press(&mut app, Key::Power, 0), vec![Effect::Unlock { user: 0, code: "1236987".into() }], "the last one joined ends it");
+        assert_eq!(acts(press(&mut app, Key::Power, 0)), vec![Effect::Unlock { user: 0, code: "1236987".into() }], "the last one joined ends it");
     }
 
     #[test]
@@ -9562,7 +9562,7 @@ mod tests {
         }
         assert_eq!(app.state.code, "2580");
         light_on(&mut app, &f, &i, Stop::Hit(Action::Type(Cap::Enter)));
-        assert_eq!(press(&mut app, Key::Power, 0), vec![Effect::Unlock { user: 0, code: "2580".into() }]);
+        assert_eq!(acts(press(&mut app, Key::Power, 0)), vec![Effect::Unlock { user: 0, code: "2580".into() }]);
     }
 
     #[test]
@@ -9987,6 +9987,13 @@ mod tests {
         fx
     }
 
+    /// What the app was asked to do, leaving out the taps of the motor: a
+    /// test that asks what a control does does not count them, and the ones
+    /// that do ask after them say so.
+    fn acts(fx: Vec<Effect>) -> Vec<Effect> {
+        fx.into_iter().filter(|e| !matches!(e, Effect::Haptic)).collect()
+    }
+
     fn swipe(app: &mut App, f: &Fonts, i: &DeviceInfo, which: Confirm) -> Vec<Effect> {
         let track = app.frame(f, i).hits.iter().find(|h| h.action == Action::Confirm(which)).expect("the track is on the page").rect;
         let y = track.centre().1 - app.top().1;
@@ -10078,7 +10085,7 @@ mod tests {
         app.set_usb_drive(Some(UsbDrive::Shown));
         let second = Effect::Backup { parts: [false, true, true, true, false], place: Place::UsbDrive, compress: true, verify: false };
         assert_eq!(swiped(&mut app, &f, &i, Confirm::Backup), vec![second]);
-        for k in 1..5 {
+        for k in 1..4 {
             tap(&mut app, &f, &i, Action::BackupPart(k));
         }
         assert!(swiped(&mut app, &f, &i, Confirm::Backup).is_empty(), "nothing ticked, nothing backed up");
@@ -10308,7 +10315,7 @@ mod tests {
         let mut app = systems_page(&f, &i, two_systems());
         assert!(!swipes(&mut app, &f, &i), "the main system starts already");
         tap(&mut app, &f, &i, Action::PickSystem(Who::Other));
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Other)]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Other)]);
         assert_eq!((app.state.systems_work, app.state.system_pick), (Some(SystemsWork::Switching(Who::Other)), None));
         assert!(app.frame(&f, &i).hits.is_empty(), "nothing to tap while the boot partitions are written");
         // The card tapped darkens and comes back, as a row of a list does.
@@ -10319,7 +10326,7 @@ mod tests {
         assert_eq!(app.state.systems_work, None);
         app.set_systems(Ok(Overview { other_starts: true, ..two_systems() }));
         tap(&mut app, &f, &i, Action::PickSystem(Who::Installed));
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Installed)]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Installed)]);
         app.set_systems(Ok(two_systems()));
         tap(&mut app, &f, &i, Action::PickSystem(Who::Other));
         app.key(Key::Back, 0);
@@ -10334,7 +10341,7 @@ mod tests {
         assert!(!swipes(&mut app, &f, &i), "nothing to swipe");
         app.set_systems(Ok(Overview { other_starts: true, ..two_systems() }));
         tap(&mut app, &f, &i, Action::PickSystem(Who::Installed));
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Installed)], "back to the main system to merge it");
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Installed)], "back to the main system to merge it");
     }
 
     #[test]
@@ -10345,7 +10352,7 @@ mod tests {
         app.state.data = Data::Open;
         app.refresh();
         tap(&mut app, &f, &i, Action::AskDelete);
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::RemoveSystem), vec![Effect::RemoveSystem]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::RemoveSystem), vec![Effect::RemoveSystem]);
         assert_eq!((app.state.systems_work, app.state.asking_delete), (Some(SystemsWork::Removing), false));
         app.set_systems(Ok(Overview { other: None, ..two_systems() }));
         assert_eq!(app.state.systems_work, None);
@@ -10367,7 +10374,7 @@ mod tests {
         let y = track.centre().1 - app.top().1;
         app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
         app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
-        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::InstallSystem { size: 8 << 30 }]);
+        assert_eq!(acts(app.touch(Touch::Up, &f, 1000)), vec![Effect::InstallSystem { size: 8 << 30 }]);
         assert_eq!(app.state.install, Install::Systeming { name: "Ubuntu Touch".into(), stage: None });
         app.install(Event::Progress(Stage::Root { done: 1 << 30, total: 6 << 30 }), 1000);
         assert_eq!(app.state.install, Install::Systeming { name: "Ubuntu Touch".into(), stage: Some(Stage::Root { done: 1 << 30, total: 6 << 30 }) });
@@ -10450,7 +10457,7 @@ mod tests {
         assert_eq!(app.state.code, "1234");
         tap(&mut app, &f, &i, Action::Type(Cap::Backspace));
         assert_eq!(app.state.code, "123");
-        let fx = tap(&mut app, &f, &i, Action::Type(Cap::Enter));
+        let fx = acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter)));
         assert_eq!(fx, vec![Effect::Unlock { user: 0, code: "123".into() }]);
         assert_eq!(app.state.code, "", "what was typed is gone once it is sent");
         assert_eq!(app.state.data, Data::Locked { user: 0, keys: Keys::Digits, checking: true });
@@ -10467,7 +10474,7 @@ mod tests {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Decrypt, W, H, PPD);
         app.data_waiting(Some((0, Keys::Digits)));
-        assert!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)).is_empty());
+        assert!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))).is_empty());
         assert_eq!(app.deadline(0), Some(TOAST_MS), "the page says to type one first");
     }
 
@@ -10483,7 +10490,7 @@ mod tests {
         for &which in &[1usize, 4, 7] {
             app.touch(Touch::Move(dots[which].0, dots[which].1 - scroll), &f, 0);
         }
-        let fx = app.touch(Touch::Up, &f, 0);
+        let fx = acts(app.touch(Touch::Up, &f, 0));
         assert_eq!(fx, vec![Effect::Unlock { user: 0, code: "1258".into() }], "the dots counted from one across the rows");
         assert!(app.state.pattern.is_empty(), "the grid is cleared once it is sent");
         assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::Pattern), "nothing more is drawn while it is checked");
@@ -10638,7 +10645,7 @@ mod tests {
         let (rows, cols) = app.term_size(&f);
         app.term_started(rows, cols);
         app.term_ended(TermEnd::Exited(0));
-        assert_eq!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)), vec![Effect::StartShell("/sdcard/Download".into())], "Enter starts it again there");
+        assert_eq!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))), vec![Effect::StartShell("/sdcard/Download".into())], "Enter starts it again there");
         app.term_started(rows, cols);
         tap_back(&mut app, &f, &i, 0);
         app.set_files("/data/adb".into(), Ok(Vec::new()), 0);
@@ -10920,7 +10927,7 @@ mod tests {
         }
         type_text(&mut app, &f, &i, "b");
         let rename = Effect::Rename { path: "/sdcard/a.zip".into(), name: "ab".into() };
-        assert_eq!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)), vec![rename]);
+        assert_eq!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))), vec![rename]);
         app.renamed(Err(RenameRefused::Failed("rename /sdcard/a.zip to ab: No space left on device (os error 28)".into())), 0);
         assert_eq!(app.screen(), Screen::Rename, "a name refused can be typed again");
         app.toast = None;
@@ -11339,7 +11346,7 @@ mod tests {
             }
         };
         type_in(&mut app, "secret");
-        assert!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)).is_empty());
+        assert!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))).is_empty());
         assert_eq!(toast(&app), Some("请输入 8 到 63 位密码"));
         tap(&mut app, &f, &i, Action::Type(Cap::Show(Layer::Digits)));
         type_in(&mut app, "12");
@@ -11409,7 +11416,7 @@ mod tests {
                 tap(app, &f, &i, Action::Type(Cap::Char(ch)));
             }
         };
-        assert!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)).is_empty());
+        assert!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))).is_empty());
         assert_eq!(toast(&app), Some("请输入网络名称"));
         type_in(&mut app, "skyward");
         let frame = app.frame(&f, &i);
@@ -11437,7 +11444,7 @@ mod tests {
         type_in(&mut app, "secret");
         tap(&mut app, &f, &i, Action::TypeInto(Field::Name));
         assert_eq!((app.state.adding.as_ref().unwrap().name.as_str(), app.state.password.as_str()), ("skyward", "secret"));
-        assert!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)).is_empty());
+        assert!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))).is_empty());
         assert_eq!(toast(&app), Some("请输入 8 到 63 位密码"));
         assert_eq!(app.state.adding.as_ref().unwrap().field, Field::Password, "the keyboard types into the field turned down");
         tap(&mut app, &f, &i, Action::Type(Cap::Show(Layer::Digits)));
@@ -11466,7 +11473,7 @@ mod tests {
         for _ in 0..33 {
             tap(&mut app, &f, &i, Action::Type(Cap::Char('a')));
         }
-        assert!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)).is_empty());
+        assert!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))).is_empty());
         assert_eq!(toast(&app), Some("网络名称不能超过 32 个字符"));
         tap(&mut app, &f, &i, Action::Type(Cap::Backspace));
         let fx = tap(&mut app, &f, &i, Action::Type(Cap::Enter));
@@ -11738,12 +11745,12 @@ mod tests {
         for (name, said) in refused {
             app.state.new_name = name.into();
             app.toast = None;
-            assert!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)).is_empty(), "{name:?} is not renamed to");
+            assert!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))).is_empty(), "{name:?} is not renamed to");
             assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some(said));
             assert_eq!(app.screen(), Screen::Rename);
         }
         app.state.new_name = "a.zip".into();
-        assert!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)).is_empty());
+        assert!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))).is_empty());
         assert_eq!(app.screen(), Screen::FileInfo, "the name left as it was, the page goes");
     }
 
