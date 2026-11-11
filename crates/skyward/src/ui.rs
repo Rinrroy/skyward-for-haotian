@@ -1649,14 +1649,25 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 faced.clear();
             }
             if app.state.always_on {
-                if !blanked || faced != shown_clock {
+                // A finger on the glass takes the face up with it, so the
+                // face is drawn again as it follows: a panel in its own
+                // doze keeps the frame it has and shows nothing else, so
+                // it comes out of the doze for as long as the finger is
+                // on the glass.
+                let drag = app.aod_drag();
+                if drag.is_some() && surface.is_dozing() {
+                    if let Err(e) = surface.wake() {
+                        let _ = skyward_sys::kmsg(&format!("the panel would not come out of its doze: {e:#}"));
+                    }
+                }
+                if !blanked || faced != shown_clock || drag.is_some() {
                     // The face the phone's own always-on display shows: the
                     // clock in one of three looks, the day under it, the
                     // charge, and the word that says how to wake it. It
                     // moves a little each minute, so no pixel of the panel
                     // holds the light long enough to burn into it.
                     app.state.aod_date = skyward_ui::fmt::date(app.state.lang, unix_now()?, app.state.time_zone);
-                    app.compose_aod(&mut screen, &fonts, &info, &shown_clock);
+                    app.compose_aod(&mut screen, &fonts, &info, &shown_clock, drag);
                     surface.present(&screen)?;
                     surface.settle()?;
                     faced.clone_from(&shown_clock);
@@ -1666,7 +1677,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 // light goes out, and the face stays on the glass. A panel
                 // that takes no doze keeps the light turned down instead,
                 // which is the recovery's own way of keeping a clock.
-                if !surface.is_dozing() && surface.can_doze() {
+                if drag.is_none() && !surface.is_dozing() && surface.can_doze() {
                     doze_brightness();
                     if let Err(e) = surface.doze() {
                         let _ = skyward_sys::kmsg(&format!("the panel would not doze: {e:#}"));

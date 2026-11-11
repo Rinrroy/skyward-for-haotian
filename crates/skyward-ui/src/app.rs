@@ -3005,6 +3005,10 @@ pub struct App {
     /// Where a finger landed on the dark glass, so that a swipe up from
     /// there can be told from a tap.
     aod_start: Option<f32>,
+    /// How far a finger has swiped up on the dark glass, in pixels, while
+    /// it is still down: the face follows it, and the page comes up where
+    /// the finger has brought it.
+    aod_drag: Option<f32>,
     /// When the power key went down, while a three-second hold is weighed
     /// against a short press.
     power_down_at: Option<u64>,
@@ -3090,6 +3094,7 @@ impl App {
             dirty: true,
             double_tap: DoubleTap::new(),
             aod_start: None,
+            aod_drag: None,
             power_down_at: None,
             power_menu_spent: false,
             power_pending_off: false,
@@ -3142,6 +3147,17 @@ impl App {
     /// Whether the panel needs a new frame since the last call.
     pub fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
+    }
+
+    /// How far a finger has swiped up on the dark glass, in pixels, while
+    /// it is still down; none when no finger is on it.
+    ///
+    /// The face on the dark glass follows the finger: it is drawn as far
+    /// up as the finger has come, and fades as it goes, so that the
+    /// panel comes up where the finger has brought it and not all at
+    /// once.
+    pub fn aod_drag(&self) -> Option<f32> {
+        self.aod_drag
     }
 
     /// When time next has to pass through [`App::tick`]: at once while
@@ -5084,7 +5100,12 @@ impl App {
     /// hint of how to leave it, all dim on black, and all aside from where
     /// they were the minute before, so no pixel holds the light long
     /// enough to burn into the panel.
-    pub fn compose_aod(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str) {
+    ///
+    /// `drag` is how far a finger has swiped up on the dark glass, in dp:
+    /// the face goes up with the finger and fades as it goes, so that the
+    /// panel comes up where the finger has brought it and not all at once.
+    /// None is a finger that is not on the glass.
+    pub fn compose_aod(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, drag: Option<f32>) {
         out.fill_rect(0.0, 0.0, out.w as f32, out.h as f32, Rgba::rgb(0, 0, 0));
         let t = self.theme();
         let m = t.m;
@@ -5124,6 +5145,14 @@ impl App {
         }
         let hint = l.pick(["上滑解锁", "上滑解鎖", "Swipe up to unlock"]);
         out.text_center(&f.body, hint, cx, h * 0.85 + dy, m.dp(13.0), AOD_FAINT);
+        // A finger on the glass takes the face up with it, and the face
+        // fades as it goes: it is leaving, and the page is coming.
+        if let Some(drag) = drag {
+            // The drag is in pixels; the threshold it is measured against
+            // is in dp, as the gesture itself is.
+            let gone = (drag / m.dp(WAKE_SWIPE_DP)).clamp(0.0, 1.0);
+            out.lift(-gone * h * 0.35, 1.0 - gone * 0.85);
+        }
     }
 
     /// The AOD's clock face: a ring with a subtle face, twelve marks, the
@@ -6688,6 +6717,12 @@ impl App {
         if !self.display_on {
             let m = self.theme().m;
             let swipe = m.dp(WAKE_SWIPE_DP);
+            // The two ways of lighting the dark glass are told apart: with
+            // the double tap turned on, it is the double tap alone that
+            // lights the panel, and a swipe up does nothing. With it
+            // turned off, the swipe up is the way in, and the face follows
+            // the finger as it comes.
+            let swipe_wakes = !self.state.double_tap;
             match ev {
                 Touch::Down(x, y) => {
                     if self.state.double_tap {
@@ -6695,17 +6730,26 @@ impl App {
                         self.double_tap.down(x, y, now);
                     }
                     self.aod_start = Some(y);
+                    self.aod_drag = None;
                 }
                 Touch::Move(x, y) => {
                     if self.state.double_tap {
                         self.double_tap.move_to(x, y, m.dp(doubletap::TAP_SLOP_DP));
                     }
                     // A finger swiped up on the dark glass lights it, as
-                    // the phone's own always-on display is woken.
+                    // the phone's own always-on display is woken -- where
+                    // the double tap is not the gesture offered. The face
+                    // goes with the finger, so that the panel comes up
+                    // where the finger has brought it and not all at once.
                     if let Some(start) = self.aod_start {
-                        if start - y > swipe {
+                        let gone = (start - y).max(0.0);
+                        if gone > swipe {
                             self.aod_start = None;
+                            self.aod_drag = None;
                             self.wake(now);
+                        } else if swipe_wakes {
+                            self.aod_drag = Some(gone);
+                            self.dirty = true;
                         }
                     }
                 }
@@ -6717,6 +6761,7 @@ impl App {
                         self.wake(now);
                     }
                     self.aod_start = None;
+                    self.aod_drag = None;
                 }
             }
             return Vec::new();
@@ -12494,6 +12539,9 @@ mod tests {
     fn a_touch_on_the_dark_panel_lights_it_only_when_swiped_up() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Home, W, H, PPD);
+        // The swipe up is the way in where the double tap is not the
+        // gesture offered.
+        app.state.double_tap = false;
         let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
         press(&mut app, Key::Power, 0);
         // A tap on the dark glass lights nothing, as on the phone's own
@@ -12510,6 +12558,44 @@ mod tests {
         assert!(app.touch(Touch::Up, &f, 240).is_empty());
         assert!(app.display_on(), "the swipe up lights the panel");
         assert_eq!(app.screen(), Screen::Home, "and the page is the one it went dark on");
+    }
+
+    #[test]
+    fn the_double_tap_and_the_swipe_up_are_two_ways_of_doing_the_same_thing() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
+        // With the double tap turned on, it is the double tap alone that
+        // lights the dark panel: a swipe up does nothing, as the two are
+        // one gesture and not two.
+        press(&mut app, Key::Power, 0);
+        assert!(app.touch(Touch::Down(x, y), &f, 100).is_empty());
+        assert!(app.touch(Touch::Move(x, y - 300.0), &f, 120).is_empty());
+        assert!(app.touch(Touch::Up, &f, 140).is_empty());
+        assert!(!app.display_on(), "the swipe up lights nothing where the double tap is");
+        // The double tap lights it.
+        app.touch(Touch::Down(x, y), &f, 200);
+        app.touch(Touch::Up, &f, 280);
+        app.touch(Touch::Down(x + 6.0, y + 4.0), &f, 400);
+        app.touch(Touch::Up, &f, 480);
+        assert!(app.display_on(), "the double tap lights it");
+    }
+
+    #[test]
+    fn the_face_on_the_dark_glass_follows_the_finger_that_is_on_it() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.double_tap = false;
+        let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
+        press(&mut app, Key::Power, 0);
+        app.touch(Touch::Down(x, y), &f, 100);
+        assert_eq!(app.aod_drag(), None, "a finger that has not moved yet");
+        app.touch(Touch::Move(x, y - 30.0), &f, 120);
+        let gone = app.aod_drag().expect("the face follows the finger");
+        assert!(gone > 0.0, "the face has gone up with it");
+        assert!(!app.display_on(), "and the panel is still dark");
+        app.touch(Touch::Up, &f, 140);
+        assert_eq!(app.aod_drag(), None, "and the face is where it was when the finger left");
     }
 
     #[test]

@@ -277,6 +277,44 @@ impl Canvas {
         }
     }
 
+    /// Take everything on this canvas up by `dy` pixels, and let `level` of
+    /// its light go as it goes.
+    ///
+    /// What was at the top is gone off it, and what was at the bottom
+    /// comes up to take its place, over black: the canvas is a window on
+    /// a panel, and the panel shows nothing that is not on it.
+    pub fn lift(&mut self, dy: f32, level: f32) {
+        let shift = dy.round() as i32;
+        if shift != 0 {
+            self.rows_moved(shift);
+        }
+        self.dim(level);
+    }
+
+    /// Move the rows of this canvas up by `shift` rows: a negative shift
+    /// moves them down.
+    fn rows_moved(&mut self, shift: i32) {
+        let (top, bottom) = (self.top as i32, self.bottom as i32);
+        if bottom <= top {
+            return;
+        }
+        let row = self.span as usize * 4;
+        // Where each row of the panel comes from: a row that has come
+        // from above the panel is black, and one that has gone off its
+        // top is not there.
+        let from = |y: i32| (y - shift).clamp(0, self.h as i32 - 1);
+        let mut moved: Vec<u8> = vec![0; self.data.len()];
+        for y in top..bottom {
+            let src = from(y) as usize;
+            let (a, b) = ((y - top) as usize * row, ((y - top) as usize + 1) * row);
+            let (c, d) = (src * row, src * row + row);
+            if d <= self.data.len() {
+                moved[a..b].copy_from_slice(&self.data[c..d]);
+            }
+        }
+        self.data = moved;
+    }
+
     /// Lay `layer`, whose top-left corner goes at (`x`, `y`), over this
     /// opaque canvas at `alpha` of its strength.
     pub fn lay(&mut self, layer: &Canvas, x: i32, y: i32, alpha: f32) {
