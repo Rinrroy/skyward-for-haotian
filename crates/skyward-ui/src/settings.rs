@@ -53,15 +53,7 @@ pub struct Settings {
     pub file_transfer: bool,
     /// A double tap on the dark panel lights it.
     pub double_tap: bool,
-    /// A dark panel keeps the clock and the phone's readings on the glass in
-    /// the panel's own doze, rather than being put out.
-    pub always_on: bool,
-    /// Install scripts turn verified boot off before they write, and the
-    /// bootloader honours the flag; a switch turns it back on.
-    pub disable_avb: bool,
-    /// The screen lock the decrypt page opens /data with, kept sealed on
-    /// the metadata partition between starts.
-    pub remember_password: bool,    pub install: Install,
+    pub install: Install,
     pub backup: Backup,
     pub logs: Logs,
 }
@@ -139,10 +131,7 @@ impl Settings {
             vibration: state.vibration,
             aod_style: state.aod_style,
             file_transfer: state.file_transfer,
-            always_on: state.always_on,
             double_tap: state.double_tap,
-            disable_avb: state.disable_avb,
-            remember_password: state.remember_password,
             install: Install { check_signature: state.check_signature, keep_recovery: state.keep_recovery },
             backup: Backup {
                 parts: names(&state.backup, &PARTS),
@@ -202,10 +191,7 @@ impl Settings {
         }
         state.aod_style = self.aod_style;
         state.file_transfer = self.file_transfer;
-        state.always_on = self.always_on;
         state.double_tap = self.double_tap;
-        state.disable_avb = self.disable_avb;
-        state.remember_password = self.remember_password;
         state.check_signature = self.install.check_signature;
         state.keep_recovery = self.install.keep_recovery;
         state.backup = picked(&self.backup.parts, &PARTS);
@@ -235,9 +221,6 @@ fn picked<const N: usize>(kept: &[String], all: &[&str; N]) -> [bool; N] {
 
 /// What the settings file held as the recovery started.
 #[derive(Debug, Clone, PartialEq)]
-// The settings are read once at the start and stay as one value for the whole
-// recovery, so boxing the big variant would buy nothing.
-#[allow(clippy::large_enum_variant)]
 pub enum Kept {
     Settings(Settings),
     /// No settings: no file, or one that does not read as settings.
@@ -330,10 +313,44 @@ mod tests {
         assert!(state.double_tap);
     }
 
-    fn the_avb_and_remember_switches_are_kept_and_start_off() {
-        let fresh = Settings::read(r#"{}"#).unwrap();
-        assert!(!fresh.disable_avb, "a fresh file starts with AVB checks on");
-        assert!(!fresh.remember_password, "a fresh file keeps no password");
+    #[test]
+    fn turning_the_double_tap_off_goes_round_through_the_file() {
+        let state = State { double_tap: false, ..State::default() };
+        let kept = Settings::read(&Settings::of(&state).text()).unwrap();
+        assert!(!kept.double_tap);
+        let mut back = State::default();
+        kept.apply(&mut back);
+        assert!(!back.double_tap);
+    }
+
+    #[test]
+    fn the_settings_go_round_through_their_file() {
+        let state = State {
+            lang: Lang::En,
+            language_chosen: true,
+            dark: true,
+            brightness: 0.7,
+            screen_off: 6,
+            time_zone: 7,
+            vibrate: false,
+            vibration: 0.4,
+            aod_style: AodStyle::Dial,
+            file_transfer: false,
+            check_signature: true,
+            keep_recovery: false,
+            backup: [false, true, true, false, false],
+            backup_to: Place::UsbDrive,
+            compress: true,
+            verify: false,
+            logs: [false, true],
+            logs_to: 1,
+            ..State::default()
+        };
+        let kept = Settings::read(&Settings::of(&state).text()).unwrap();
+        let mut back = State::default();
+        kept.apply(&mut back);
+        assert_eq!(Settings::of(&back), Settings::of(&state));
+        assert_eq!((back.lang, back.screen_off, back.time_zone), (Lang::En, 6, 7));
     }
 
     #[test]
@@ -347,8 +364,6 @@ mod tests {
         assert_eq!(json["backup"]["parts"], serde_json::json!(["boot", "modem"]));
         assert_eq!(json["logs"]["to"], "temporary");
         assert_eq!(json["spoken"], "zh-Hans");
-        assert_eq!(json["always_on"], false, "the face on a dark panel is off until it is turned on");
-        assert_eq!(json["double_tap"], false, "the two-tap wake is off until it is turned on");
         assert!(json.get("language").is_none(), "no language is chosen until one is");
         let never = Settings::of(&State { screen_off: SCREEN_OFF.len() - 1, ..State::default() });
         assert_eq!(never.screen_off, 0, "a screen that stays on");

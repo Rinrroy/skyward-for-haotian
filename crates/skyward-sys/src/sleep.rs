@@ -6,7 +6,6 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -140,49 +139,6 @@ impl Sleeper {
 /// a key press, or a cable going in or out, that the loop has yet to see.
 pub struct Wakeful {
     epoll: OwnedFd,
-}
-
-/// Where the kernel says whether a device may wake the phone, under the
-/// device's own folder: `enabled` or `disabled`, written to change it.
-const WAKEUP: &str = "power/wakeup";
-
-/// Whether a device hidden behind `path` may wake the phone from a suspend,
-/// and where that is written. `None` where the device cannot wake it at all:
-/// many input devices are made not to, and nothing can be done about that.
-fn wakeup_switch(device: &Path) -> Option<PathBuf> {
-    let at = device.join(WAKEUP);
-    at.exists().then_some(at)
-}
-
-/// Arm the touch panel as something that wakes the phone, so that a suspend
-/// while its panel is dark still ends at the first tap.
-///
-/// A phone whose display controller reports fingers with the panel off, which
-/// is the only kind the two-tap wake works on, is a phone whose touch driver
-/// must be able to wake it: otherwise the phone would have to stay awake with
-/// the screen off for the tap to be seen at all, and staying awake is most of
-/// what the recovery's power draw is.
-///
-/// The switch is on the device the driver bound to rather than on the input
-/// node: a touch driver arms its interrupt through the bus device, and the
-/// `/sys/class/input/eventN/device` link is that bus device already. Both are
-/// tried, because which one carries the attribute is the driver's business.
-/// A device already enabled is left as it is.
-pub fn arm_wakeup(device: &Path) -> Result<bool> {
-    let Some(at) = wakeup_switch(device) else { return Ok(false) };
-    match fs::read_to_string(&at) {
-        Ok(held) if held.trim() == "enabled" => return Ok(true),
-        Ok(_) => {}
-        Err(e) => return Err(e).with_context(|| format!("read {}", at.display())),
-    }
-    fs::write(&at, "enabled").with_context(|| format!("write to {}", at.display()))?;
-    Ok(true)
-}
-
-/// Whether `device` is armed to wake the phone, which is worth knowing before
-/// the loop lets it sleep.
-pub fn wakes(device: &Path) -> bool {
-    wakeup_switch(device).and_then(|at| fs::read_to_string(at).ok()).is_some_and(|held| held.trim() == "enabled")
 }
 
 impl Wakeful {

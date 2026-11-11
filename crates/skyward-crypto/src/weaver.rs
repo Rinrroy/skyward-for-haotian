@@ -104,16 +104,6 @@ pub struct Weaver<'a> {
 
 #[cfg(target_os = "android")]
 impl<'a> Weaver<'a> {
-    /// How long the weaver is given to answer before it is taken to be
-    /// unreachable.
-    ///
-    /// A weaver that talks to a secure element through Android's own OMAPI
-    /// service waits on a service a recovery does not run, and the driver
-    /// would hold the caller for tens of seconds before saying so. Four
-    /// seconds is longer than a weaver that can answer takes, and short
-    /// enough that a page is not stuck behind one that cannot.
-    pub const WAIT: std::time::Duration = std::time::Duration::from_secs(4);
-
     /// Reach the running weaver, or say that none is.
     pub fn open(binder: &'a skyward_binder::driver::Binder) -> Result<Weaver<'a>> {
         let device = skyward_binder::service::find(binder, SERVICE)?
@@ -122,10 +112,7 @@ impl<'a> Weaver<'a> {
     }
 
     pub fn config(&self) -> Result<Config> {
-        let reply = self
-            .device
-            .transact_within(GET_CONFIG, &ask_config(), Some(Weaver::WAIT))
-            .with_context(|| format!("ask the weaver about itself, within {:?}", Weaver::WAIT))?;
+        let reply = self.device.transact(GET_CONFIG, &ask_config()).context("ask the weaver about itself")?;
         config(&mut reply.read())
     }
 
@@ -133,10 +120,7 @@ impl<'a> Weaver<'a> {
     /// the slot by the secure element, so this is not something to call
     /// twice over on a guess.
     pub fn read(&self, slot: u32, key: &[u8]) -> Result<Vec<u8>> {
-        let reply = self
-            .device
-            .transact_within(READ, &ask_value(slot, key), Some(Weaver::WAIT))
-            .with_context(|| format!("read slot {slot} of the weaver within {:?}", Weaver::WAIT))?;
+        let reply = self.device.transact(READ, &ask_value(slot, key)).with_context(|| format!("read slot {slot} of the weaver"))?;
         value(&mut reply.read())
     }
 }

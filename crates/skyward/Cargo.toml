@@ -9,8 +9,6 @@ name = "skyward"
 path = "src/main.rs"
 
 [dependencies]
-aes-gcm = "0.10.3"
-sha2 = "0.10.9"
 anyhow = { workspace = true }
 clap = { version = "4.5.51", features = ["derive"] }
 skyward-config = { path = "../skyward-config" }

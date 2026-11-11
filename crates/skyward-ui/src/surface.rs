@@ -1,96 +1,6 @@
 use crate::canvas::Canvas;
 use anyhow::Result;
 
-/// How long after the panel goes dark the phone stays awake before it is let
-/// sleep.
-///
-/// A phone woken from a suspend takes a moment to report the touch that woke
-/// it, and the two-tap gesture is one tap at a time: if the phone slept the
-/// instant the panel went dark, a tap right after it would find the phone
-/// still coming up. This is long enough to cover that and short enough that a
-/// phone left dark settles quickly.
-pub const DARK_GRACE: u64 = 30_000;
-
-/// Whether the phone may suspend now, and why not where it may not.
-///
-/// This is the decision the screen's loop makes every turn, kept apart from
-/// the loop so that it can be read and tested without a phone. The phone is
-/// let sleep only with its panel off and nothing under way, and with the
-/// panel's report of a tap armed to wake it: a suspended phone is one the
-/// touch panel cannot report a tap to, so a phone that must feel a tap has to
-/// be woken by it rather than kept awake for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Sleep {
-    /// Let the phone suspend.
-    May,
-    /// Keep it awake: the panel is lit, so there is nothing to save.
-    Lit,
-    /// Keep it awake: a tap has to be felt, and the touch panel could not be
-    /// made to wake the phone, so the only way to feel one is not to sleep.
-    TapsUnarmed,
-    /// Keep it awake: the panel has only just gone dark, and a tap right
-    /// after it should find the phone awake.
-    JustDark,
-    /// Keep it awake: work is under way.
-    Busy,
-    /// Keep it awake: something outside the pages needs the phone, such as a
-    /// computer on the USB port, a restart on its way, or a cable that has
-    /// just been plugged in.
-    Needed,
-}
-
-/// What the loop knows when it decides.
-#[derive(Debug, Clone, Copy)]
-pub struct Idle {
-    /// The panel is off: not lit and not resting.
-    pub dark: bool,
-    /// How long ago it went dark, in milliseconds; `None` while it is lit.
-    pub dark_for: Option<u64>,
-    /// The phone's two-tap wake is on, so a tap has to be felt with the
-    /// panel off.
-    pub wants_taps: bool,
-    /// The touch panel is armed to wake the phone from a suspend.
-    pub taps_wake: bool,
-    /// Something has the phone: work under way, fastboot, a sideload, a
-    /// restart, a network being joined, a shell running, a computer on the
-    /// port, or a reading asked for after an event.
-    pub needed: bool,
-}
-
-impl Idle {
-    /// Whether the phone may suspend now.
-    pub fn may_sleep(&self) -> Sleep {
-        if !self.dark {
-            return Sleep::Lit;
-        }
-        if self.wants_taps && !self.taps_wake {
-            // The panel cannot report a tap to a suspended phone and the
-            // touchscreen cannot wake it: staying awake is the only way the
-            // second tap is ever seen. This is what the recovery did before
-            // the touchscreen was armed, and it is correct, just expensive.
-            return Sleep::TapsUnarmed;
-        }
-        if self.needed {
-            return Sleep::Busy;
-        }
-        match self.dark_for {
-            Some(ms) if ms < DARK_GRACE => Sleep::JustDark,
-            _ => Sleep::May,
-        }
-    }
-}
-
-/// Whether the panel may change to its fastest refresh when it comes on.
-///
-/// A recovery's pages are mostly still: a list scrolling, a page sliding in.
-/// 60 Hz, which every mode here is at least, draws those quite well enough,
-/// and the switch to the faster mode is a modeset of its own that the panel
-/// and the display controller both pay for. So it is asked for by a phone
-/// whose configuration names it, rather than done to every phone.
-pub fn uses_fastest_refresh(asked: bool) -> bool {
-    asked
-}
-
 /// A present target. The device backend scans out through KMS; the host
 /// preview backend encodes PNGs. Keeping the renderer behind this trait is
 /// what lets the whole UI be built and reviewed without the phone.
@@ -286,58 +196,6 @@ mod tests {
         assert_eq!(SdeMode::find(ISHTAR, "1440x3200x120cmd").unwrap(), SdeMode { mixers: 2, dsc: true });
         assert_eq!(SdeMode::find(ISHTAR, "1080x2400x60cmd").unwrap(), SdeMode { mixers: 1, dsc: false });
         assert!(SdeMode::find(ISHTAR, "1440x3200x90cmd").is_err());
-    }
-
-    /// An idle phone with its panel dark long enough, and nothing else on it.
-    fn dark() -> Idle {
-        Idle { dark: true, dark_for: Some(DARK_GRACE), wants_taps: false, taps_wake: false, needed: false }
-    }
-
-    #[test]
-    fn a_lit_panel_keeps_the_phone_awake() {
-        let idle = Idle { dark: false, dark_for: None, ..dark() };
-        assert_eq!(idle.may_sleep(), Sleep::Lit);
-    }
-
-    #[test]
-    fn a_phone_that_must_feel_a_tap_sleeps_once_its_touchscreen_can_wake_it() {
-        // The fault this exists for: `double_tap` alone used to be enough to
-        // keep the phone awake for ever, because a suspended phone cannot
-        // report a tap. Armed as a wakeup source, the touchscreen can, and
-        // the phone sleeps.
-        let unarmed = Idle { wants_taps: true, taps_wake: false, ..dark() };
-        assert_eq!(unarmed.may_sleep(), Sleep::TapsUnarmed, "awake, so that the tap is seen at all");
-        let armed = Idle { taps_wake: true, ..unarmed };
-        assert_eq!(armed.may_sleep(), Sleep::May, "asleep, and the tap brings it back");
-    }
-
-    #[test]
-    fn a_phone_that_does_not_want_taps_does_not_need_an_armed_touchscreen() {
-        assert_eq!(dark().may_sleep(), Sleep::May);
-    }
-
-    #[test]
-    fn the_panel_going_dark_leaves_the_phone_awake_for_a_moment() {
-        let just = Idle { dark_for: Some(0), ..dark() };
-        assert_eq!(just.may_sleep(), Sleep::JustDark, "a tap right after the panel goes dark still lands");
-        let later = Idle { dark_for: Some(DARK_GRACE - 1), ..dark() };
-        assert_eq!(later.may_sleep(), Sleep::JustDark, "the grace is not over");
-        assert_eq!(Idle { dark_for: Some(DARK_GRACE), ..dark() }.may_sleep(), Sleep::May, "and at the end of it the phone sleeps");
-    }
-
-    #[test]
-    fn work_under_way_keeps_the_phone_awake() {
-        let busy = Idle { needed: true, ..dark() };
-        assert_eq!(busy.may_sleep(), Sleep::Busy);
-        // Even with the panel dark long enough and the touchscreen armed.
-        let busy = Idle { taps_wake: true, wants_taps: true, ..busy };
-        assert_eq!(busy.may_sleep(), Sleep::Busy);
-    }
-
-    #[test]
-    fn the_fastest_refresh_is_only_asked_for() {
-        assert!(!uses_fastest_refresh(false), "a phone that names nothing keeps the mode its pages come up in");
-        assert!(uses_fastest_refresh(true), "and one that asks for it gets it");
     }
 }
 
@@ -657,10 +515,7 @@ pub mod kms {
     }
 
     impl KmsSurface {
-        /// `fastest_refresh` says whether the panel may be switched to its
-        /// fastest refresh once it is up, which the phone's configuration
-        /// asks for and which is off unless it does.
-        pub fn open(path: &str, fastest_refresh: bool) -> Result<Self> {
+        pub fn open(path: &str) -> Result<Self> {
             let card = open_card(path)?;
             let res = card.resource_handles().context("read KMS resources")?;
 
@@ -854,44 +709,18 @@ pub mod kms {
             // The panel comes up in its preferred mode, then switches to the
             // fastest, as `to_fastest` says why.
             commit(&card, req, AtomicCommitFlags::ALLOW_MODESET).context("set the panel mode")?;
-            // The fastest refresh is only held onto where the phone asks for
-            // it: a panel whose configuration names none stays in its
-            // preferred mode, which is the one its pages are laid out for and
-            // the one that costs the least to keep on the glass.
-            let fastest = (uses_fastest_refresh(fastest_refresh) && mode.vrefresh() != preferred.vrefresh()).then_some(blob);
+            let fastest = (mode.vrefresh() != preferred.vrefresh()).then_some(blob);
 
             let ids: Vec<u32> = planes.iter().map(|p| u32::from(p.0)).collect();
-            // What the connector and the CRTC were left holding, read back: the
-            // link's own settings are the driver's, and a sub-pixel block that
-            // was asked for but did not arrive is worth telling apart from one
-            // that did. This line is the only place a phone with the pages up
-            // can say either.
-            let link = match Props::read(&card, conn.handle()) {
-                Ok(props) => ["dsc_mode", "bpp_mode", "frame_trigger_mode"]
-                    .into_iter()
-                    .filter_map(|name| props.value(name).ok().map(|value| format!("{name}={value}")))
-                    .collect::<Vec<_>>()
-                    .join(","),
-                Err(_) => String::from("?"),
-            };
-            let held = match &spr {
-                Some((_, _, name)) => {
-                    let value = Props::read(&card, crtc).ok().and_then(|props| props.value(name).ok()).unwrap_or(0);
-                    match card.get_property_blob(value) {
-                        Ok(blob) if !blob.is_empty() => format!("{name}, {} bytes held", blob.len()),
-                        _ => format!("{name}, nothing held"),
-                    }
-                }
-                None => String::from("-"),
-            };
             let summary = format!(
-                "{:?} connector {} mode {:?} {w}x{h} {} Hz, crtc {}, planes {ids:?} {:?}, link {link}, sub-pixel rendering {held}",
+                "{:?} connector {} mode {:?} {w}x{h} {} Hz, crtc {}, planes {ids:?} {:?}{}",
                 conn.interface(),
                 u32::from(conn.handle()),
                 mode.name(),
                 mode.vrefresh(),
                 u32::from(crtc),
-                fourcc
+                fourcc,
+                spr.as_ref().map(|(_, _, name)| format!(", sub-pixel rendering through {name}")).unwrap_or_default()
             );
             let spr = spr.map(|(id, setup, _)| (id, setup));
             let lp = match conn_props.get("LP") {
@@ -960,15 +789,6 @@ pub mod kms {
         /// Turn the display off: the panel and the display processor feeding
         /// it stop drawing power. The next frame presented turns it on
         /// again.
-        ///
-        /// **A phone that lights its panel on a double tap must not come
-        /// here.** Xiaomi's touch driver follows the panel's blanking
-        /// notices: this commit is `FB_BLANK POWER DOWN`, and the driver
-        /// suspends the touch IC on it (`xiaomi_touch_suspend_work`), so no
-        /// finger is reported again until the panel is brought back. Such a
-        /// phone keeps its panel dozing instead (`aod::Panel`), which is dark
-        /// to the eye with the CRTC still running and the touchscreen still
-        /// scanning.
         pub fn turn_off(&mut self) -> Result<()> {
             if self.power == Power::Off {
                 return Ok(());
