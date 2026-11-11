@@ -12491,18 +12491,27 @@ mod tests {
     }
 
     #[test]
-    fn a_touch_on_the_dark_panel_lights_nothing() {
+    fn a_touch_on_the_dark_panel_lights_it_only_when_swiped_up() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Home, W, H, PPD);
         let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
         press(&mut app, Key::Power, 0);
+        // A tap on the dark glass lights nothing, as on the phone's own
+        // system, where the power key lights it.
         assert!(app.touch(Touch::Down(x, y), &f, 100).is_empty());
-        assert!(app.touch(Touch::Move(x, y - 300.0), &f, 120).is_empty());
-        assert!(app.touch(Touch::Up, &f, 140).is_empty());
+        assert!(app.touch(Touch::Up, &f, 120).is_empty());
         assert!(!app.display_on(), "the panel stays dark");
         assert_eq!(app.screen(), Screen::Home, "the tap pressed nothing");
         assert_eq!(app.top().1, 0.0, "nor scrolled the page");
-        press(&mut app, Key::Power, 200);
+        // A swipe up lights it, as the phone's own always-on display is
+        // woken.
+        assert!(app.touch(Touch::Down(x, y), &f, 200).is_empty());
+        assert!(app.touch(Touch::Move(x, y - 300.0), &f, 220).is_empty());
+        assert!(app.touch(Touch::Up, &f, 240).is_empty());
+        assert!(app.display_on(), "the swipe up lights the panel");
+        press(&mut app, Key::Power, 300);
+        assert!(!app.display_on());
+        press(&mut app, Key::Power, 400);
         assert!(app.display_on());
         tap_at(&mut app, &f, &i, Action::Open(Screen::Settings), 700);
         assert_eq!(app.screen(), Screen::Settings, "a tap on the lit panel does");
