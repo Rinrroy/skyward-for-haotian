@@ -273,7 +273,7 @@ pub struct Device {
     pub os_version_prop: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Display {
     #[serde(default)]
     pub width: u32,
@@ -288,6 +288,24 @@ pub struct Display {
     /// sliding over another rounds its leading corners to it.
     #[serde(default)]
     pub corner_radius: u32,
+    /// The exponent the slider's position is raised to before it is
+    /// written, so the light rises evenly to the eye on panels whose own
+    /// curve is not even. One passes the slider straight through.
+    #[serde(default = "default_gamma")]
+    pub gamma: f32,
+}
+
+impl Default for Display {
+    /// A page laid out for no panel yet, its slider as the position it is
+    /// given until the phone says otherwise.
+    fn default() -> Self {
+        Self { width: 0, height: 0, density: 0, diagonal: None, corner_radius: 0, gamma: default_gamma() }
+    }
+}
+
+/// The default backlight curve: the slider passes straight through.
+fn default_gamma() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, Deserialize)]
