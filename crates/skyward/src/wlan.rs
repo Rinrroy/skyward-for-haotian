@@ -403,7 +403,7 @@ impl Station {
     /// step is best effort: a store that cannot be read, or a network that
     /// does not answer, leaves the password to be typed as always.
     fn auto_join_saved(&mut self) {
-        let saved = wificonf::load();
+        let saved = skyward_net::wificonf::load();
         let Some(s) = saved.iter().find(|s| s.joinable()) else {
             return;
         };
