@@ -53,8 +53,8 @@ fn downsample(src: &Canvas, w: u32, h: u32) -> Vec<Rgb> {
                     n += 1;
                 }
             }
-            if n > 0 {
-                out[(sy * w + sx) as usize] = [(r / n) as u8, (g / n) as u8, (b / n) as u8];
+            if let (Some(dr), Some(dg), Some(db)) = (r.checked_div(n), g.checked_div(n), b.checked_div(n)) {
+                out[(sy * w + sx) as usize] = [dr as u8, dg as u8, db as u8];
             }
         }
     }
