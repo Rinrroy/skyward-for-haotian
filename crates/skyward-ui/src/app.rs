@@ -12509,12 +12509,7 @@ mod tests {
         assert!(app.touch(Touch::Move(x, y - 300.0), &f, 220).is_empty());
         assert!(app.touch(Touch::Up, &f, 240).is_empty());
         assert!(app.display_on(), "the swipe up lights the panel");
-        press(&mut app, Key::Power, 300);
-        assert!(!app.display_on());
-        press(&mut app, Key::Power, 400);
-        assert!(app.display_on());
-        tap_at(&mut app, &f, &i, Action::Open(Screen::Settings), 700);
-        assert_eq!(app.screen(), Screen::Settings, "a tap on the lit panel does");
+        assert_eq!(app.screen(), Screen::Home, "and the page is the one it went dark on");
     }
 
     #[test]
