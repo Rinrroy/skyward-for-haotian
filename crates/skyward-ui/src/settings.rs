@@ -53,8 +53,7 @@ pub struct Settings {
     pub file_transfer: bool,
     /// A double tap on the dark panel lights it.
     pub double_tap: bool,
-    /// A dark panel keeps a clock on the glass in its own doze rather than
-    /// being put out.
+    /// A dark panel keeps a clock on the glass rather than being put out.
     pub always_on: bool,
     pub install: Install,
     pub backup: Backup,

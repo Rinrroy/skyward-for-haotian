@@ -410,9 +410,9 @@ pub fn settings(cx: &Ctx) -> Frame {
         Action::Toggle(Switch::DoubleTap),
     ]));
     let note = l.pick([
-        "息屏时钟让暗屏在面板低功耗状态下显示时间；双击亮屏需保持触控上电。两者都会略增待机耗电。",
-        "息屏時鐘讓暗屏在面板低功耗狀態下顯示時間；雙擊亮屏需保持觸控上電。兩者都會略增待機耗電。",
-        "The dark panel keeps a clock in its own low-power doze; double-tap keeps the touch controller awake. Both use a little standby power.",
+        "息屏时钟让熄屏时屏幕保持微亮并显示时间；双击亮屏需保持触控上电。两者都会略增待机耗电。",
+        "息屏時鐘讓熄屏時屏幕保持微亮並顯示時間；雙擊亮屏需保持觸控上電。兩者都會略增待機耗電。",
+        "The dark panel stays dimly lit and keeps a clock on it; double-tap keeps the touch controller awake. Both use a little standby power.",
     ]);
     y = widgets::footnote(&mut c, t, f, general.bottom, note);
     y = widgets::section(&mut c, t, f, y, "USB");

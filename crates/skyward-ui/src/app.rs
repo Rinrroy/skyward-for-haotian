@@ -580,7 +580,7 @@ pub enum Switch {
     LocalSend,
     /// Hear a double tap on the dark panel and light it.
     DoubleTap,
-    /// Keep a clock on the dark panel, in the panel's own doze.
+    /// Keep a clock on the dark panel.
     AlwaysOn,
     /// Show the password typed rather than a dot for each character.
     ShowPassword,
@@ -1761,12 +1761,8 @@ pub struct State {
     /// A double tap on the dark panel lights it. Keeping the touch
     /// controller awake costs some standby power, so this can be turned off.
     pub double_tap: bool,
-    /// A dark panel keeps a clock on the glass in its own doze rather than
-    /// being put out, on a phone whose display driver keeps one.
+    /// A dark panel keeps a clock on the glass rather than being put out.
     pub always_on: bool,
-    /// The display driver keeps a doze the panel can be put into; set once
-    /// the pages know the phone, and the switch is only offered with it.
-    pub panel_dozes: bool,
     /// The language was chosen on the language page, now or at an earlier
     /// start, where otherwise it is the one the system names.
     pub language_chosen: bool,
@@ -1989,7 +1985,6 @@ impl Default for State {
             lang: Lang::Hans,
             double_tap: true,
             always_on: true,
-            panel_dozes: false,
             language_chosen: false,
             dark: false,
             brightness: SLIDER_START,

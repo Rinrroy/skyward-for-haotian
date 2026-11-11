@@ -41,7 +41,6 @@ use skyward_ui::app::{
     Place, RenameRefused, Screen, Shot, Starter, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION,
     DOWNLOADS, INSTALL_UNFINISHED, USB_DRIVE, SkywardEnd, SkywardStage,
 };
-use skyward_ui::aod::{Shown, Want};
 use skyward_ui::settings::Keeper;
 use skyward_ui::surface::kms::KmsSurface;
 use skyward_ui::{Canvas, Fonts, Lang, Surface};
@@ -66,6 +65,11 @@ const LEAVE_AFTER_MS: u64 = 1500;
 /// How long after the screen starts a touch panel may still come up; with
 /// none by then, the pages are worked with the keys, their light shown.
 const TOUCH_WAIT: Duration = Duration::from_secs(5);
+
+/// The light a dark panel keeps, as a share of the brightness at the slider's
+/// top: enough for the face the frame holds to be read in a dark room, and
+/// no more.
+const AOD_LIGHT: f32 = 0.03;
 
 /// How long a panel gone dark rests, ready to light again at once, before
 /// the display turns off; the phone's own system keeps its panel dozing
@@ -1260,14 +1264,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // Whether the panel's frame memory has been blacked out for an off
     // panel; cleared once a real frame is shown again.
     let mut blanked = false;
-    // The panel's own doze, on a phone whose configuration names one: a dark
-    // panel then keeps a face on the glass rather than being put out.
-    let mut doze = cfg.aod.as_ref().map(crate::aod::Panel::new);
     // The clock the face was drawn for; drawn again as the minute turns.
     let mut faced = String::new();
-    // Whether the settings page offers the switch: a phone whose panel keeps
-    // a doze of its own.
-    app.state.panel_dozes = cfg.aod.is_some();
     // When the panel gone dark began to rest.
     let mut rested_at: Option<Instant> = None;
     // Started for fastboot, the port goes to the phone's own fastbootd. The
@@ -1588,26 +1586,17 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             port_at = Instant::now();
         }
         let panel = app.panel(now);
-        // Whether the phone's display driver keeps a doze the panel can be
-        // put into, and has not yet refused one.
-        let dozes = doze.as_ref().is_some_and(crate::aod::Panel::usable);
         // A double tap that lights a dark panel needs its touch controller
         // to keep reporting. Xiaomi's rests with the panel, so while the
         // gesture is offered a dark panel is left powered, showing a black
         // frame at zero backlight, and the phone is not let suspend.
         let keep_touch = app.double_tap_wake() && !app.display_on();
-        // A dark panel is kept in its own doze rather than taken down: with
-        // the face on when the switch says so, and dark otherwise so that a
-        // tap can still be felt.
-        let dozing_want = dozes && (app.state.always_on || keep_touch);
+        // A dark panel is kept powered rather than taken down: with the face
+        // on it when the switch says so, and dark otherwise so that a tap can
+        // still be felt.
+        let dozing_want = app.state.always_on || keep_touch;
         let mut shown = false;
         if panel.is_some() {
-            // Out of the panel's doze before the page goes over the face.
-            if blanked {
-                if let Some(p) = doze.as_mut() {
-                    p.want(Want::Lit);
-                }
-            }
             // A display turned off comes on again with a frame drawn for it.
             if app.take_dirty() || !surface.is_on() {
                 let t0 = Instant::now();
@@ -1621,9 +1610,11 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             }
             blanked = false;
         } else if dozing_want {
-            // The panel is put into its own doze rather than taken down, so
-            // the glass keeps what the frame holds: the face with the switch
-            // on, and nothing with it off, so a tap can still be felt.
+            // The panel keeps what the frame holds: the face with the switch
+            // on, and nothing with it off, so that a tap can still be felt.
+            // The frame is what glows, so the backlight is turned down rather
+            // than off -- a panel whose light is at zero gives nothing of the
+            // frame back, which is why the face is drawn on a lit panel.
             if !blanked {
                 faced.clear();
             }
@@ -1645,13 +1636,6 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 surface.present(&screen)?;
                 surface.settle()?;
             }
-            if !blanked && doze.as_mut().is_some_and(|p| p.want(Want::Dark) == Shown::Blank) {
-                // The driver would not take the panel into its doze: the
-                // glass is blacked out the ordinary way instead.
-                screen.data.fill(0);
-                surface.present(&screen)?;
-                surface.settle()?;
-            }
             blanked = true;
         } else if !blanked {
             // Black out the panel's frame memory before the backlight goes
@@ -1668,9 +1652,16 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         if backlight.level == 0 && panel.is_some() {
             surface.settle()?;
         }
-        backlight.show(panel)?;
-        // A panel kept in its own doze is neither rested nor turned off:
-        // either would take the glass, and the face with it, away.
+        // A dark panel with the face on it is turned down rather than off:
+        // a panel whose light is at zero gives nothing of the frame back.
+        let back = match panel {
+            Some(v) => Some(v),
+            None if dozing_want => Some(AOD_LIGHT),
+            None => None,
+        };
+        backlight.show(back)?;
+        // A panel that is kept lit is neither rested nor turned off: either
+        // would take the glass, and the face with it, away.
         let dozing = panel.is_none() && dozing_want;
         if panel.is_some() {
             // Lit, a panel that came on again switches to its fastest

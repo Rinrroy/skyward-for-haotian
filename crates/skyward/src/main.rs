@@ -42,8 +42,6 @@ mod updates;
 mod wipe;
 #[cfg(target_os = "android")]
 mod wlan;
-#[cfg(target_os = "android")]
-mod aod;
 
 #[derive(Parser)]
 #[command(name = "skyward", version, about = "Skyward recovery")]

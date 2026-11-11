@@ -413,13 +413,33 @@ impl Station {
     /// step is best effort: a store that cannot be read, or a network that
     /// does not answer, leaves the password to be typed as always.
     fn auto_join_saved(&mut self) {
+        if !skyward_net::wificonf::readable() {
+            let _ = skyward_sys::kmsg("the installed system's wifi store is not there to read");
+            return;
+        }
         let saved = skyward_net::wificonf::load();
+        if saved.is_empty() {
+            let _ = skyward_sys::kmsg("the installed system's wifi store names no network this reader knows");
+            return;
+        }
+        let names: Vec<String> = saved
+            .iter()
+            .map(|s| {
+                let name = String::from_utf8_lossy(&s.ssid).into_owned();
+                if s.psk.is_some() { name } else { format!("{name} (no password)") }
+            })
+            .collect();
+        let _ = skyward_sys::kmsg(&format!(
+            "the installed system remembers {} network(s): {}",
+            saved.len(),
+            names.join(", ")
+        ));
         let Some(s) = saved.iter().find(|s| s.joinable()) else {
+            let _ = skyward_sys::kmsg("none of them carries a password the recovery can use");
             return;
         };
         let _ = skyward_sys::kmsg(&format!(
-            "{} network(s) the installed system remembers; joining {}",
-            saved.len(),
+            "joining {} from the store",
             String::from_utf8_lossy(&s.ssid)
         ));
         let joined = Joined {

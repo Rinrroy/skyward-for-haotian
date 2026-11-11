@@ -262,16 +262,6 @@ optional = true
 # the settings from the vendor partition, the address from where the
 # vendor's link points in persist. wpa_supplicant runs on the recovery's
 # own libraries before the vendor partition's, as on the 17 Ultra.
-# The panel's own doze, kept by Xiaomi's mi_disp driver inside msm_drm: the
-# command set that puts the panel into it goes through the node the driver
-# lists, and whatever the pages' frame holds is what stays lit — the face the
-# AOD draws, and nothing else. A panel whose driver refuses the set is put out
-# the ordinary way.
-[aod]
-enter = [{ id = 3, value = "1" }]
-enter_cmds = [44]
-leave_cmds = [18]
-
 [wlan]
 modules = ["rfkill", "qca_cld3_kiwi_v2"]
 writes = [{ path = "/sys/kernel/cnss/fs_ready", value = "1" }]
