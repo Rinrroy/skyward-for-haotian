@@ -339,7 +339,7 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(digits.len() / 2);
-    for pair in digits.chunks_exact(2) {
+    for pair in digits.as_chunks::<2>().0 {
         let pair = std::str::from_utf8(pair).ok()?;
         out.push(u8::from_str_radix(pair, 16).ok()?);
     }
