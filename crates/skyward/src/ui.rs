@@ -1650,13 +1650,13 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             }
             if app.state.always_on {
                 if !blanked || faced != shown_clock {
-                    let facts = skyward_ui::aod::Facts {
-                        date: skyward_ui::fmt::date(app.state.lang, unix_now()?, app.state.time_zone),
-                        battery: info.battery.as_ref().map(|b| (b.level, b.plugged)),
-                        slot: info.slot.map(|s| s.letter().to_string()),
-                        data: skyward_ui::fmt::data(app.state.lang, &app.state.data).to_string(),
-                    };
-                    skyward_ui::aod::face(&mut screen, &fonts, &shown_clock, &facts, cfg.display.density as f32 / 160.0);
+                    // The face the phone's own always-on display shows: the
+                    // clock in one of three looks, the day under it, the
+                    // charge, and the word that says how to wake it. It
+                    // moves a little each minute, so no pixel of the panel
+                    // holds the light long enough to burn into it.
+                    app.state.aod_date = skyward_ui::fmt::date(app.state.lang, unix_now()?, app.state.time_zone);
+                    app.compose_aod(&mut screen, &fonts, &info, &shown_clock);
                     surface.present(&screen)?;
                     surface.settle()?;
                     faced.clone_from(&shown_clock);

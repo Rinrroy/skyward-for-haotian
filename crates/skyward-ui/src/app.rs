@@ -1214,6 +1214,15 @@ pub enum AodStyle {
 }
 
 impl AodStyle {
+    /// The name the style is known by, as the setting shows it.
+    pub fn name(self, l: Lang) -> &'static str {
+        match self {
+            AodStyle::Digits => l.pick(["数字", "數字", "Digits"]),
+            AodStyle::Offset => l.pick(["错位", "錯位", "Offset"]),
+            AodStyle::Dial => l.pick(["表盘", "錶盤", "Dial"]),
+        }
+    }
+
     /// The style after this one, as the setting is tapped.
     pub fn next(self) -> Self {
         match self {
@@ -1232,16 +1241,12 @@ const WAKE_SWIPE_DP: f32 = 64.0;
 
 /// Where the AOD sits, in dp from its usual place, one each minute in
 /// turn, so no pixel holds the light long enough to burn into the panel.
-#[expect(dead_code)]
 const AOD_SPOTS: [(f32, f32); 4] = [(0.0, 0.0), (5.0, -3.0), (0.0, 6.0), (-5.0, -3.0)];
 
 /// The AOD's inks on the black panel: the clock the brightest, the day
 /// and the charge left dimmer, the hint of how to leave it faintest.
-#[expect(dead_code)]
 const AOD_INK: Rgba = Rgba::rgb(0xC0, 0xC0, 0xC0);
-#[expect(dead_code)]
 const AOD_DIM: Rgba = Rgba::rgb(0x82, 0x82, 0x82);
-#[expect(dead_code)]
 const AOD_FAINT: Rgba = Rgba::rgb(0x52, 0x52, 0x52);
 
 /// How long changed settings wait after the last change before they are
@@ -5077,9 +5082,7 @@ impl App {
     /// hint of how to leave it, all dim on black, and all aside from where
     /// they were the minute before, so no pixel holds the light long
     /// enough to burn into the panel.
-    /// Waiting for the AOD to be wired into the panel loop.
-    #[expect(dead_code)]
-    fn compose_aod(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str) {
+    pub fn compose_aod(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str) {
         out.fill_rect(0.0, 0.0, out.w as f32, out.h as f32, Rgba::rgb(0, 0, 0));
         let t = self.theme();
         let m = t.m;
@@ -5125,8 +5128,6 @@ impl App {
     /// quarter hours named inside them, tapered hour and minute hands at
     /// the time `(hh, mm)` name, and the charge left as an arc of the
     /// battery's share just outside the ring.
-    /// Waiting for the AOD to be wired into the panel loop.
-    #[expect(dead_code)]
     fn aod_dial(&self, out: &mut Canvas, f: &Fonts, (cx, cy, r): (f32, f32, f32), clock: &str, level: Option<u8>) {
         let (hh, mm) = match clock.split_once(':').and_then(|(hh, mm)| hh.parse::<f32>().ok().zip(mm.parse::<f32>().ok())) {
             Some((hh, mm)) => (hh, mm),

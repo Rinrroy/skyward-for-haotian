@@ -454,7 +454,11 @@ impl Station {
             stage: Stage::Joining,
         };
         if let Err(e) = self.join(&joined, s.psk.as_deref().unwrap_or("")) {
-            let _ = skyward_sys::kmsg(&format!("joining {} from the store failed: {e:#}", joined.name));
+            let _ = skyward_sys::kmsg(&format!(
+                "joining {} from the store failed (a {}-character password): {e:#}",
+                joined.name,
+                s.psk.as_deref().map(|p| p.len()).unwrap_or(0)
+            ));
         }
     }
 
@@ -509,6 +513,21 @@ impl Station {
     }
 
     fn joining(&mut self, told: &Told) {
+        // What the supplicant says about the network it is joining: a
+        // wrong password, an access point that is not there, a refusal.
+        // The reason is said here and nowhere else, so it is said here.
+        match told {
+            Told::TemporarilyDisabled { reason } => {
+                let _ = skyward_sys::kmsg(&format!("the supplicant set the network aside: {reason}"));
+            }
+            Told::Rejected => {
+                let _ = skyward_sys::kmsg("the supplicant was turned away by the access point");
+            }
+            Told::NotFound => {
+                let _ = skyward_sys::kmsg("the supplicant did not find the network");
+            }
+            _ => {}
+        }
         let Some(j) = &mut self.state.joined else { return };
         match j.on(told) {
             Next::Show => {}

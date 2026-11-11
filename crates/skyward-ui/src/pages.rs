@@ -401,12 +401,14 @@ pub fn settings(cx: &Ctx) -> Frame {
         Row::new(l.pick(LANGUAGE)).icon(BLUE, Icon::Globe).trail(Trail::Value(l.name())),
         Row::new(l.pick(TIME_ZONE)).icon(ORANGE, Icon::Clock).trail(Trail::Value(l.pick(TIME_ZONES[s.time_zone].0))),
         Row::new(l.pick(["息屏时钟", "息屏時鐘", "Always-on clock"])).icon(PURPLE, Icon::Clock).trail(Trail::Switch(s.always_on)),
+        Row::new(l.pick(["时钟样式", "時鐘樣式", "Clock style"])).icon(PURPLE, Icon::Clock).trail(Trail::Value(s.aod_style.name(l))),
         Row::new(l.pick(["双击亮屏", "雙擊亮屏", "Double-tap to wake"])).icon(PURPLE, Icon::Power).trail(Trail::Switch(s.double_tap)),
     ]);
     out.extend(hits(&general.rows, &[
         Action::Open(Screen::Language),
         Action::Open(Screen::TimeZone),
         Action::Toggle(Switch::AlwaysOn),
+        Action::AodStyle,
         Action::Toggle(Switch::DoubleTap),
     ]));
     let note = l.pick([

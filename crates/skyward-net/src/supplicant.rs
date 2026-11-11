@@ -161,9 +161,13 @@ pub fn network_commands(id: u32, ssid: &[u8], security: Security, password: &str
         commands.push(set("scan_ssid", "1".into()));
     }
     let psk = || -> Result<String> {
-        ensure!((8..=63).contains(&password.len()), "a WPA2 password is 8 to 63 characters long");
-        ensure!(password.bytes().all(|b| (32..=126).contains(&b)), "a WPA2 password is printable ASCII");
-        Ok(format!("\"{password}\""))
+        // The supplicant reads the password as a quoted string, so a quote
+        // or a backslash in it has to be escaped, and a password the
+        // standard would not allow is the phone's business, not ours.
+        ensure!(!password.is_empty(), "a WPA password is not empty");
+        ensure!(password.len() <= 63, "a WPA password is at most 63 characters long");
+        let escaped = password.replace('\\', "\\\\").replace('"', "\\\"");
+        Ok(format!("\"{escaped}\""))
     };
     match security {
         Security::Open => commands.push(set("key_mgmt", "NONE".into())),
