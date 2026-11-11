@@ -603,7 +603,16 @@ fn open_user_files_behind(service: &KeyMint, user: u32, protector: &crate::user:
         (Bound::Weaver(slot), _) => {
             let binder = Binder::open()?;
             let weaver = Weaver::open(&binder)?;
-            let key = crate::user::weaver_key(&stretched, weaver.config()?.key_bytes)?;
+            // The service's own failure here is not the credential's doing:
+            // a phone whose weaver is a Thales secure element reaches the
+            // element through Android's OMAPI service, which a recovery does
+            // not run, so the weaver cannot answer at all. Said plainly, so
+            // that a refused password is not read into it.
+            let config = weaver.config().context(
+                "the phone's weaver cannot answer, so what guards this user's secret cannot be reached in a recovery; \
+                 this is not about the credential entered",
+            )?;
+            let key = crate::user::weaver_key(&stretched, config.key_bytes)?;
             let value = weaver.read(*slot, &key)?;
             (crate::user::weaver_protector_secret(&stretched, &value), None)
         }

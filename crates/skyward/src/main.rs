@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 
 mod avbkeep;
 #[cfg(target_os = "android")]
+mod aod;
+mod art;
+#[cfg(target_os = "android")]
 mod backup;
 #[cfg(target_os = "android")]
 mod decrypt;
@@ -24,6 +27,8 @@ mod partwork;
 mod pty;
 #[cfg(target_os = "android")]
 mod readings;
+#[cfg(target_os = "android")]
+mod remembered;
 #[cfg(target_os = "android")]
 mod relabel;
 #[cfg(target_os = "android")]
@@ -65,7 +70,7 @@ enum AvbAction {
 enum Cmd {
     /// Print what the About page shows, plus a partition summary.
     Info {
-        /// Device configuration, e.g. devices/nezha.toml.
+        /// Device configuration, e.g. devices/haotian.toml.
         #[arg(long)]
         config: String,
     },
@@ -849,6 +854,115 @@ const FIRMWARE_FALLBACK: &str = "/proc/sys/kernel/firmware_config/force_sysfs_fa
 #[cfg(target_os = "android")]
 const FIRMWARE_SHOWN: &str = "/firmware";
 
+/// Where the kernel shows the processors it can boot, one directory each.
+#[cfg(target_os = "android")]
+const REMOTEPROC: &str = "/sys/class/remoteproc";
+
+/// How long the DSP is given to say it is running before it is asked for
+/// again, and after.
+///
+/// Short on purpose. The kernel starts the DSP while the modules load, so a
+/// phone whose firmware it can read says running within a second.
+#[cfg(target_os = "android")]
+const ADSP_READY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long the DSP is given once the loader has been asked again.
+#[cfg(target_os = "android")]
+const ADSP_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The switch that has the phone's ADSP loader read the DSP's firmware and
+/// start it, which is what its own init writes as the modules come in.
+#[cfg(target_os = "android")]
+const ADSP_BOOT: &str = "/sys/kernel/boot_adsp/boot";
+
+/// Have the DSP started, or say why it is not.
+///
+/// The kernel reads the DSP's firmware while the modules are loading, and its
+/// search ends with `/firmware/image` - a folder the recovery makes by
+/// showing the modem partition there. On a phone whose `/vendor/firmware`
+/// carries only the first part of that firmware, the kernel takes what it
+/// finds there and stops at the first segment that is not: its own log reads
+/// "could not find firmware for adsp.b28 ... attempted /firmware/image/
+/// adsp.b28, open failed", and the DSP stays offline for the whole start.
+/// The rest of the firmware is on the modem partition. Nothing has to be
+/// copied for it: `/firmware` is in place by now, so asking the loader for
+/// another try is enough, and this is the switch its own init writes.
+///
+/// The switch is only written while the DSP is not running: written to one
+/// that is, it asks for a restart instead, and the SSR switch beside it takes
+/// the DSP down through rproc_shutdown, which blocks the writer in the ADSP
+/// driver's shutdown path until the DSP is gone. A phone whose DSP will not
+/// come up at all still shows its pages.
+#[cfg(target_os = "android")]
+fn wait_for_adsp() -> Result<()> {
+    if let Some(adsp) = adsp()? {
+        if waiting_for_running(&adsp, ADSP_READY)? {
+            return skyward_sys::kmsg(&format!("{} runs, so the secure element's HAL can reach it", adsp.display()));
+        }
+        // Offline: the kernel's own attempt did not have `/firmware` to look
+        // in. Ask now that it does. A phone without that switch is left as it
+        // is, and so is one whose firmware is missing outright - the loader
+        // says so in the kernel log and the moment below runs out.
+        match std::fs::write(ADSP_BOOT, "1") {
+            Ok(()) => skyward_sys::kmsg("the ADSP is offline; asked the loader again now that /firmware is in place")?,
+            Err(e) => skyward_sys::kmsg(&format!("the ADSP is offline and cannot be asked again: {e}"))?,
+        }
+        if waiting_for_running(&adsp, ADSP_RETRY)? {
+            return skyward_sys::kmsg(&format!("{} runs, so the secure element's HAL can reach it", adsp.display()));
+        }
+        return Err(anyhow!("it is not running, even after the loader was asked again"));
+    }
+    Err(anyhow!("the kernel shows no processor that is the DSP"))
+}
+
+/// Whether `adsp` says it is running within `within`.
+#[cfg(target_os = "android")]
+fn waiting_for_running(adsp: &Path, within: std::time::Duration) -> Result<bool> {
+    let asked = std::time::Instant::now();
+    loop {
+        if adsp_running(adsp)? {
+            return Ok(true);
+        }
+        if asked.elapsed() >= within {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// The processor the kernel names the ADSP, wherever its remoteproc number
+/// puts it: the number is not the same on every phone of this family.
+#[cfg(target_os = "android")]
+fn adsp() -> Result<Option<PathBuf>> {
+    let dirs = match std::fs::read_dir(REMOTEPROC) {
+        Ok(dirs) => dirs,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {REMOTEPROC}")),
+    };
+    for dir in dirs {
+        let dir = dir?;
+        let name = match std::fs::read_to_string(dir.path().join("name")) {
+            Ok(name) => name,
+            Err(_) => continue,
+        };
+        if name.trim().contains("adsp") {
+            return Ok(Some(dir.path()));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the kernel says the processor is running.
+#[cfg(target_os = "android")]
+fn adsp_running(adsp: &Path) -> Result<bool> {
+    let state = adsp.join("state");
+    match std::fs::read_to_string(&state) {
+        Ok(state) => Ok(state.trim() == "running"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("read {}", state.display())),
+    }
+}
+
 /// Mount the partition holding the firmware images where and as the
 /// phone's own table mounts it, which is where the loaders of the secure
 /// world's apps look for theirs, and show it where the recovery's ueventd
@@ -983,6 +1097,14 @@ fn recovery() -> Result<()> {
             // shared blocks, which writes to the slot's own.
             if !matches!(request.work, bcb::Work::Fastboot | bcb::Work::WipeAb { .. } | bcb::Work::UnshareBlocks) {
                 prepare(&cfg, booted_slot()?)?;
+                // A recovery flashed over the system leaves behind what ART
+                // compiled for the system that was there. Clearing it once per
+                // image makes the system compile its own again, which is what the
+                // phone then runs: on the older code it re-verifies and recompiles
+                // as it goes, and is slower and hotter for as long as that lasts.
+                // The key service the data partition opens with is up by now,
+                // since prepare brought it up.
+                art::clear_once(open_data_for_art);
             }
             let root = Path::new("/");
             ui::run(&cfg, &root.join(ramdisk::FONT), &root.join(ramdisk::MONO), request, Screen::Home, None)
@@ -995,6 +1117,19 @@ fn recovery() -> Result<()> {
     run().inspect_err(|e| {
         let _ = skyward_sys::kmsg(&format!("recovery failed: {e:#}"));
     })
+}
+
+/// Open the data partition as far as it opens with nothing a user knows,
+/// which is what clearing what ART compiled needs: none of it is a user's
+/// own file. The key service has to answer, which `prepare` has by now
+/// started; where it does not, the reason is what the caller says.
+#[cfg(target_os = "android")]
+fn open_data_for_art() -> Result<()> {
+    use skyward_crypto::data;
+    let binder = skyward_binder::driver::Binder::open()?;
+    let service = skyward_crypto::keymint::KeyMint::open(&binder)?;
+    data::open_without_credential(&service)?;
+    Ok(())
 }
 
 /// Map and mount the slot's partitions from super, then bring up what runs

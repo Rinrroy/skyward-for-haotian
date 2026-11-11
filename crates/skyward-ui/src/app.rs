@@ -24,6 +24,7 @@ use crate::tr;
 use crate::widgets::{self, Bar, Bolt, Cap, Layer, WlanMark};
 use serde::{Deserialize, Serialize};
 use skyward_info::DeviceInfo;
+use skyward_install::commands::avbctl;
 use skyward_install::{Event, ImageKind, Outcome, Reflash, Refusal, Stage};
 use skyward_net::download::{Failure, Progress};
 use skyward_net::localsend::{Phase as LocalSendPhase, Status as LocalSendStatus};
@@ -68,6 +69,9 @@ pub enum Screen {
     BackupJob,
     /// Tools for the experienced: files, a terminal, the logs.
     Advanced,
+    /// The AVB checks of the slot the phone runs from: what they are,
+    /// and turning them on or off.
+    Avb,
     Files,
     /// One file, and what can be done with it.
     FileInfo,
@@ -575,11 +579,18 @@ pub enum Switch {
     /// Write Skyward back into the recovery partitions an install writes
     /// over.
     KeepRecovery,
+    /// Turn both AVB checks off after a ROM is installed.
+    DisableAvb,
+    /// Remember the screen lock that opens the data partition.
+    RememberPassword,
     Wlan,
     /// Turn the LocalSend file transfer endpoint on or off.
     LocalSend,
+    /// Show the clock and the phone's readings on a dark panel, in the
+    /// panel's own doze, rather than putting the panel out.
+    AlwaysOn,
     /// Hear a double tap on the dark panel and light it.
-    DoubleTap,
+    DoubleTap,    DoubleTap,
     /// Show the password typed rather than a dot for each character.
     ShowPassword,
 }
@@ -874,6 +885,8 @@ impl Data {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Confirm {
+    /// Change an AVB check on the slot the phone runs from.
+    Avb,
     Reboot,
     Wipe,
     Flash,
@@ -1266,6 +1279,11 @@ pub const TIME_ZONES: [(Text, Text, &str); 9] = [
 /// What a control does when touched.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
+    /// Ask to turn one AVB check on or off; a second call on the same
+    /// check takes the request back.
+    AvbToggle(avbctl::Check),
+    /// Take back a request to change vbmeta.
+    CancelAvb,
     Open(Screen),
     /// Leave the decrypt page for the page it was opened from; the page
     /// the recovery started on, for the home page without keeping it
@@ -1273,6 +1291,10 @@ pub enum Action {
     Skip,
     /// Try opening the data partition again, after it did not open.
     OpenData,
+    /// Ask for `user`'s screen lock on the decrypt page, for a user whose
+    /// own files are still closed while the owner's are open: a second
+    /// space's, a cloned app's. The page then asks for it like any other.
+    UnlockUser(u32),
     Back,
     Theme { dark: bool },
     Toggle(Switch),
@@ -1754,6 +1776,15 @@ pub struct Queued {
 /// stands.
 #[derive(Clone, Debug, PartialEq)]
 pub struct State {
+    /// What the AVB page last read: none before its first read, and why
+    /// where it could not be read.
+    pub avb: Option<Result<avbctl::State, String>>,
+    /// A check the page was asked to change, with the state it was asked
+    /// to change it in: the write refuses unless that is still what the
+    /// slot holds.
+    pub avb_pending: Option<(avbctl::State, avbctl::Check, bool)>,
+    /// What the last write said, once it ended.
+    pub avb_notice: Option<String>,
     /// The language the pages speak.
     pub lang: Lang,
     /// A double tap on the dark panel lights it. Keeping the touch
@@ -1781,6 +1812,27 @@ pub struct State {
     pub vibration: f32,
     /// A computer connected over USB is offered internal storage.
     pub file_transfer: bool,
+    /// A dark panel keeps the clock and the phone's readings on the glass in
+    /// the panel's own doze, rather than being put out. A phone whose panel
+    /// has no doze of its own shows nothing either way, and the switch is
+    /// not offered on it. It starts off: a phone flashed and never visited
+    /// here puts a dark panel out the way the recovery always did, since a
+    /// face left glowing all night is a thing to ask for rather than to find.
+    pub always_on: bool,
+    /// This phone's panel has the two-tap wake at all, which the settings page
+    /// then offers a switch for: a panel whose touch controller stops
+    /// reporting fingers with the panel off has nothing for the gesture to
+    /// work with, and shows nothing either way.
+    pub panel_taps: bool,
+    /// Two taps on the dark panel light it again. It starts off, because a
+    /// phone that offers the gesture has to keep its panel dozing rather than
+    /// taking it down — the touchscreen is suspended with the panel's
+    /// blanking — and a dozing panel is a phone that never suspends. Least
+    /// power is what a recovery should do unless someone asks for more.
+    pub double_tap: bool,
+    /// This phone's panel has a doze of its own, which the settings page then
+    /// offers a switch for.
+    pub panel_dozes: bool,
     pub reboot: usize,
     /// What the wipe page has chosen, by place in [`WIPES`].
     pub wipe: [bool; WIPES.len()],
@@ -1824,6 +1876,19 @@ pub struct State {
     /// Skyward goes back into the recovery partitions an install writes
     /// over.
     pub keep_recovery: bool,
+    /// Turn both AVB checks off after a ROM is installed, so that a system
+    /// built without this phone's keys can start on a bootloader that
+    /// would otherwise refuse it. Off unless asked for: it is a change to
+    /// the signature the bootloader checks, not to what an install writes.
+    pub disable_avb: bool,
+    /// Remember the screen lock once it opens the data partition, and try
+    /// it by itself at the next start. Off unless asked for, because a
+    /// password kept on the phone is a password someone else may read.
+    pub remember_password: bool,
+    /// The last credential this phone accepted, where remembering is on.
+    /// Held so that the decrypt page can offer it, and dropped when it is
+    /// turned off or the phone forgets it.
+    pub remembered: Option<String>,
     /// How Skyward went back into the recovery partitions the install
     /// wrote over, where it did.
     pub reflash: Option<Reflash>,
@@ -1889,6 +1954,12 @@ pub struct State {
     /// lock its users' own files wait on.
     pub data: Data,
     pub code: String,
+    /// The users whose own files are still closed beyond the one the page
+    /// waits on: a second space's, a cloned app's. The owner's files open
+    /// first, and these do not hold the recovery; the decrypt page offers
+    /// each by name, and the file manager says so where a folder of one is
+    /// opened. Each with the control its screen lock is answered with.
+    pub others: Vec<(u32, Keys)>,
     /// What is typed in the search field.
     pub search: String,
     /// The on-screen keyboard's layer.
@@ -1978,7 +2049,9 @@ impl Default for State {
         State {
             aod_date: String::new(),
             aod_style: AodStyle::Digits,
-            lang: Lang::Hans,
+            avb: None,
+            avb_pending: None,
+            avb_notice: None,            lang: Lang::Hans,
             double_tap: true,
             language_chosen: false,
             dark: false,
@@ -1989,6 +2062,14 @@ impl Default for State {
             vibrate: true,
             vibration: SLIDER_START,
             file_transfer: true,
+            // Off, so a freshly flashed phone is put out as it always was and
+            // the face is turned on from the settings page.
+            always_on: false,
+            panel_taps: false,
+            // Off, so a phone flashed and never visited here puts its panel
+            // out and suspends, which is the least it can draw.
+            double_tap: false,
+            panel_dozes: false,
             reboot: 0,
             wipe: [false; WIPES.len()],
             cache_partition: false,
@@ -2007,6 +2088,9 @@ impl Default for State {
             check_signature: false,
             recovery_partitions: false,
             keep_recovery: true,
+            disable_avb: false,
+            remember_password: false,
+            remembered: None,
             reflash: None,
             mounts: Ok(Vec::new()),
             mount_failure: None,
@@ -2033,6 +2117,7 @@ impl Default for State {
             system_notice: None,
             data: Data::Closed,
             code: String::new(),
+            others: Vec::new(),
             search: String::new(),
             layer: Layer::Letters,
             held: None,
@@ -2165,6 +2250,37 @@ pub enum Touch {
     Up,
 }
 
+/// A tap on the dark panel, as the touchscreen reports it while nothing else
+/// is to be done with the finger: the phone's own system lights its screen
+/// on two of them, so the recovery does too.
+///
+/// A tap is not a touch: what is counted here is only what a finger does to
+/// a panel that is off, so the gesture that lights the panel works nothing
+/// on the page under it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tap {
+    /// Where the finger came down, in the same units as [`Touch`].
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Tap {
+    /// How long after a tap another may come and still be the second of a
+    /// double tap: Android's own window.
+    pub const WINDOW_MS: u64 = 300;
+    /// How far apart two taps of one double tap may land, as a share of the
+    /// screen's width: the slop the phone's own system uses. A tap is in
+    /// screen pixels, so this is measured against the width the pages are
+    /// laid out in.
+    pub const SLOP: f32 = 0.08;
+    /// Whether `other` lands near enough to be the second tap of one double
+    /// tap started by this, on a screen `w` pixels wide.
+    pub fn doubles(&self, other: &Tap, w: f32) -> bool {
+        let slop = Self::SLOP * w;
+        (other.x - self.x).abs() <= slop && (other.y - self.y).abs() <= slop
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
     Power,
@@ -2186,6 +2302,14 @@ pub enum Shot {
 /// Work the runtime carries out on the UI's behalf.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
+    /// Read the AVB checks of the slot the phone runs from, telling the
+    /// page with `App::avb_read`.
+    ReadAvb,
+    /// Change one AVB check, having confirmed that the slot still holds
+    /// what the page showed.
+    SetAvb { expected: avbctl::State, check: avbctl::Check, disabled: bool },
+    /// Remember the screen lock just typed, or forget the one remembered.
+    RememberPassword(Option<String>),
     Reboot(Target),
     /// A short tap of the vibration motor.
     Haptic,
@@ -2943,6 +3067,13 @@ pub struct App {
     /// When the panel last lit from dark, for the brief guard that keeps a
     /// stray touch or key from acting on a page just put up.
     woke_at: Option<u64>,
+    /// The last tap on a dark panel and when it came, for the second tap of
+    /// a double tap to find.
+    tapped: Option<(Tap, u64)>,
+    /// The switch last touched and how far it had turned when it was:
+    /// what a page reads to draw it on its way rather than already
+    /// there. One is enough, because a switch is turned by one touch at
+    /// a time and a page shows the page it was last touched on.
     /// The panel at full brightness, or easing to the dim level it takes
     /// shortly before going off.
     bright: Fade,
@@ -3057,6 +3188,7 @@ impl App {
             display_on: true,
             active: None,
             woke_at: None,
+            tapped: None,
             bright: full_brightness(),
             curtain: Fade::shown(BRIGHTEN, DARKEN),
             darkening: None,
@@ -3448,7 +3580,22 @@ impl App {
             self.curtain.set(true, now);
         }
         self.woke_at = Some(now);
+        self.tapped = None;
         self.stir(now);
+    }
+
+    /// A finger came down on the dark panel: the second of two taps that land
+    /// near each other, soon enough, lights it, as the phone's own double tap
+    /// does. One that comes later than the window is a tap of its own and
+    /// starts the count again.
+    fn tap(&mut self, now: u64, x: f32, y: f32) {
+        let tap = Tap { x, y };
+        let doubled =
+            self.tapped.filter(|(first, at)| now.saturating_sub(*at) <= Tap::WINDOW_MS && first.doubles(&tap, self.w as f32));
+        match doubled {
+            Some(_) => self.wake(now),
+            None => self.tapped = Some((tap, now)),
+        }
     }
 
     /// A charger or a computer was attached, `cable_in`, or taken away: the
@@ -3550,6 +3697,47 @@ impl App {
         self.dirty = true;
     }
 
+    /// The credential to try by itself at this start, where the owner's
+    /// files are still shut and one was kept for them: what the decrypt
+    /// page would have been asked for, taken without asking. `owner_shut`
+    /// says the phone's files did not open with nothing known, which is
+    /// the only case a credential is any use in.
+    pub fn auto_attempt(&self, owner_shut: bool) -> Option<String> {
+        if !self.state.remember_password || !owner_shut {
+            return None;
+        }
+        self.state.remembered.clone()
+    }
+
+    /// The kept credential was refused, so it is not the phone's any more:
+    /// a credential left behind after a password change would be tried and
+    /// refused at every start.
+    pub fn forget_password(&mut self) -> Vec<Effect> {
+        self.state.remembered = None;
+        vec![Effect::RememberPassword(None)]
+    }
+
+    /// A credential that opened the phone's files, to be written down
+    /// where the owner asked for it to be kept.
+    pub fn keep_password(&mut self, code: String) -> Vec<Effect> {
+        self.state.remembered = Some(code.clone());
+        vec![Effect::RememberPassword(Some(code))]
+    }
+
+    /// What an earlier start kept, for the decrypt page to offer.
+    pub fn remembered(&mut self, code: Option<String>) {
+        self.state.remembered = code;
+        self.refresh();
+    }
+
+    /// What the AVB page's read found, and what the write before it said.
+    pub fn avb_read(&mut self, state: Result<avbctl::State, String>, notice: Option<String>) {        self.state.avb = Some(state);
+        self.state.avb_pending = None;
+        self.state.avb_notice = notice;
+        self.state.confirm = 0.0;
+        self.refresh();
+    }
+
     /// The settings the pages show, as they are kept between starts.
     pub fn settings(&self) -> Settings {
         Settings::of(&self.state)
@@ -3596,14 +3784,18 @@ impl App {
         self.dirty = true;
     }
 
-    /// The data partition is open: every user's own files with it, or
-    /// those of `waiting`, the user and the control their screen lock is
-    /// answered with, still closed.
-    pub fn data_waiting(&mut self, waiting: Option<(u32, Keys)>) {
+    /// The data partition is open: the owner's own files with it, or
+    /// `waiting`, the user the page asks a screen lock for and the control
+    /// it is answered with, still closed. `others` are the users beyond it
+    /// whose own files are still closed, offered by name rather than asked
+    /// for: the owner came to open the owner's files, and a second space
+    /// does not hold the recovery at its prompt.
+    pub fn data_waiting(&mut self, waiting: Option<(u32, Keys)>, others: Vec<(u32, Keys)>) {
         self.state.data = match waiting {
             Some((user, keys)) => Data::Locked { user, keys, checking: false },
             None => Data::Open,
         };
+        self.state.others = others;
         self.state.code.clear();
         self.refresh();
     }
@@ -3902,6 +4094,16 @@ impl App {
         }
     }
 
+    /// The phone has a WLAN, and the recovery brings it up as it starts, as
+    /// the phone's own system does: the page shows the radio coming up
+    /// rather than a switch that is off, and how it goes comes back with
+    /// [`App::set_wlan`]. A WLAN that does not come up says why on its page
+    /// and in the kernel log, and the other pages are not held up by it.
+    pub fn start_wlan(&mut self) {
+        self.state.wlan = Some(Wlan { power: Power::Starting, ..Wlan::default() });
+        self.refresh();
+    }
+
     /// How the WLAN stands, as the runtime last told it.
     pub fn set_wlan(&mut self, w: Wlan) {
         if self.state.wlan.as_ref() == Some(&w) {
@@ -3949,7 +4151,11 @@ impl App {
             data: match self.state.data {
                 Data::Erased => None,
                 Data::Open => Some(true),
-                Data::Closed | Data::Opening | Data::Failed(_) | Data::Locked { .. } => Some(false),
+                // The owner is user 0: once the owner's own files are open
+                // the phone's storage reads, whatever a second space's user
+                // still waits on.
+                Data::Locked { user, .. } => Some(user != 0),
+                Data::Closed | Data::Opening | Data::Failed(_) => Some(false),
             },
             slot: info.slot.map(Slot::letter),
             temp: battery.and_then(|b| b.temp),
@@ -4491,7 +4697,14 @@ impl App {
             let screen = self.screen();
             for rows in std::mem::take(&mut self.stale) {
                 let band = Band { rows, cols: (0, self.cols) };
-                let cx = Ctx { t: &t, f, info, state: &self.state, term: self.term.as_ref(), band: Some(band) };
+                let cx = Ctx {
+                    t: &t,
+                    f,
+                    info,
+                    state: &self.state,
+                    term: self.term.as_ref(),
+                    band: Some(band),
+                };
                 let fresh = pages::render(screen, &cx);
                 let mut canvas = self.frame.take().expect("checked above").canvas;
                 assert_eq!(canvas.h, fresh.canvas.h, "a page drawn again in part is as tall as it was");
@@ -4504,7 +4717,14 @@ impl App {
             let screen = self.screen();
             let first = self.top().1.max(0.0) as u32;
             let band = Band { rows: (first, first + self.h), cols: (0, wide.min(self.w)) };
-            let cx = Ctx { t: &t, f, info, state: &self.state, term: self.term.as_ref(), band: Some(band) };
+            let cx = Ctx {
+                    t: &t,
+                    f,
+                    info,
+                    state: &self.state,
+                    term: self.term.as_ref(),
+                    band: Some(band),
+                };
             let mut frame = pages::render(screen, &cx);
             // A page drawn in part across holds its rows whole, the columns
             // of them drawn on as they are needed.
@@ -4569,7 +4789,14 @@ impl App {
         let held = frame.canvas.held();
         let t = self.theme();
         let band = Band { rows: (held.start, held.end), cols: (self.cols, wide) };
-        let cx = Ctx { t: &t, f, info, state: &self.state, term: self.term.as_ref(), band: Some(band) };
+        let cx = Ctx {
+                    t: &t,
+                    f,
+                    info,
+                    state: &self.state,
+                    term: self.term.as_ref(),
+                    band: Some(band),
+                };
         let part = pages::render(self.screen(), &cx).canvas;
         self.frame.as_mut().expect("drawn above").canvas.replace(&part);
         self.cols = wide;
@@ -4600,7 +4827,14 @@ impl App {
         let screen = self.screen();
         for rows in bands {
             let band = Band { rows, cols: (0, self.w) };
-            let cx = Ctx { t: &t, f, info, state: &self.state, term: self.term.as_ref(), band: Some(band) };
+            let cx = Ctx {
+                    t: &t,
+                    f,
+                    info,
+                    state: &self.state,
+                    term: self.term.as_ref(),
+                    band: Some(band),
+                };
             let part = pages::render(screen, &cx).canvas;
             self.frame.as_mut().expect("drawn above").canvas.join(&part);
         }
@@ -5619,6 +5853,29 @@ impl App {
                 _ => {}
             },
             Event::Reflashed(reflash) => self.state.reflash = Some(reflash),
+            Event::Avb(avb) => {
+                // What the install's own AVB step did, said where the install
+                // says how it went. A phone whose checks were left on because
+                // this failed is the one the owner has to know about.
+                let slot = avb.slot.map(|s| s.letter()).unwrap_or("?");
+                let said = match avb.done {
+                    Ok(None) => tr!(self.state.lang, "{slot} 槽的 AVB 校验本来就是关闭的", "{slot} 槽的 AVB 驗證本來就是關閉的", "The AVB checks of slot {slot} were already off"),
+                    Ok(Some(backup)) => tr!(
+                        self.state.lang,
+                        "{slot} 槽的 AVB 校验已关闭，重启后生效。原镜像备份：{backup}",
+                        "{slot} 槽的 AVB 驗證已停用，重新啟動後生效。原映像檔備份：{backup}",
+                        "The AVB checks of slot {slot} are off, from the next start. The image as it was is kept at {backup}"
+                    ),
+                    Err(why) => tr!(
+                        self.state.lang,
+                        "{slot} 槽的 AVB 校验没有改动：{why}",
+                        "{slot} 槽的 AVB 驗證沒有變更：{why}",
+                        "The AVB checks of slot {slot} were left as they were: {why}"
+                    ),
+                };
+                self.state.avb_notice = Some(said);
+                self.refresh();
+            }
             Event::Wipe | Event::Reboot(_) => unreachable!("the runtime carries out what rescue asks of it"),
             Event::Done(outcome) | Event::Finished(outcome) => {
                 let damage = match (&outcome, &*install) {
@@ -5713,6 +5970,14 @@ impl App {
             self.state.queue_picking = false;
         }
         match s {
+            Screen::Avb => {
+                // Read afresh each time it opens: a zip may have flashed a
+                // vbmeta image since the page was last looked at.
+                self.state.avb = None;
+                self.state.avb_pending = None;
+                self.state.avb_notice = None;
+                vec![Effect::ReadAvb]
+            }
             Screen::Mount => vec![Effect::ReadMounts],
             Screen::Filesystems => vec![Effect::ReadFilesystems],
             // The tools page says beside its row whether the checks are on,
@@ -5804,6 +6069,15 @@ impl App {
                 return Vec::new();
             }
             Action::OpenData => return self.open_data(),
+            // A user offered by name: the page asks for their screen lock,
+            // as it does for the owner's.
+            Action::UnlockUser(user) => {
+                if let Some((_, keys)) = self.state.others.iter().find(|(u, _)| *u == user).copied() {
+                    self.state.data = Data::Locked { user, keys, checking: false };
+                    self.state.code.clear();
+                    self.refresh();
+                }
+            }
             Action::Skip => {
                 self.leave(true);
                 if self.stack.len() > 1 {
@@ -5850,15 +6124,29 @@ impl App {
                     Switch::Verify => &mut self.state.verify,
                     Switch::Signature => &mut self.state.check_signature,
                     Switch::KeepRecovery => &mut self.state.keep_recovery,
+                    Switch::DisableAvb => &mut self.state.disable_avb,
+                    Switch::RememberPassword => &mut self.state.remember_password,
                     Switch::ShowPassword => &mut self.state.show_password,
+                    Switch::AlwaysOn => &mut self.state.always_on,
+                    Switch::DoubleTap => &mut self.state.double_tap,
                     Switch::Wlan => unreachable!("the WLAN switch is turned above"),
                     Switch::LocalSend => unreachable!("the LocalSend switch is turned above"),
                 };
                 *on = !*on;
                 let now_on = *on;
+                if switch == Switch::RememberPassword && !now_on {
+                    self.state.remembered = None;
+                }
                 self.refresh();
                 if switch == Switch::FileTransfer {
                     return vec![Effect::FileTransfer(now_on)];
+                }
+                // Turning remembering off has to take the sealed file away,
+                // not only the copy the pages hold: a credential left on the
+                // phone after the switch was turned off is the one thing the
+                // switch promises not to do.
+                if switch == Switch::RememberPassword && !now_on {
+                    return vec![Effect::RememberPassword(None)];
                 }
             }
             Action::MountToggle(i) => {
@@ -5889,6 +6177,27 @@ impl App {
                     }
                     (false, _) => self.state.wipe[k] = false,
                 }
+                self.refresh();
+            }
+            Action::AvbToggle(check) => {
+                // The request is only held here; it is written after the
+                // page's own swipe agrees to it, so that a stray touch on a
+                // row cannot change what the bootloader checks.
+                if let Some(Ok(state)) = self.state.avb.clone() {
+                    if state.unlocked {
+                        self.state.avb_pending = match &self.state.avb_pending {
+                            Some((_, pending, _)) if *pending == check => None,
+                            _ => Some((state.clone(), check, !state.disabled(check))),
+                        };
+                        self.state.avb_notice = None;
+                        self.state.confirm = 0.0;
+                        self.refresh();
+                    }
+                }
+            }
+            Action::CancelAvb => {
+                self.state.avb_pending = None;
+                self.state.confirm = 0.0;
                 self.refresh();
             }
             Action::Confirm(_) => self.say(l.pick(["请按住圆形按钮向右滑动", "請按住圓形按鈕向右滑動", "Hold the round button and slide it right"]), now),
@@ -7349,6 +7658,15 @@ impl App {
             Confirm::DeleteEntry => fx.push(Effect::Delete(self.entry_path())),
             // The partition has to be open; whether its users have unlocked
             // their own files makes no difference.
+            Confirm::Avb => {
+                // The write refuses unless the slot still holds what the page
+                // showed, and unless the bootloader is unlocked; both are
+                // checked again where the write is made.
+                match self.state.avb_pending.take() {
+                    Some((expected, check, disabled)) => fx.push(Effect::SetAvb { expected, check, disabled }),
+                    None => self.say(l.pick(["没有待确认的改动", "沒有待確認的變更", "There is no change to confirm"]), now),
+                }
+            }
             Confirm::Relabel => match self.state.data {
                 Data::Open | Data::Locked { .. } => fx.push(Effect::Relabel),
                 Data::Opening => self.say(l.pick(DATA_OPENING), now),
@@ -8203,27 +8521,40 @@ mod tests {
         };
         assert_eq!(lock(&mut app, Data::Locked { user: 0, keys: Keys::Digits, checking: false }), Some(false), "shut while its files are out of reach");
         assert_eq!(lock(&mut app, Data::Open), Some(true));
+        assert_eq!(
+            lock(&mut app, Data::Locked { user: 999, keys: Keys::Digits, checking: false }),
+            Some(true),
+            "the owner's files are open behind a second space's lock"
+        );
         assert_eq!(lock(&mut app, Data::Erased), None, "nothing to open once wiped");
         let none = app.bar("12:00", &info());
         assert_eq!((none.slot, none.temp), (None, None), "a phone without slots or a fuel gauge");
     }
 
-    /// A screen the home page's rows fit on with a little room to spare.
-    const SNUG: u32 = 3000;
+    /// A screen as tall as the home page's rows need, with a little room to
+    /// spare. Measured from the page rather than written down, so that a row
+    /// added to the page moves it with them.
+    fn snug(f: &Fonts, i: &DeviceInfo) -> u32 {
+        let mut app = App::new(Screen::Home, W, H * 2, PPD);
+        let fr = app.frame(f, i);
+        let last = fr.hits.iter().map(|h| h.rect.y + h.rect.h).fold(0.0f32, f32::max);
+        (last + 8.0).ceil() as u32
+    }
 
     #[test]
     fn a_home_page_grown_by_an_update_notice_scrolls_down_to_its_last_row() {
         let f = fonts();
         let plain = info();
-        let mut app = App::new(Screen::Home, W, SNUG, PPD);
+        let snug = snug(&f, &plain);
+        let mut app = App::new(Screen::Home, W, snug, PPD);
         let fr = app.frame(&f, &plain);
         let reboot = fr.hits.iter().find(|h| h.action == Action::Open(Screen::Reboot)).expect("a reboot row").rect;
-        assert!(reboot.y + reboot.h <= SNUG as f32, "without the notice the rows fit the screen");
+        assert!(reboot.y + reboot.h <= snug as f32, "without the notice the rows fit the screen");
         let i = DeviceInfo { snapshot: SnapshotState::Snapshotted, ..info() };
-        let mut app = App::new(Screen::Home, W, SNUG, PPD);
+        let mut app = App::new(Screen::Home, W, snug, PPD);
         let fr = app.frame(&f, &i);
         let reboot = fr.hits.iter().find(|h| h.action == Action::Open(Screen::Reboot)).expect("a reboot row").rect;
-        assert!(reboot.y + reboot.h > SNUG as f32, "the notice pushes the last row below the screen");
+        assert!(reboot.y + reboot.h > snug as f32, "the notice pushes the last row below the screen");
         assert!(reboot.y + reboot.h <= fr.canvas.h as f32, "the page is drawn down to it");
         app.touch(Touch::Down(700.0, 2800.0), &f, 0);
         app.touch(Touch::Move(700.0, 2000.0), &f, 0);
@@ -8233,7 +8564,7 @@ mod tests {
             app.tick(ms);
         }
         let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::Reboot));
-        assert!(y < SNUG as f32, "scrolled up into view");
+        assert!(y < snug as f32, "scrolled up into view");
         tap_at(&mut app, &f, &i, Action::Open(Screen::Reboot), 3000);
         assert_eq!(app.screen(), Screen::Reboot);
     }
@@ -8925,6 +9256,114 @@ mod tests {
     }
 
     #[test]
+    fn the_always_on_switch_shows_only_on_a_panel_that_dozes_and_turns_it() {
+        let (f, i) = (fonts(), info());
+        let offered = |app: &mut App| app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Toggle(Switch::AlwaysOn));
+        let mut app = App::new(Screen::Settings, W, H, PPD);
+        assert!(!offered(&mut app), "a panel with no doze of its own has nothing to keep on the glass");
+        // A phone whose panel does doze offers the switch, and a start that
+        // has not been to the page yet has it off: the face is asked for.
+        app.state.panel_dozes = true;
+        app.refresh();
+        assert!(offered(&mut app), "the switch is among the page's controls");
+        assert!(!app.state.always_on, "the face is off until it is turned on");
+        // The switch is worked the way any other on the page is.
+        app.act(Action::Toggle(Switch::AlwaysOn), 1000);
+        assert!(app.state.always_on, "the switch turns it on");
+        app.act(Action::Toggle(Switch::AlwaysOn), 2000);
+        assert!(!app.state.always_on, "and off again");
+    }
+
+    #[test]
+    fn the_avb_page_reads_before_it_shows_and_only_writes_after_the_swipe() {
+        use skyward_install::commands::avbctl;
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Advanced, W, H, PPD);
+        // Opening it reads the slot afresh, because a zip may have flashed a
+        // vbmeta image since the page was last looked at. Worked through
+        // `act` rather than a touch: what it does is the question here, not
+        // where the row is drawn.
+        assert_eq!(app.act(Action::Open(Screen::Avb), 0), vec![Effect::ReadAvb]);
+        let state = avbctl::State { suffix: "_a".into(), flags: 0, unlocked: true, digest: [0; 32] };
+        app.avb_read(Ok(state.clone()), None);
+        // A touch on a row only holds the request: nothing is written until
+        // the page's own swipe agrees to it.
+        let saved = app.settings();
+        assert!(app.act(Action::AvbToggle(avbctl::Check::Verification), 1000).is_empty());
+        assert_eq!(app.settings(), saved, "a pending change is not a saved setting");
+        assert_eq!(app.state.avb, Some(Ok(state.clone())), "and does not claim a disk change");
+        assert_eq!(app.state.avb_pending, Some((state.clone(), avbctl::Check::Verification, true)));
+        app.act(Action::CancelAvb, 2000);
+        assert!(app.state.avb_pending.is_none(), "the request can be taken back");
+        app.act(Action::AvbToggle(avbctl::Check::Verification), 3000);
+        // The page has to draw the swipe before it can be worked, and it is
+        // the swipe that writes.
+        app.frame(&f, &i);
+        assert_eq!(
+            swipe(&mut app, &f, &i, Confirm::Avb),
+            vec![Effect::SetAvb { expected: state, check: avbctl::Check::Verification, disabled: true }]
+        );
+        assert!(app.state.avb_pending.is_none(), "and the request is spent");
+    }
+
+    #[test]
+    fn an_avb_state_that_could_not_be_read_or_is_locked_offers_no_write() {
+        use skyward_install::commands::avbctl;
+        let locked = avbctl::State { suffix: "_a".into(), flags: 0, unlocked: false, digest: [0; 32] };
+        for unreadable in [Err("cannot read vbmeta".to_string()), Ok(locked)] {
+            let mut app = App::new(Screen::Avb, W, H, PPD);
+            app.avb_read(unreadable, None);
+            app.act(Action::AvbToggle(avbctl::Check::Verity), 1000);
+            assert!(app.state.avb_pending.is_none(), "a state the page cannot act on reaches no write");
+            app.act(Action::Confirm(Confirm::Avb), 2000);
+            assert!(app.state.avb_pending.is_none());
+        }
+    }
+
+    #[test]
+    fn installing_a_rom_honours_the_avb_switch_and_it_is_saved() {
+        let mut app = App::new(Screen::Install, W, H, PPD);
+        assert!(!app.state.disable_avb, "a ROM is installed without turning the checks off");
+        assert!(app.act(Action::Toggle(Switch::DisableAvb), 1000).is_empty());
+        assert!(app.state.disable_avb);
+        let saved = crate::settings::Settings::of(&app.state);
+        let mut next = State::default();
+        saved.apply(&mut next);
+        assert!(next.disable_avb, "and the choice is kept for the next start");
+    }
+
+    #[test]
+    fn turning_remembering_off_forgets_the_credential_it_held() {
+        let mut app = App::new(Screen::Settings, W, H, PPD);
+        app.state.remember_password = true;
+        app.state.remembered = Some("1234".into());
+        // Off: what was held is dropped, and the runtime is told to take the
+        // sealed file away with it.
+        assert_eq!(app.act(Action::Toggle(Switch::RememberPassword), 1000), vec![Effect::RememberPassword(None)]);
+        assert!(app.state.remembered.is_none(), "the credential goes with the switch");
+        assert!(!app.state.remember_password);
+    }
+    #[test]
+    fn the_two_tap_switch_shows_only_where_the_panel_offers_it_and_starts_off() {
+        let (f, i) = (fonts(), info());
+        let offered = |app: &mut App| app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Toggle(Switch::DoubleTap));
+        let mut app = App::new(Screen::Settings, W, H, PPD);
+        assert!(!offered(&mut app), "no panel reports fingers with it dark, so there is nothing to offer");
+        // A phone whose panel can doze and whose driver keeps reporting offers
+        // the switch, and a start that has not been to the page yet has it
+        // off: the gesture costs the phone its suspend, so it is asked for.
+        app.state.panel_taps = true;
+        app.refresh();
+        assert!(offered(&mut app), "the switch is among the page's controls");
+        assert!(!app.state.double_tap, "the two-tap wake is off until it is turned on");
+        // The switch is worked the way any other on the page is.
+        app.act(Action::Toggle(Switch::DoubleTap), 1000);
+        assert!(app.state.double_tap, "the switch turns it on");
+        app.act(Action::Toggle(Switch::DoubleTap), 2000);
+        assert!(!app.state.double_tap, "and off again");
+    }
+
+    #[test]
     fn scrolling_back_down_past_the_top_pulls_from_the_top() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Settings, W, H, PPD);
@@ -9532,16 +9971,17 @@ mod tests {
     #[test]
     fn the_keys_reach_the_last_row_of_a_home_page_grown_by_an_update_notice() {
         let f = fonts();
+        let snug = snug(&f, &info());
         let i = DeviceInfo { snapshot: SnapshotState::Snapshotted, ..info() };
-        let mut app = App::new(Screen::Home, W, SNUG, PPD);
+        let mut app = App::new(Screen::Home, W, snug, PPD);
         let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::Reboot));
-        assert!(y > SNUG as f32, "below the screen to start with");
+        assert!(y > snug as f32, "below the screen to start with");
         light_on(&mut app, &f, &i, Stop::Hit(Action::Open(Screen::Reboot)));
         for ms in (0..3000).step_by(8) {
             app.tick(ms);
         }
         let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::Reboot));
-        assert!(y < SNUG as f32, "the page scrolled the lit row into view");
+        assert!(y < snug as f32, "the page scrolled the lit row into view");
         press(&mut app, Key::Power, 3000);
         assert_eq!(app.screen(), Screen::Reboot);
     }
@@ -9752,7 +10192,7 @@ mod tests {
     fn the_keys_join_a_patterns_dots_and_end_it_on_the_last_one_joined() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Decrypt, W, H, PPD);
-        app.data_waiting(Some((0, Keys::Pattern)));
+        app.data_waiting(Some((0, Keys::Pattern)), Vec::new());
         app.frame(&f, &i);
         press(&mut app, Key::VolumeDown, 0);
         assert_eq!(lit(&mut app, &f, &i), Some(Stop::Dot(0)), "the grid's first dot is lit first");
@@ -9788,7 +10228,7 @@ mod tests {
     fn the_keys_type_a_screen_locks_code_on_its_keypad() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Decrypt, W, H, PPD);
-        app.data_waiting(Some((0, Keys::Digits)));
+        app.data_waiting(Some((0, Keys::Digits)), Vec::new());
         app.frame(&f, &i);
         for ch in ['2', '5', '8', '0'] {
             light_on(&mut app, &f, &i, Stop::Hit(Action::Type(Cap::Char(ch))));
@@ -10060,7 +10500,7 @@ mod tests {
     fn a_zip_runs_its_install_script_once_agreed_to_and_shows_what_it_says() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Install, &f, &i);
-        app.data_waiting(None);
+        app.data_waiting(None, Vec::new());
         tap(&mut app, &f, &i, Action::Open(Screen::Choose(Place::Storage)));
         app.set_place(Place::Storage, String::new(), Ok(vec![entry("rom.zip", FileKind::File)]), LISTED);
         assert_eq!(tap(&mut app, &f, &i, Action::ChooseEntry(0)), vec![Effect::InstallFile(Place::Storage, "rom.zip".into())]);
@@ -10241,14 +10681,21 @@ mod tests {
     #[test]
     fn every_unfinished_entry_now_opens_its_page() {
         let (f, i) = (fonts(), DeviceInfo { slot: Some(Slot::B), ..info() });
-        let routes: [(Screen, Screen); 13] = [
+        let routes: [(Screen, Screen); 17] = [
             (Screen::Home, Screen::Search),
             (Screen::Home, Screen::Backup),
             (Screen::Home, Screen::Restore),
             (Screen::Home, Screen::Advanced),
+            // Every row the Advanced page draws, which is the page whose last
+            // row was once drawn and given no action: it was there to touch
+            // and did nothing.
             (Screen::Advanced, Screen::Files),
             (Screen::Advanced, Screen::Terminal),
+            (Screen::Advanced, Screen::Relabel),
+            (Screen::Advanced, Screen::Filesystems),
             (Screen::Advanced, Screen::Logs),
+            (Screen::Advanced, Screen::Update),
+            (Screen::Advanced, Screen::Avb),
             (Screen::Settings, Screen::Language),
             (Screen::Settings, Screen::TimeZone),
             (Screen::Settings, Screen::Terminal),
@@ -10277,7 +10724,7 @@ mod tests {
         assert!(tap(&mut app, &f, &i, Action::ExportLogs).is_empty(), "internal storage waits for the data partition");
         app.tick(1000);
         assert_eq!(app.deadline(1000), Some(TOAST_MS), "and says so");
-        app.data_waiting(None);
+        app.data_waiting(None, Vec::new());
         assert_eq!(tap(&mut app, &f, &i, Action::ExportLogs), vec![Effect::ExportLogs { recovery: false, kernel: true, storage: true }]);
         tap(&mut app, &f, &i, Action::LogPart(1));
         assert!(tap(&mut app, &f, &i, Action::ExportLogs).is_empty(), "nothing ticked, nothing saved");
@@ -10441,7 +10888,7 @@ mod tests {
     fn backing_up_shows_how_far_it_has_come_and_stops_when_asked() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Backup, &f, &i);
-        app.data_waiting(None);
+        app.data_waiting(None, Vec::new());
         app.backup_started(false, Place::Storage, true);
         assert_eq!(app.screen(), Screen::BackupJob);
         app.key(Key::Back, 0);
@@ -10658,9 +11105,9 @@ mod tests {
         assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Decrypt)), vec![Effect::OpenData], "no swipe first");
         assert_eq!(app.state.data, Data::Opening);
         assert!(!keys_shown(&mut app, &f, &i) && app.frame(&f, &i).pattern.is_none(), "nothing to answer yet");
-        app.data_waiting(Some((0, Keys::Pattern)));
+        app.data_waiting(Some((0, Keys::Pattern)), Vec::new());
         assert!(app.frame(&f, &i).pattern.is_some(), "the owner set a pattern, so the grid shows");
-        app.data_waiting(Some((0, Keys::Digits)));
+        app.data_waiting(Some((0, Keys::Digits)), Vec::new());
         assert!(keys_shown(&mut app, &f, &i), "for a code, the keypad");
         app.key(Key::Back, 0);
         assert!(tap(&mut app, &f, &i, Action::Open(Screen::Decrypt)).is_empty(), "open already, it is not opened again");
@@ -10684,7 +11131,7 @@ mod tests {
     fn the_code_typed_on_the_keypad_is_sent_once_and_checked_before_more_is_taken() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Decrypt, W, H, PPD);
-        app.data_waiting(Some((0, Keys::Digits)));
+        app.data_waiting(Some((0, Keys::Digits)), Vec::new());
         for ch in "1234".chars() {
             tap(&mut app, &f, &i, Action::Type(Cap::Char(ch)));
         }
@@ -10699,7 +11146,7 @@ mod tests {
         app.unlock_failed("the secure world does not recognise that credential".into(), 0);
         assert!(keys_shown(&mut app, &f, &i), "turned down, it is asked for again");
         assert_eq!(app.deadline(0), Some(TOAST_MS), "with why");
-        app.data_waiting(None);
+        app.data_waiting(None, Vec::new());
         assert_eq!(app.state.data, Data::Open);
     }
 
@@ -10716,7 +11163,7 @@ mod tests {
     fn a_pattern_is_sent_as_the_numbers_of_the_dots_it_joins() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Decrypt, W, H, PPD);
-        app.data_waiting(Some((0, Keys::Pattern)));
+        app.data_waiting(Some((0, Keys::Pattern)), Vec::new());
         let (cx, cy, span) = app.frame(&f, &i).pattern.expect("the grid is on the page");
         let dots = widgets::pattern_dots(cx, cy, span);
         let scroll = app.top().1;
@@ -10756,7 +11203,7 @@ mod tests {
     fn a_pattern_too_short_to_be_one_is_not_sent() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Decrypt, W, H, PPD);
-        app.data_waiting(Some((0, Keys::Pattern)));
+        app.data_waiting(Some((0, Keys::Pattern)), Vec::new());
         let (cx, cy, span) = app.frame(&f, &i).pattern.expect("the grid is on the page");
         let dots = widgets::pattern_dots(cx, cy, span);
         let scroll = app.top().1;
@@ -10979,7 +11426,7 @@ mod tests {
         let mut app = opened(Screen::Install, &f, &i);
         // Closed, the storage leads to the decrypt page, which comes back.
         assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Decrypt)), vec![Effect::OpenData]);
-        app.data_waiting(None);
+        app.data_waiting(None, Vec::new());
         tap(&mut app, &f, &i, Action::Skip);
         assert_eq!(app.screen(), Screen::Install);
         let storage = Screen::Choose(Place::Storage);
@@ -11043,7 +11490,7 @@ mod tests {
     fn a_file_waits_for_the_install_before_it_to_end() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Install, &f, &i);
-        app.data_waiting(None);
+        app.data_waiting(None, Vec::new());
         tap(&mut app, &f, &i, Action::Open(Screen::Choose(Place::Storage)));
         app.set_place(Place::Storage, String::new(), Ok(vec![entry("ota.zip", FileKind::File)]), LISTED);
         app.state.install = Install::Ending;
@@ -12252,7 +12699,7 @@ mod tests {
         // Without a tap of the motor where the settings turn it off, and into
         // the gallery once internal storage is open.
         app.state.vibrate = false;
-        app.data_waiting(None);
+        app.data_waiting(None, Vec::new());
         app.key(Key::Power, 3000);
         assert_eq!(app.key(Key::VolumeDown, 3010), vec![Effect::Screenshot { storage: true }]);
     }
@@ -12471,16 +12918,73 @@ mod tests {
         let mut app = App::new(Screen::Home, W, H, PPD);
         let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
         press(&mut app, Key::Power, 0);
+        // One tap alone is not the second of a double tap, so the panel stays
+        // dark and the page under it is not worked.
         assert!(app.touch(Touch::Down(x, y), &f, 100).is_empty());
         assert!(app.touch(Touch::Move(x, y - 300.0), &f, 120).is_empty());
         assert!(app.touch(Touch::Up, &f, 140).is_empty());
         assert!(!app.display_on(), "the panel stays dark");
         assert_eq!(app.screen(), Screen::Home, "the tap pressed nothing");
         assert_eq!(app.top().1, 0.0, "nor scrolled the page");
-        press(&mut app, Key::Power, 200);
+        // A tap far from the first is a tap of its own.
+        assert!(app.touch(Touch::Down(x + W as f32 * 0.5, y), &f, 200).is_empty());
+        assert!(app.touch(Touch::Up, &f, 220).is_empty());
+        assert!(!app.display_on(), "a tap elsewhere is not the second of a double tap");
+        press(&mut app, Key::Power, 400);
         assert!(app.display_on());
-        tap_at(&mut app, &f, &i, Action::Open(Screen::Settings), 700);
+        // Past the guard that keeps a stray touch just after the panel lit
+        // from acting, the same tap works the page.
+        tap_at(&mut app, &f, &i, Action::Open(Screen::Settings), 400 + WAKE_GUARD_MS + 10);
         assert_eq!(app.screen(), Screen::Settings, "a tap on the lit panel does");
+    }
+
+    /// Two taps on the dark panel light it, as the phone's own system's double
+    /// tap does, and neither tap works the page: they are one gesture that
+    /// lights the panel.
+    #[test]
+    fn two_taps_on_the_dark_panel_light_it() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
+        press(&mut app, Key::Power, 0);
+        for (at, lit) in [(100, false), (200, true)] {
+            app.touch(Touch::Down(x, y), &f, at);
+            app.touch(Touch::Up, &f, at + 20);
+            assert_eq!(app.display_on(), lit, "after the tap at {at} ms");
+        }
+        assert_eq!(app.screen(), Screen::Home, "the taps pressed nothing: they lit the panel");
+        assert_eq!(app.panel(320), Some(SLIDER_START), "and the panel comes up at full brightness");
+        // The next tap, past the guard that keeps a touch just after the panel
+        // lit from acting, works the page.
+        let after = 200 + WAKE_GUARD_MS + 10;
+        app.touch(Touch::Down(x, y), &f, after);
+        app.touch(Touch::Up, &f, after + 20);
+        assert_eq!(app.screen(), Screen::Settings);
+    }
+
+    /// The two taps of one double tap are close together on the glass and
+    /// inside Android's own window; anything else is a tap of its own, and the
+    /// panel stays dark.
+    #[test]
+    fn taps_too_far_apart_or_too_late_do_not_light_the_panel() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
+        press(&mut app, Key::Power, 0);
+        // Too late: the window the first tap opened has gone by.
+        app.touch(Touch::Down(x, y), &f, 100);
+        app.touch(Touch::Up, &f, 120);
+        app.touch(Touch::Down(x, y), &f, 100 + Tap::WINDOW_MS + 50);
+        app.touch(Touch::Up, &f, 100 + Tap::WINDOW_MS + 70);
+        assert!(!app.display_on(), "a tap past the window starts a count of its own");
+        // Too far: the tap after it lands elsewhere on the glass.
+        let far = W as f32 * (Tap::SLOP + 0.05);        app.touch(Touch::Down(x + far, y), &f, 100 + Tap::WINDOW_MS + 100);
+        app.touch(Touch::Up, &f, 100 + Tap::WINDOW_MS + 120);
+        assert!(!app.display_on(), "a tap far from the last is not its pair");
+        // The two that are both soon and close do light it.
+        app.touch(Touch::Down(x + far, y), &f, 100 + Tap::WINDOW_MS + 150);
+        app.touch(Touch::Up, &f, 100 + Tap::WINDOW_MS + 170);
+        assert!(app.display_on());
     }
 
     #[test]

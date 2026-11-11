@@ -6,6 +6,7 @@ pub mod http;
 #[cfg(target_os = "android")]
 pub mod iface;
 pub mod localsend;
+pub mod wificonf;
 pub mod reach;
 pub mod release;
 pub mod supplicant;

@@ -289,7 +289,10 @@ impl Station {
 
     fn command(&mut self, c: Command) {
         match c {
-            Command::On => self.on(),
+            Command::On => {
+                self.on();
+                self.auto_join_saved();
+            }
             Command::Off => self.off(),
             Command::Scan => {
                 if let Some(r) = &self.running {
@@ -391,6 +394,33 @@ impl Station {
         let _ = skyward_sys::kmsg(&format!("the WLAN went away: {e:#}"));
         self.off();
         self.state.power = Power::Failed(format!("{e:#}"));
+    }
+
+    /// Join the first network the installed system remembers, without the
+    /// password being typed: its store is read once the data stands
+    /// decrypted, and the first network that can be joined goes first, as
+    /// the store lists them -- the one the phone was last on leads. Every
+    /// step is best effort: a store that cannot be read, or a network that
+    /// does not answer, leaves the password to be typed as always.
+    fn auto_join_saved(&mut self) {
+        let saved = wificonf::load();
+        let Some(s) = saved.iter().find(|s| s.joinable()) else {
+            return;
+        };
+        let _ = skyward_sys::kmsg(&format!(
+            "{} network(s) the installed system remembers; joining {}",
+            saved.len(),
+            String::from_utf8_lossy(&s.ssid)
+        ));
+        let joined = Joined {
+            ssid: s.ssid.clone(),
+            name: String::from_utf8_lossy(&s.ssid).into_owned(),
+            security: s.security,
+            stage: Stage::Joining,
+        };
+        if let Err(e) = self.join(&joined, s.psk.as_deref().unwrap_or("")) {
+            let _ = skyward_sys::kmsg(&format!("joining {} from the store failed: {e:#}", joined.name));
+        }
     }
 
     fn join(&self, joined: &Joined, password: &str) -> Result<()> {
