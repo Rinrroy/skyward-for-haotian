@@ -26,9 +26,11 @@ use skyward_net::download::{Failure, Progress};
 use skyward_net::github::{Build, Newest};
 use skyward_net::release::{Release, Unanswered};
 use skyward_net::supplicant::Security;
+pub use skyward_net::supplicant::SavedNetwork;
 use skyward_net::wlan::{Joined, Network, Power, Stage as Joining, Traffic, Wlan};
 use skyward_systems::{Overview, Who};
 use skyward_vab::{BootSlots, Hold, Slot, SnapshotState, Standing};
+pub use skyward_vab::vbmeta::Rollback;
 
 /// The pages of the recovery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +141,14 @@ pub enum Screen {
     /// A network added by hand: its name, how it is protected and its
     /// password, typed on the screen's keyboard.
     WlanAdd,
+    /// Turning the phone off, and what that means: the swipe that does it.
+    PowerOff,
+    /// The plugins installed, as much of them as the recovery reads now:
+    /// what one is, where they go, and what was found.
+    Plugins,
+    /// The vbmeta image of the slot the phone runs from: the copies kept of
+    /// it, making one, and putting one back.
+    Vbmeta,
 }
 
 /// How far asking the update server for the newest system has come.
@@ -235,6 +245,11 @@ pub enum SkywardEnd {
 /// Where the full packages downloaded go, from the top of internal
 /// storage: the folder the stock updater keeps them in.
 pub const DOWNLOADS: &str = "downloaded_rom";
+
+/// Where a plugin's folder is looked for, from the top of internal storage:
+/// beside the backups the recovery writes, so that what a person puts on the
+/// phone and what the recovery keeps are found in one place.
+pub const PLUGIN_FOLDER: &str = "Skyward/plugins";
 
 /// Where the USB drive plugged in is shown.
 pub const USB_DRIVE: &str = "/mnt/usb";
@@ -573,6 +588,9 @@ pub enum Switch {
     DoubleTap,
     /// Show the password typed rather than a dot for each character.
     ShowPassword,
+    /// Keep the network joined, with its password, so that the recovery
+    /// joins it by itself at the next start.
+    RememberWlan,
 }
 
 /// What a backup can take, in the order the backup page lists it.
@@ -893,6 +911,17 @@ pub enum Confirm {
     RemoveSystem,
     /// Install the system the installer holds with the room chosen.
     InstallSystem,
+    /// Turn an AVB check off, which the AVB page asked for and which the
+    /// page had said what it costs: the second confirmation alone writes.
+    AvbDisable,
+    /// Write the vbmeta copy the page chose back into the slot's vbmeta.
+    VbmetaRestore,
+    /// Forget the network the WLAN page's details are of.
+    ForgetNetwork,
+    /// Delete the full package downloaded from internal storage.
+    DeleteDownload,
+    /// Turn the phone off.
+    PowerOff,
 }
 
 /// What the wipe page erases: everything a factory reset erases, or any of
@@ -1128,6 +1157,24 @@ pub enum Target {
 
 pub const TARGETS: [Target; 6] = [Target::System, Target::Recovery, Target::Fastboot, Target::Bootloader, Target::Edl, Target::PowerOff];
 
+/// How the file manager orders a folder's entries, in the order the page
+/// offers them. Folders come first in every one of them, as the stock file
+/// manager puts them; ties are broken by name, ignoring case.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortKey {
+    /// By name, ignoring case.
+    #[default]
+    Name,
+    /// Most recently changed first, so what was just written is at the top.
+    Modified,
+    /// By kind: folders, then files grouped by what they are — an image, a
+    /// package, a text file, anything else — each group ordered by name.
+    Kind,
+}
+
+/// The three orders, in the order the page lists them.
+pub const SORT_KEYS: [SortKey; 3] = [SortKey::Name, SortKey::Modified, SortKey::Kind];
+
 /// Where the fastboot page goes, in the order it lists them: the volume
 /// keys move between them and the power key takes one.
 pub const FASTBOOT_CHOICES: [(Text, Action); 4] = [
@@ -1183,6 +1230,35 @@ pub enum Action {
     AvbToggle(avbctl::Check),
     /// Take back a request to change vbmeta.
     CancelAvb,
+    /// A check was asked to be turned off, and the page says what that
+    /// means: this opens the second confirmation, which alone writes.
+    AvbConfirmOpen,
+    /// Keep the image the slot's vbmeta holds now, as a copy that outlives
+    /// this start, in `place`'s Skyward folder.
+    VbmetaBackup(Place),
+    /// Put the copy at this place in the list of those found back into the
+    /// slot's vbmeta, once the rollback index says it may be.
+    VbmetaRestore(usize),
+    /// Look again for the copies of vbmeta kept in the places that can be
+    /// read.
+    FindVbmeta,
+    /// Order the file manager's list by this key, and keep it for the rest
+    /// of the start.
+    SortFiles(SortKey),
+    /// Forget the network the WLAN page's details are of: its password and
+    /// how it is protected, from what the phone keeps. A swipe then does it.
+    ForgetNetwork,
+    /// Forget the saved network at this place in the list of those kept.
+    ForgetSaved(usize),
+    /// Pause the system update package's download, keeping what came of it.
+    PauseDownload,
+    /// Delete the full package downloaded, from internal storage. A swipe
+    /// then confirms it.
+    AskDeleteDownload,
+    /// Open the plugin at this place in the list of those found.
+    OpenPlugin(usize),
+    /// Open the folder the plugins are kept in, in the file manager.
+    OpenPluginFolder,
     Open(Screen),
     /// Leave the decrypt page for the page it was opened from; the page
     /// the recovery started on, for the home page without keeping it
@@ -1331,7 +1407,6 @@ pub enum Action {
     /// Download the newest system's full package, or carry on downloading
     /// it.
     Download,
-    StopDownload,
     /// Install the full package downloaded.
     InstallDownloaded,
     /// Ask GitHub for Skyward's newest release.
@@ -1754,6 +1829,13 @@ pub struct State {
     pub held: Option<Action>,
     /// The folder the file manager shows.
     pub files: Folder,
+    /// How the file manager orders a folder's entries.
+    pub sort: SortKey,
+    /// A network joined keeps its password, so that the recovery joins it by
+    /// itself at the next start. It starts on, because joining a network and
+    /// typing its password again at every start is the thing this spares
+    /// someone; a network that is never joined keeps nothing either way.
+    pub remember_wlan: bool,
     /// The folder of internal storage a file to install is chosen in, its
     /// path from the top of the storage.
     pub storage: Folder,
@@ -1824,6 +1906,83 @@ pub struct State {
     pub skyward_job: Option<SkywardJob>,
     /// How fast data went over the network joined in the last second.
     pub traffic: Traffic,
+    /// The copies of the slot's vbmeta image found in the places that can
+    /// be read, as the runtime last looked for them; none until it has.
+    pub vbmeta_copies: Option<Result<Vec<VbmetaCopy>, String>>,
+    /// The copy the page was asked to put back, and whether the page has
+    /// said what that means: the write waits on a swipe.
+    pub vbmeta_pending: Option<VbmetaCopy>,
+    /// What the last save or write back of vbmeta said, once it ended.
+    pub vbmeta_notice: Option<String>,
+    /// A check was asked to be turned off and the AVB page has said what
+    /// that means: the second confirmation stands over the page, and the
+    /// swipe it holds is the only place the write comes from.
+    pub avb_confirming: bool,
+    /// The network the details page shows and the swipe asks to forget.
+    pub forget_pending: Option<String>,
+    /// The networks whose passwords the phone keeps, as the runtime last
+    /// read them: what the WLAN page offers to forget one of.
+    pub saved: Vec<SavedNetwork>,
+    /// The plugins kept on the phone, as the runtime last read them; none
+    /// until it has.
+    pub plugins: Option<Result<Vec<PluginRow>, String>>,
+    /// The plugin the page was opened on, by its place in the list.
+    pub plugin_chosen: usize,
+}
+
+/// A copy of the slot's vbmeta image kept somewhere that outlives a start,
+/// as the AVB page lists it. What the image itself says — its slot and its
+/// rollback index — is `skyward_vab::vbmeta`'s to read; this is only the
+/// pairing of that with the place the file is in, which is the page's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VbmetaCopy {
+    pub place: Place,
+    /// The file's own name, which says the slot and when it was taken.
+    pub name: String,
+    /// The slot the image was read from, empty on a phone with one slot.
+    pub suffix: String,
+    /// Bytes the image takes.
+    pub size: u64,
+    /// The index it carries, or why it cannot be read as a vbmeta image. The
+    /// page shows either, so a file that cannot be read is never passed over
+    /// as though there were nothing there — and the write does not trust
+    /// this reading either: it reads the partition and the copy again where
+    /// the write is made, because what a page was showing is not what the
+    /// phone holds.
+    pub rollback: Result<Rollback, String>,
+    /// When it was taken, in Unix seconds.
+    pub made: i64,
+}
+
+/// A plugin found in the folder the recovery reads them from: what its
+/// manifest says, or why it cannot be used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginRow {
+    /// The plugin's folder name, which is what it is called.
+    pub name: String,
+    /// What its manifest says, or why there is none to read: the page shows
+    /// either, so a folder a person dropped in is never silently passed
+    /// over.
+    pub manifest: Result<Plugin, String>,
+}
+
+/// What a plugin's manifest says it is.
+///
+/// Nothing runs one yet: this release is the page and the reading of what a
+/// plugin will be, so that a later one has somewhere to put what it does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Plugin {
+    /// What it calls itself, where its folder's name is not enough.
+    pub title: Option<String>,
+    /// The version it is at, as its author numbers it.
+    pub version: Option<String>,
+    /// Who wrote it.
+    pub author: Option<String>,
+    /// What it is for, in one line.
+    pub about: Option<String>,
+    /// What it says it needs of the recovery, by name: what a later release
+    /// refuses to run it without.
+    pub needs: Vec<String>,
 }
 
 impl Default for State {
@@ -1892,6 +2051,8 @@ impl Default for State {
             layer: Layer::Letters,
             held: None,
             files: Folder::new("/"),
+            sort: SortKey::default(),
+            remember_wlan: true,
             storage: Folder::new(""),
             usb_drive: None,
             drive: Folder::new(""),
@@ -1924,6 +2085,14 @@ impl Default for State {
             skyward_check: SkywardCheck::Idle,
             skyward_job: None,
             traffic: Traffic::default(),
+            vbmeta_copies: None,
+            vbmeta_pending: None,
+            vbmeta_notice: None,
+            avb_confirming: false,
+            forget_pending: None,
+            saved: Vec::new(),
+            plugins: None,
+            plugin_chosen: 0,
         }
     }
 }
@@ -2240,7 +2409,6 @@ pub enum Effect {
     /// Download `release`'s full package into [`DOWNLOADS`], telling how it
     /// goes with [`App::download_progress`] and [`App::download_ended`].
     Download(Release),
-    StopDownload,
     /// Ask GitHub for Skyward's newest release, telling what it answered
     /// with [`App::skyward_checked`].
     CheckSkyward,
@@ -2252,6 +2420,27 @@ pub enum Effect {
     /// Merge the update that waits in the slot the phone runs from,
     /// telling how it goes with [`App::set_update`].
     Merge,
+    /// Stop the system update package's download as a pause: what came of
+    /// it stays on disk for a later start to go on from.
+    PauseDownload,
+    /// Delete the full package `name` from the downloads folder, telling
+    /// how it went with [`App::download_deleted`].
+    DeleteDownload(String),
+    /// Keep the running slot's vbmeta image as a copy in `place`, telling
+    /// how it went with [`App::vbmeta_notice`].
+    VbmetaBackup { place: Place },
+    /// Write the vbmeta copy at `name` in `place` back into the running
+    /// slot's vbmeta, telling how it went with [`App::vbmeta_notice`].
+    VbmetaRestore { place: Place, name: String },
+    /// Look for the vbmeta copies kept in the places that can be read,
+    /// telling what is found with [`App::set_vbmeta_copies`].
+    FindVbmeta { storage: bool, usb: bool },
+    /// Read the plugins kept on the phone, telling what is found with
+    /// [`App::set_plugins`].
+    ReadPlugins,
+    /// Forget the network named `name`, with what was kept of it, telling
+    /// how it went with [`App::wlan_forgotten`].
+    ForgetWlan(String),
 }
 
 enum Drag {
@@ -3415,11 +3604,83 @@ impl App {
     }
 
     /// What the AVB page's read found, and what the write before it said.
-    pub fn avb_read(&mut self, state: Result<avbctl::State, String>, notice: Option<String>) {        self.state.avb = Some(state);
+    pub fn avb_read(&mut self, state: Result<avbctl::State, String>, notice: Option<String>) {
+        self.state.avb = Some(state);
         self.state.avb_pending = None;
+        self.state.avb_confirming = false;
         self.state.avb_notice = notice;
         self.state.confirm = 0.0;
         self.refresh();
+    }
+
+    /// The copies of the slot's vbmeta image kept where the phone's storage
+    /// has them, or why they could not be read.
+    pub fn set_vbmeta_copies(&mut self, copies: Result<Vec<VbmetaCopy>, String>) {
+        self.state.vbmeta_copies = Some(copies);
+        self.state.vbmeta_pending = None;
+        self.state.confirm = 0.0;
+        self.refresh();
+    }
+
+    /// Saving a copy of vbmeta, or writing one back, ended: the page says
+    /// what came of it and the pending choice is put down.
+    pub fn vbmeta_notice(&mut self, said: String) {
+        self.state.vbmeta_notice = Some(said);
+        self.state.vbmeta_pending = None;
+        // A write back changes what the partition holds, which is what the
+        // AVB page shows and what the next copy would save.
+        self.state.avb = None;
+        self.state.confirm = 0.0;
+        self.refresh();
+    }
+
+    /// The plugins found in the folder the recovery reads them from, or why
+    /// it could not be read.
+    pub fn set_plugins(&mut self, plugins: Result<Vec<PluginRow>, String>) {
+        self.state.plugins = Some(plugins);
+        self.refresh();
+    }
+
+    /// A network joined has its password kept, or the one kept for it is
+    /// taken away: what the WLAN page offers to forget changed.
+    pub fn set_saved(&mut self, saved: Vec<SavedNetwork>) {
+        self.state.saved = saved;
+        self.refresh();
+    }
+
+    /// Forgetting a network ended: the page says what came of it, and what
+    /// is kept is read again.
+    pub fn wlan_forgotten(&mut self, forgot: Result<String, String>, now: u64) {
+        let l = self.state.lang;
+        let said = match forgot {
+            Ok(name) if !name.is_empty() => tr!(l, "已忘记「{name}」", "已忘記「{name}」", "“{name}” is forgotten"),
+            Ok(_) => l.pick(["已清除保存的网络", "已清除儲存的網路", "The networks kept are cleared"]).to_string(),
+            Err(why) => format!("{}: {why}", l.pick(["未能忘记该网络", "未能忘記該網路", "The network was not forgotten"])),
+        };
+        self.state.forget_pending = None;
+        self.state.details = None;
+        self.state.asking_delete = false;
+        self.state.confirm = 0.0;
+        self.refresh();
+        self.say(&said, now);
+    }
+
+    /// How deleting the full package downloaded went: bytes freed, and what
+    /// internal storage holds of it now; or why it is still there.
+    pub fn download_deleted(&mut self, outcome: Result<u64, String>, have: Have, now: u64) {
+        self.state.have = have;
+        self.state.asking_delete = false;
+        self.state.confirm = 0.0;
+        self.refresh();
+        let l = self.state.lang;
+        match outcome {
+            Ok(0) => self.say(l.pick(["安装包已不存在", "安裝檔已不存在", "The package is already gone"]), now),
+            Ok(freed) => {
+                let size = crate::fmt::file_size(freed);
+                self.say(&tr!(l, "已删除安装包，释放 {size}", "已刪除安裝檔，釋放 {size}", "Package deleted, freeing {size}"), now);
+            }
+            Err(why) => self.report(&tr!(l, "无法删除安装包：{why}", "無法刪除安裝檔：{why}", "Couldn't delete the package: {why}"), now),
+        }
     }
 
     /// The settings the pages show, as they are kept between starts.
@@ -5331,6 +5592,20 @@ impl App {
                 vec![Effect::ReadAvb]
             }
             Screen::Mount => vec![Effect::ReadMounts],
+            Screen::Plugins => {
+                // Read afresh each time it opens: a plugin is a folder put
+                // there by someone else, and it may have come or gone since
+                // the page was last looked at.
+                self.state.plugins = None;
+                vec![Effect::ReadPlugins]
+            }
+            Screen::Vbmeta => {
+                // The copies kept are found again as the page opens, and the
+                // flags shown are the ones the phone has now.
+                self.state.vbmeta_copies = None;
+                self.state.vbmeta_pending = None;
+                vec![Effect::FindVbmeta { storage: true, usb: self.state.usb_drive.is_some() }, Effect::ReadAvb]
+            }
             Screen::Filesystems => vec![Effect::ReadFilesystems],
             Screen::Slot | Screen::Reboot => vec![Effect::ReadSlots],
             Screen::Systems => vec![Effect::ReadSystems],
@@ -5356,6 +5631,12 @@ impl App {
             // it opens, once a network is joined and nothing has been heard.
             Screen::Update => {
                 let mut fx = vec![Effect::ReadUpdate];
+                // Deleting a package is asked for on this page, and a swipe
+                // left armed by an earlier visit would draw over a page that
+                // did not ask for it. The page is opened afresh, so the
+                // question is put down with it.
+                self.state.asking_delete = false;
+                self.state.confirm = 0.0;
                 if self.state.update_server && matches!(self.state.check, Check::Idle | Check::Failed(_)) && self.state.online() {
                     self.state.check = Check::Asking;
                     fx.push(Effect::CheckUpdate);
@@ -5454,6 +5735,7 @@ impl App {
                     Switch::ShowPassword => &mut self.state.show_password,
                     Switch::AlwaysOn => &mut self.state.always_on,
                     Switch::DoubleTap => &mut self.state.double_tap,
+                    Switch::RememberWlan => &mut self.state.remember_wlan,
                     Switch::Wlan => unreachable!("the WLAN switch is turned above"),
                 };
                 *on = !*on;
@@ -5471,6 +5753,13 @@ impl App {
                 // switch promises not to do.
                 if switch == Switch::RememberPassword && !now_on {
                     return vec![Effect::RememberPassword(None)];
+                }
+                // Turning remembering a network off takes what is stored
+                // away, as turning the credential off does: a password kept
+                // on the phone after the switch was turned off is the one
+                // thing the switch promises not to do.
+                if switch == Switch::RememberWlan && !now_on {
+                    return vec![Effect::ForgetWlan(String::new())];
                 }
             }
             Action::MountToggle(i) => {
@@ -5519,8 +5808,13 @@ impl App {
                     }
                 }
             }
+            // Taking the request back puts down both the change and the step
+            // that asks what it costs: a page left open on the second
+            // confirmation with nothing pending behind it would write
+            // nothing, which is a control that lies about what it does.
             Action::CancelAvb => {
                 self.state.avb_pending = None;
+                self.state.avb_confirming = false;
                 self.state.confirm = 0.0;
                 self.refresh();
             }
@@ -5936,14 +6230,6 @@ impl App {
                     return vec![Effect::Download(release)];
                 }
             }
-            Action::StopDownload => {
-                let job = self.state.download.as_mut().expect("only a download under way is stopped");
-                if job.outcome.is_none() && !job.stopping {
-                    job.stopping = true;
-                    self.refresh();
-                    return vec![Effect::StopDownload];
-                }
-            }
             Action::InstallDownloaded => {
                 let name = self.state.newest().expect("the package installed is the newest system's").name.clone();
                 let Have::Whole(size) = self.state.have else { unreachable!("only a whole package is offered to install") };
@@ -5990,6 +6276,91 @@ impl App {
                 }
             }
             Action::Unavailable(text) => self.say(text, now),
+            // The file manager's order, chosen from the page's own list: the
+            // folder is listed again in it, and the order is kept for the
+            // rest of the start.
+            Action::SortFiles(key) => {
+                if self.state.sort != key {
+                    self.state.sort = key;
+                    self.refresh();
+                    return vec![Effect::ReadDir(self.state.files.path.clone())];
+                }
+            }
+            // Taking a check off is what the second confirmation is for: the
+            // AVB page says what it costs, and the confirmation alone writes.
+            Action::AvbConfirmOpen => {
+                if matches!(self.state.avb_pending, Some((_, _, true))) {
+                    self.state.avb_confirming = true;
+                    self.state.confirm = 0.0;
+                    self.refresh();
+                } else {
+                    self.say(l.pick(["没有要关闭的校验", "沒有要關閉的驗證", "There is no check to turn off"]), now);
+                }
+            }
+            Action::VbmetaBackup(place) => {
+                self.state.vbmeta_notice = None;
+                return vec![Effect::VbmetaBackup { place }];
+            }
+            Action::VbmetaRestore(i) => {
+                let found = match &self.state.vbmeta_copies {
+                    Some(Ok(copies)) => copies.get(i).cloned(),
+                    _ => None,
+                };
+                match found {
+                    Some(copy) => {
+                        self.state.vbmeta_pending = Some(copy);
+                        self.state.vbmeta_notice = None;
+                        self.state.confirm = 0.0;
+                        self.refresh();
+                    }
+                    None => self.say(l.pick(["没有这个备份", "沒有這個備份", "That copy is not here"]), now),
+                }
+            }
+            Action::FindVbmeta => {
+                self.state.vbmeta_copies = None;
+                self.refresh();
+                return vec![Effect::FindVbmeta { storage: self.state.data.storage_open(), usb: self.state.usb_drive.is_some() }];
+            }
+            // Forgetting a network is the details page's, and the swipe that
+            // asks for it confirms it.
+            Action::ForgetNetwork => {
+                if self.state.details.is_some() {
+                    self.state.asking_delete = true;
+                    self.state.confirm = 0.0;
+                    self.refresh();
+                }
+            }
+            Action::ForgetSaved(i) => {
+                if let Some(saved) = self.state.saved.get(i) {
+                    self.state.forget_pending = Some(saved.name.clone());
+                    self.state.asking_delete = true;
+                    self.state.confirm = 0.0;
+                    self.refresh();
+                }
+            }
+            // Pausing is stopping the download in a way that keeps what came
+            // of it: the page then offers to go on from there.
+            Action::PauseDownload => {
+                if self.state.download.as_ref().is_some_and(|j| j.outcome.is_none() && !j.stopping) {
+                    if let Some(job) = self.state.download.as_mut() {
+                        job.stopping = true;
+                    }
+                    self.refresh();
+                    return vec![Effect::PauseDownload];
+                }
+            }
+            Action::AskDeleteDownload => {
+                if matches!(self.state.have, Have::Whole(_)) && self.state.download.as_ref().is_none_or(|j| j.outcome.is_some()) {
+                    self.state.asking_delete = true;
+                    self.state.confirm = 0.0;
+                    self.refresh();
+                }
+            }
+            Action::OpenPlugin(i) => {
+                self.state.plugin_chosen = i;
+                self.refresh();
+            }
+            Action::OpenPluginFolder => return vec![Effect::ReadDir(PLUGIN_FOLDER.to_string())],
         }
         Vec::new()
     }
@@ -6841,8 +7212,24 @@ impl App {
                 // The write refuses unless the slot still holds what the page
                 // showed, and unless the bootloader is unlocked; both are
                 // checked again where the write is made.
+                //
+                // **Turning a check off is not this arm's to do.** It is
+                // `Confirm::AvbDisable`'s alone, which the page reaches only
+                // through `Action::AvbConfirmOpen`, so that a disable is
+                // never one swipe away — not from a stale frame, not from
+                // another screen, and not from this arm. A pending disable
+                // that arrives here is sent to the step that says what it
+                // costs instead of being written.
                 match self.state.avb_pending.take() {
-                    Some((expected, check, disabled)) => fx.push(Effect::SetAvb { expected, check, disabled }),
+                    // Turning a check on can only make the phone check more,
+                    // so it keeps the single swipe.
+                    Some((expected, check, false)) => fx.push(Effect::SetAvb { expected, check, disabled: false }),
+                    Some((expected, check, true)) => {
+                        self.state.avb_pending = Some((expected, check, true));
+                        self.state.avb_confirming = true;
+                        self.state.confirm = 0.0;
+                        self.refresh();
+                    }
                     None => self.say(l.pick(["没有待确认的改动", "沒有待確認的變更", "There is no change to confirm"]), now),
                 }
             }
@@ -6897,6 +7284,45 @@ impl App {
                     self.refresh();
                 }
             }
+            // The second confirmation is the only place a check is turned
+            // off from: the page above it said what it costs, and this says
+            // it again over its own swipe.
+            Confirm::AvbDisable => match self.state.avb_pending.take() {
+                Some((expected, check, true)) => {
+                    self.state.avb_confirming = false;
+                    fx.push(Effect::SetAvb { expected, check, disabled: true });
+                }
+                other => {
+                    self.state.avb_pending = other;
+                    self.state.avb_confirming = false;
+                    self.say(l.pick(["没有要关闭的校验", "沒有要關閉的驗證", "There is no check to turn off"]), now);
+                }
+            },
+            Confirm::VbmetaRestore => match self.state.vbmeta_pending.take() {
+                Some(copy) => fx.push(Effect::VbmetaRestore { place: copy.place, name: copy.name }),
+                None => self.say(l.pick(["没有选择要写回的备份", "沒有選擇要寫回的備份", "No copy is chosen to write back"]), now),
+            },
+            // Two ways in reach this: the details page's own row, which has
+            // the network in hand, and a row of a network whose password is
+            // kept, which leaves only its name behind. Whichever asked, that
+            // is what the swipe forgets.
+            Confirm::ForgetNetwork => {
+                let name = self.state.details.take().map(|n| n.name).or_else(|| self.state.forget_pending.take());
+                self.state.asking_delete = false;
+                self.state.confirm = 0.0;
+                self.state.forget_pending = None;
+                match name {
+                    Some(name) => fx.push(Effect::ForgetWlan(name)),
+                    None => self.say(l.pick(["没有要忘记的网络", "沒有要忘記的網路", "There is no network to forget"]), now),
+                }
+            }
+            Confirm::DeleteDownload => match self.state.have {
+                Have::Whole(_) if self.state.download.as_ref().is_none_or(|j| j.outcome.is_some()) => {
+                    fx.push(Effect::DeleteDownload(self.state.newest().map_or_else(String::new, |r| r.name.clone())))
+                }
+                _ => self.say(l.pick(["没有可删除的安装包", "沒有可刪除的安裝檔", "There is no package to delete"]), now),
+            },
+            Confirm::PowerOff => fx.push(Effect::Reboot(Target::PowerOff)),
         }
         fx
     }
@@ -11399,11 +11825,11 @@ mod tests {
         app.download_progress(Progress::Checking { done: 0, total: 7_572_375_802 }, 0);
         app.download_progress(Progress::Downloading { done: 1_000_000_000, total: 7_572_375_802 }, 12_000_000);
         assert!(app.state.downloading());
-        assert_eq!(tap(&mut app, &f, &i, Action::StopDownload), vec![Effect::StopDownload]);
-        assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::StopDownload), "stopping, it is not asked again");
+        assert_eq!(tap(&mut app, &f, &i, Action::PauseDownload), vec![Effect::PauseDownload]);
+        assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::PauseDownload), "pausing, it is not asked again");
         // An end lights the panel, and a touch just after only keeps it lit.
         app.download_ended(DownloadEnd::Stopped, Have::Part(1_000_000_000), 0);
-        assert_eq!(tap_at(&mut app, &f, &i, Action::Download, 2000), vec![Effect::Download(newest())], "a download stopped carries on");
+        assert_eq!(tap_at(&mut app, &f, &i, Action::Download, 2000), vec![Effect::Download(newest())], "a download paused carries on");
         let damaged = skyward_net::download::Failure::Damaged;
         app.download_ended(DownloadEnd::Failed(damaged.clone()), Have::Nothing, 3000);
         assert_eq!(fmt::download_failure(Lang::Hans, &damaged), "完整更新包校验失败，已删除，请重新下载。");

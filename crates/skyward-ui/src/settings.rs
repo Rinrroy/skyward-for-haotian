@@ -5,7 +5,7 @@
 //! a time zone, a part or a place by its name, so a later version that lists
 //! them otherwise reads them the same.
 
-use crate::app::{Place, State, SCREEN_OFF, TIME_ZONES};
+use crate::app::{Place, SortKey, State, SCREEN_OFF, TIME_ZONES};
 use crate::Lang;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,9 @@ const PARTS: [&str; 4] = ["boot", "system", "data", "modem"];
 /// Where a backup goes, by name.
 const STORAGE: &str = "storage";
 const USB_DRIVE: &str = "usb_drive";
+/// The orders the file manager can show a folder in, by name, in the order
+/// its page offers them.
+const SORTS: [&str; 3] = ["name", "modified", "kind"];
 /// The logs exported, and where they go, by name, in the order of the page
 /// that exports them.
 const LOGS: [&str; 2] = ["recovery", "kernel"];
@@ -64,6 +67,9 @@ pub struct Settings {
     /// Remember the screen lock that opens the data partition, and try it
     /// by itself at the next start.
     pub remember_password: bool,
+    /// The order the file manager shows a folder in, by name: by name,
+    /// modified or kind.
+    pub sort: String,
     pub install: Install,
     pub backup: Backup,
     pub logs: Logs,
@@ -145,6 +151,12 @@ impl Settings {
             double_tap: state.double_tap,
             disable_avb: state.disable_avb,
             remember_password: state.remember_password,
+            sort: SORTS[match state.sort {
+                SortKey::Name => 0,
+                SortKey::Modified => 1,
+                SortKey::Kind => 2,
+            }]
+            .to_string(),
             install: Install { check_signature: state.check_signature, keep_recovery: state.keep_recovery },
             backup: Backup {
                 parts: names(&state.backup, &PARTS),
@@ -207,6 +219,11 @@ impl Settings {
         state.double_tap = self.double_tap;
         state.disable_avb = self.disable_avb;
         state.remember_password = self.remember_password;
+        // A name this version does not know leaves the order as it is, as an
+        // unknown time zone or place does.
+        if let Some(at) = SORTS.iter().position(|name| *name == self.sort) {
+            state.sort = [SortKey::Name, SortKey::Modified, SortKey::Kind][at];
+        }
         state.check_signature = self.install.check_signature;
         state.keep_recovery = self.install.keep_recovery;
         state.backup = picked(&self.backup.parts, &PARTS);

@@ -9,7 +9,7 @@
 use super::Io;
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -315,23 +315,34 @@ fn read_state(by_name: &Path, suffix: &str, unlocked: bool) -> io::Result<State>
     })
 }
 
-/// The whole vbmeta image a partition holds at `at`, bounded so that a
-/// corrupt footer cannot make this read a gigabyte of somebody's data.
+/// The vbmeta image a partition holds at `at`: the 256-byte header, then the
+/// authentication block, then the auxiliary block, each as long as the header
+/// says. Nothing after it is read, because nothing after it is the image.
+///
+/// **This extent is the whole of what a copy may be written back as.** A
+/// `vbmeta` partition is a slot's worth of megabytes around a few kilobytes of
+/// image, and a `boot` partition carries a kernel in front of the image and an
+/// AVB footer in its last 64 bytes — writing either a partition's length rather
+/// than the image's would overwrite bytes that are not the image's to lose. The
+/// length comes from `skyward_vab::vbmeta`, which is the one place the header's
+/// offsets are written down.
 fn read_vbmeta(file: &mut File, path: &Path, at: u64) -> io::Result<Vec<u8>> {
-    /// The most a vbmeta image can be. The largest this project has seen is
-    /// tens of kilobytes; a megabyte is already generous for a phone that
-    /// carries several chained descriptors.
-    const MOST: usize = 1 << 20;
+    /// The most a vbmeta image can be, before the header is trusted to say how
+    /// long it is. A partition's remaining size can be far more than this, so
+    /// the cap has to come from outside it.
+    const MOST: usize = skyward_vab::vbmeta::MOST;
     file.seek(SeekFrom::Start(at)).map_err(|e| about(path, e))?;
-    let mut image = Vec::new();
-    Read::by_ref(file).take(MOST as u64 + 1).read_to_end(&mut image).map_err(|e| about(path, e))?;
-    // A vbmeta partition is usually bigger than the image in it, so the end
-    // is not known: what bounds it is the header's own descriptor offset and
-    // sizes. This only checks that a header is there and is not absurd.
-    if image.len() < HEADER_LEN || !image.starts_with(MAGIC) {
+    let mut prefix = Vec::new();
+    Read::by_ref(file).take(MOST as u64).read_to_end(&mut prefix).map_err(|e| about(path, e))?;
+    // A header of its own, said plainly, before the lengths in it are trusted.
+    if prefix.len() < HEADER_LEN || !prefix.starts_with(MAGIC) {
         return Err(io::Error::new(ErrorKind::InvalidData, format!("{} holds no vbmeta header {at} bytes in", path.display())));
     }
-    Ok(image)
+    let len = skyward_vab::vbmeta::image_len(&prefix).map_err(|why| {
+        io::Error::new(ErrorKind::InvalidData, format!("{} holds no vbmeta image {at} bytes in: {why}", path.display()))
+    })?;
+    prefix.truncate(len);
+    Ok(prefix)
 }
 
 /// Change one flag of the current slot's vbmeta, after confirming that it
@@ -343,6 +354,135 @@ pub fn change(expected: &State, check: Check, disabled: bool) -> io::Result<(Sta
     }
     let wanted = if disabled { expected.flags | check.off() } else { expected.flags & !check.off() };
     change_flags_at(Path::new(skyward_block::BY_NAME), &backups(), expected, unlocked, wanted)
+}
+
+/// Keep the slot's vbmeta image as it is now in `dir`, as a copy that
+/// outlives a start, and say where it went.
+///
+/// This is the lasting copy: the one [`change`] leaves in `/tmp` is memory
+/// in a recovery and is gone the moment the phone restarts, which is exactly
+/// when a phone that will not boot needs it back. What is written is the
+/// image's own extent, from where its header starts to where its third block
+/// ends — the same bytes [`write_back`] writes, taken from the one function
+/// that decides that extent — so writing one back is writing the partition's
+/// own content and not a reconstruction of it.
+///
+/// **A copy is kept whatever the bootloader's state is.** A locked bootloader
+/// is exactly when an owner wants a copy in hand before unlocking, and reading
+/// a partition changes nothing; only [`write_back`] needs the unlock, because
+/// only it writes. Refusing here would be refusing the one act that is always
+/// safe.
+pub fn keep(dir: &Path) -> io::Result<PathBuf> {
+    // Not `current_phone()`: that insists on a two-slot phone, and this reads
+    // whichever slot the phone reports, one slot or two. The suffix goes into a
+    // file name, so anything but a slot's own name is refused rather than used.
+    let suffix = skyward_sys::prop("ro.boot.slot_suffix").unwrap_or_default();
+    if !matches!(suffix.as_str(), "" | "_a" | "_b") {
+        return Err(io::Error::other(format!("{suffix:?} is not a slot suffix")));
+    }
+    let by_name = Path::new(skyward_block::BY_NAME);
+    let phone = Phone { by_name, suffix: &suffix, locked: false };
+    let (path, at) = top_level(&phone)?;
+    let mut file = File::open(&path).map_err(|e| about(&path, e))?;
+    let image = read_vbmeta(&mut file, &path, at)?;
+    fs::create_dir_all(dir).map_err(|e| about(dir, e))?;
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(io::Error::other)?.as_secs();
+    let slot = match suffix.as_str() {
+        "" => String::new(),
+        suffix => suffix.to_string(),
+    };
+    let name = format!("vbmeta{slot}-{stamp}.img");
+    let target = dir.join(name);
+    // Written and flushed beside its name and then moved into place, so a
+    // start cut off in the middle leaves a whole copy or none, never half of
+    // one. A file that is already there is not overwritten.
+    let writing = dir.join(format!(".{}.part", target.file_name().map_or_else(|| "vbmeta".into(), |n| n.to_string_lossy().into_owned())));
+    if writing.exists() {
+        let _ = fs::remove_file(&writing);
+    }
+    let mut saved = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&writing).map_err(|e| about(&writing, e))?;
+    saved.write_all(&image).and_then(|()| saved.sync_all()).map_err(|e| about(&writing, e))?;
+    drop(saved);
+    if let Err(e) = fs::rename(&writing, &target) {
+        let _ = fs::remove_file(&writing);
+        return Err(about(&target, e));
+    }
+    // Read back before it is believed, as a write into a partition is: a
+    // copy that does not read as what was saved is not one to offer back.
+    let read_back = fs::read(&target).map_err(|e| about(&target, e))?;
+    if read_back != image {
+        let _ = fs::remove_file(&target);
+        return Err(io::Error::new(ErrorKind::InvalidData, format!("{} did not read back as it was saved", target.display())));
+    }
+    Ok(target)
+}
+
+/// Write a kept copy of the slot's vbmeta back into the partition, or refuse
+/// and say why.
+///
+/// **The refusal is the point.** The rollback index in the copy is compared
+/// against the one the partition holds now, read afresh rather than taken
+/// from anything a page showed; a copy below it is one the phone has moved
+/// past, and writing it is a phone that will not start. Nothing is written
+/// when that check fails. When it passes the image is written the width of
+/// itself, flushed, and read back before it is believed, exactly as a flag
+/// change is.
+///
+/// The answer is a [`Back`] either way: a refusal is an answer to the person
+/// who asked, not an error of the recovery.
+pub fn write_back(copy: &Path) -> io::Result<Back> {
+    // Not `current_phone()`: it insists on two slots, and a phone with one slot
+    // has a vbmeta image to write back too. The suffix names a partition, so
+    // anything but a slot's own name is refused rather than used.
+    let suffix = skyward_sys::prop("ro.boot.slot_suffix").unwrap_or_default();
+    if !matches!(suffix.as_str(), "" | "_a" | "_b") {
+        return Err(io::Error::other(format!("{suffix:?} is not a slot suffix")));
+    }
+    let unlocked = skyward_sys::prop("ro.boot.vbmeta.device_state").as_deref() == Some("unlocked");
+    if !unlocked {
+        return Err(io::Error::other("an unlocked bootloader is required to change vbmeta"));
+    }
+    let by_name = Path::new(skyward_block::BY_NAME);
+    let phone = Phone { by_name, suffix: &suffix, locked: !unlocked };
+    let (path, at) = top_level(&phone)?;
+    let kept = fs::read(copy).map_err(|e| about(copy, e))?;
+    let mut file = OpenOptions::new().read(true).write(true).open(&path).map_err(|e| about(&path, e))?;
+    // Both numbers read afresh, from the partition as it is now and from the
+    // copy as it is on disk. Nothing a page showed is trusted here.
+    let now = read_vbmeta(&mut file, &path, at)?;
+    match skyward_vab::vbmeta::may_restore(&now, &kept) {
+        // The guard says no: nothing is written, and why is the answer.
+        Ok(skyward_vab::vbmeta::Restore::Refused { phone, copy }) => Ok(Back::Refused { why: format!("ROLLBACK {copy} {phone}") }),
+        // Either image would not read, so neither number is known: nothing
+        // is written for the same reason.
+        Err(why) => Ok(Back::Refused { why }),
+        Ok(skyward_vab::vbmeta::Restore::Allowed) => {
+            // The image takes the partition from where its own header starts,
+            // the same extent `keep` read, so what is written is what was
+            // kept and nothing more.
+            let written = (|| -> io::Result<()> {
+                file.seek(SeekFrom::Start(at)).map_err(|e| about(&path, e))?;
+                file.write_all(&kept).map_err(|e| about(&path, e))?;
+                file.sync_all().map_err(|e| about(&path, e))?;
+                let read_back = read_vbmeta(&mut file, &path, at)?;
+                if read_back != kept {
+                    return Err(io::Error::new(ErrorKind::InvalidData, format!("{} did not read back as it was written", path.display())));
+                }
+                Ok(())
+            })();
+            written.map(|()| Back::Written).map_err(io::Error::other)
+        }
+    }
+}
+
+/// How writing a kept copy back ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Back {
+    /// Written the width of the kept image, flushed, and read back.
+    Written,
+    /// Not written, and why: the rollback index refused it (in the words
+    /// [`Refusal`] carries), or one of the two images would not read.
+    Refused { why: String },
 }
 
 /// Write `wanted` into the confirmed slot's vbmeta, keeping the image as it
@@ -402,10 +542,16 @@ mod tests {
     use std::fs;
 
     /// A vbmeta image whose flags are `flags`: its header, and the
-    /// authentication block after it, which avbctl leaves as it is.
+    /// authentication block after it, which avbctl leaves as it is. The header
+    /// says how long both variable blocks are, as a real image's does, so that
+    /// the extent the image occupies is the extent these bytes are.
     fn vbmeta(flags: u32) -> Vec<u8> {
-        let mut image = vec![0u8; 256 + 64];
+        let (auth, aux) = (64, 64);
+        let mut image = vec![0u8; 256 + auth + aux];
         image[..4].copy_from_slice(b"AVB0");
+        image[12..20].copy_from_slice(&(auth as u64).to_be_bytes());
+        image[20..28].copy_from_slice(&(aux as u64).to_be_bytes());
+        image[112..120].copy_from_slice(&7u64.to_be_bytes());
         image[120..124].copy_from_slice(&flags.to_be_bytes());
         image[128..141].copy_from_slice(b"avbtool 1.3.0");
         for (i, b) in image[256..].iter_mut().enumerate() {
@@ -552,6 +698,39 @@ mod tests {
         let (back, _) = change_flags_at(dir.path(), dir.path(), &now, true, now.flags & !Check::Verity.off()).unwrap();
         assert_eq!(fs::read(&a).unwrap(), original);
         assert_eq!(back.flags, state.flags);
+    }
+
+    #[test]
+    fn a_copy_is_the_image_and_not_the_partition_and_a_write_back_touches_only_that() {
+        // The pair that has to agree, and the one a "successful" restore could
+        // brick a phone through: `keep` must save exactly the bytes
+        // `write_back` writes, and both must be the image's own length — not
+        // the partition's, which is much larger and whose tail is not the
+        // image's to lose.
+        let dir = tempfile::tempdir().unwrap();
+        let image = vbmeta(0);
+        let at = 4096u64;
+        // A boot partition: a kernel, then the image, then zeroes, then a
+        // footer in its last 64 bytes — the shape a restore must not spill
+        // over.
+        let mut partition = vec![0x11u8; at as usize];
+        partition.extend_from_slice(&image);
+        partition.resize(at as usize + image.len() + 8192, 0);
+        let footer = partition.len() - FOOTER_LEN;
+        partition[footer..footer + 4].copy_from_slice(FOOTER_MAGIC);
+        partition[footer + VBMETA_AT..footer + VBMETA_AT + 8].copy_from_slice(&at.to_be_bytes());
+
+        // What the reader gives, which both sides use.
+        let path = dir.path().join("partition");
+        fs::write(&path, &partition).unwrap();
+        let mut file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let read = read_vbmeta(&mut file, &path, at).unwrap();
+        assert_eq!(read, image, "the image's own bytes, exactly, and not a byte past them");
+        assert!(read.len() < partition.len() - footer, "the partition is far larger than the image");
+        assert_eq!(read.len(), skyward_vab::vbmeta::image_len(&image).unwrap());
+        // The footer, which is not part of the image, is still where it was:
+        // the extent stops before it.
+        assert!(at as usize + read.len() <= footer, "the image stops before the footer");
     }
 
     #[test]

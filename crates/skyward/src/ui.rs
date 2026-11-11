@@ -326,10 +326,16 @@ fn asked(request: &bcb::Request) -> Asked {
 /// whose own files are still closed says so in place of its entries: the
 /// names in it cannot be read until that user's credential is given.
 fn list(app: &mut App, folder: String, closed: &[Closed]) -> Result<()> {
-    let files = match closed_to_user(closed, Path::new(&folder)) {
+    let mut files = match closed_to_user(closed, Path::new(&folder)) {
         Some((_, why)) => Err(why),
         None => read_folder(Path::new(&folder)).map_err(|e| format!("{e:#}")),
     };
+    // The order is the file page's own switch, applied in the one place an
+    // order is decided: `sort` is the only function that orders a listing, so
+    // a folder cannot come out one way here and another way there.
+    if let Ok(rows) = &mut files {
+        skyward_ui::sort::sort(rows, app.state.sort);
+    }
     app.set_files(folder, files, unix_now()?);
     Ok(())
 }
@@ -367,7 +373,13 @@ fn closed_to_user(closed: &[Closed], path: &Path) -> Option<(u32, String)> {
 /// Read a folder of `place` to choose a file to install in, as it is now;
 /// `folder` is its path from the place's top.
 fn list_place(app: &mut App, place: Place, folder: String) -> Result<()> {
-    let files = read_folder(&in_place(place, &folder)).map_err(|e| format!("{e:#}"));
+    let mut files = read_folder(&in_place(place, &folder)).map_err(|e| format!("{e:#}"));
+    // A place's list is for choosing something to install, not for browsing,
+    // so it is always by name: the file page's switch has nothing to mean
+    // here.
+    if let Ok(rows) = &mut files {
+        skyward_ui::sort::sort(rows, skyward_ui::app::SortKey::Name);
+    }
     app.set_place(place, folder, files, unix_now()?);
     Ok(())
 }
@@ -987,7 +999,9 @@ fn read_folder(path: &Path) -> Result<Vec<FileRow>> {
         let name = full.file_name().with_context(|| format!("{} has no name", full.display()))?.to_string_lossy().into_owned();
         rows.push(FileRow { name, kind, size: meta.len(), modified: meta.mtime(), mode: meta.mode(), uid: meta.uid(), gid: meta.gid() });
     }
-    rows.sort_by_key(|r| (!matches!(r.kind, FileKind::Folder { .. } | FileKind::Link { folder: true, .. }), r.name.to_lowercase()));
+    // The order is not decided here: `skyward_ui::sort::sort` is the one
+    // place that decides one, so that the file page's switch and the choose
+    // pages cannot disagree with each other about the same folder.
     Ok(rows)
 }
 
@@ -2216,6 +2230,15 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 app.set_traffic(t);
             }
         }
+        // What the phone keeps of the networks joined, and one just
+        // forgotten: each comes back only when it has changed, so nothing is
+        // redrawn for nothing.
+        if let Some(saved) = wlan.as_ref().and_then(wlan::Worker::saved) {
+            app.set_saved(saved);
+        }
+        if let Some(forgot) = wlan.as_ref().and_then(wlan::Worker::forgotten) {
+            app.wlan_forgotten(forgot, now);
+        }
         // The WLAN page scans again now and then while it shows, as the
         // stock settings do.
         let wlan_on = app.state.wlan.as_ref().is_some_and(|w| w.power == WlanPower::On);
@@ -2697,6 +2720,32 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         };
                         app.avb_read(state, Some(notice));
                     }
+                    // A copy of the slot's vbmeta is kept beside the backups,
+                    // and put back from there. Both are writes to a partition
+                    // and follow the rule a flag change follows: nothing else
+                    // may be writing partitions, and what is written is read
+                    // back before it is believed. The rollback index is
+                    // checked where the write is made, against the partition
+                    // as it is now.
+                    Effect::VbmetaBackup { place } => app.vbmeta_notice(crate::vbmeta::keep(place, app.state.lang)),
+                    Effect::VbmetaRestore { place, name } => {
+                        let busy = installer.is_some() || part_worker.is_some() || eraser.is_some() || backuper.is_some() || skyward_updater.is_some();
+                        if busy {
+                            let said = app.state.lang.pick([
+                                "其他分区操作尚未结束，暂不能写回 vbmeta。",
+                                "其他分割區操作尚未結束，暫不能寫回 vbmeta。",
+                                "Another partition operation is active; vbmeta cannot be written back yet.",
+                            ]);
+                            app.vbmeta_notice(said.to_string());
+                        } else {
+                            app.vbmeta_notice(crate::vbmeta::write_back(place, &name, app.state.lang));
+                        }
+                    }
+                    Effect::FindVbmeta { storage, usb } => app.set_vbmeta_copies(crate::vbmeta::find(storage, usb)),
+                    // Listing plugins reads files someone else put there, so
+                    // it cannot be allowed to end the run: a folder that
+                    // cannot be read is a row saying so, and the page stays.
+                    Effect::ReadPlugins => app.set_plugins(crate::plugins::read(app.state.lang)),
                     Effect::RememberPassword(code) => match code {
                         Some(credential) => match crate::remembered::save(&credential) {
                             Ok(()) => app.state.remembered = Some(credential),
@@ -2879,7 +2928,11 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         wlan_worker(&wlan)?.send(wlan::Command::Scan);
                     }
                     Effect::JoinWlan { ssid, name, security, password } => {
-                        wlan_worker(&wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0 })
+                        // Whether the password is kept for the next start is
+                        // the settings page's switch, read here rather than
+                        // asked of the page that typed it.
+                        let remember = app.state.remember_wlan;
+                        wlan_worker(&wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0, remember })
                     }
                     Effect::LeaveWlan => wlan_worker(&wlan)?.send(wlan::Command::Leave),
                     // What the installed system is called is the page's to
@@ -2907,7 +2960,43 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             Err(e) => app.download_ended(DownloadEnd::Failed(Failure::Other(format!("{e:#}"))), have(&app, &release), now),
                         }
                     }
-                    Effect::StopDownload => downloader.as_ref().context("there is no download to stop")?.stop(),
+                    // Pausing stops the transfer and keeps what came of it:
+                    // whoever goes on downloads from the part's own length.
+                    // No `?` on a stray pause — an error out of `run()` is a
+                    // recovery that restarts, which is the shape of the bug
+                    // this release is fixing.
+                    Effect::PauseDownload => match &downloader {
+                        Some(d) => d.stop(),
+                        None => {
+                            let _ = skyward_sys::kmsg("there is no download to pause");
+                        }
+                    },
+                    // Deleting the package whole, once nothing is downloading
+                    // it and no install is reading it.
+                    Effect::DeleteDownload(name) => {
+                        let folder = Path::new(skyward_crypto::data::SDCARD).join(skyward_ui::app::DOWNLOADS);
+                        let deleted = match (downloader.is_some(), installer.is_some(), updates::package_in(&folder, &name)) {
+                            (true, _, _) => Err("the package is being downloaded".to_string()),
+                            (_, true, _) => Err("an install is under way".to_string()),
+                            (_, _, None) => Err(format!("{name} is not a package name")),
+                            (false, false, Some(path)) => updates::delete(&path).map_err(|e| format!("{e:#}")),
+                        };
+                        // What internal storage holds of the newest package
+                        // now, read from disk rather than assumed: deleting a
+                        // part and deleting a whole one leave different
+                        // states behind.
+                        let after = app.state.newest().map_or(Have::Nothing, |release| have(&app, release));
+                        app.download_deleted(deleted, after, now);
+                    }
+                    // Forgetting a network takes what the phone keeps of it
+                    // away. An empty name is the WLAN switch turned off,
+                    // which forgets everything stored rather than one network.
+                    // The thread does it, and tells the page what is kept
+                    // now when it has.
+                    Effect::ForgetWlan(name) => {
+                        let asked = wlan_worker(&wlan).map(|w| w.forget(name.clone())).map_err(|e| format!("{e:#}"));
+                        app.wlan_forgotten(asked.map(|()| name), now);
+                    }
                     Effect::CheckSkyward => {
                         ensure!(skyward_checker.is_none(), "GitHub is being asked already");
                         let probe = cfg.wlan.as_ref().context("the phone's WLAN is not brought up")?.probe.clone();

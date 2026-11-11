@@ -1274,6 +1274,12 @@ pub fn paragraph(c: &mut Canvas, t: &Theme, f: &Fonts, y: f32, text: &str) -> f3
 /// them for the gesture area. Returns the bar and where each button is on
 /// it.
 pub fn dock_bar(t: &Theme, f: &Fonts, bg: Rgba, labels: &[&str]) -> (Canvas, Vec<Rect>) {
+    chosen_bar(t, f, bg, labels, labels.len().checked_sub(1))
+}
+
+/// The same bar with the button `chosen` in the accent colour instead of
+/// the last one: what a bar of choices is of, which one is on.
+pub fn chosen_bar(t: &Theme, f: &Fonts, bg: Rgba, labels: &[&str], chosen: Option<usize>) -> (Canvas, Vec<Rect>) {
     let m = &t.m;
     let (h, pad, gap) = (m.dp(48.0), m.dp(12.0), m.dp(12.0));
     let mut c = Canvas::new(m.w, (pad + h + m.dp(KEYBOARD_BOTTOM_DP)).ceil() as u32);
@@ -1283,7 +1289,7 @@ pub fn dock_bar(t: &Theme, f: &Fonts, bg: Rgba, labels: &[&str]) -> (Canvas, Vec
     let mut rects = Vec::new();
     for (k, label) in labels.iter().enumerate() {
         let x = m.margin + k as f32 * (w + gap);
-        let (fill, ink) = if k + 1 == labels.len() { (t.pal.accent, Rgba::rgb(255, 255, 255)) } else { (t.pal.search, t.pal.text) };
+        let (fill, ink) = if chosen == Some(k) { (t.pal.accent, Rgba::rgb(255, 255, 255)) } else { (t.pal.search, t.pal.text) };
         c.fill_round_rect(x, pad, w, h, h / 2.0, fill);
         c.text_center(&f.heading, label, x + w / 2.0, pad + h / 2.0, m.row_title_px, ink);
         rects.push(Rect::new(x, pad, w, h));
