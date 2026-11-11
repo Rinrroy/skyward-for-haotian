@@ -158,7 +158,9 @@ pub fn network_commands(id: u32, ssid: &[u8], security: Security, password: &str
     let set = |name: &str, value: String| format!("SET_NETWORK {id} {name} {value}");
     let mut commands = vec![set("ssid", hex(ssid))];
     if hidden {
-        commands.push(set("scan_ssid", "1".into()));
+        // The supplicant scans for the named network only, and takes its
+        // name as the supplicant takes every name: in hex.
+        commands.push(set("scan_ssid", hex(ssid)));
     }
     let psk = || -> Result<String> {
         // The supplicant reads the password as a quoted string and takes a
@@ -420,7 +422,7 @@ mod tests {
         assert!(network_commands(0, b"Skyward",Security::Psk, "密码密码密码密码", false).is_ok(), "a password need not be ASCII");
         assert!(network_commands(0, b"Skyward",Security::Wep, "12345", false).is_err());
         let hidden = network_commands(3, b"Skyward", Security::Open, "", true).unwrap();
-        assert_eq!(hidden, ["SET_NETWORK 3 ssid 536b7977617264", "SET_NETWORK 3 scan_ssid 1", "SET_NETWORK 3 key_mgmt NONE"]);
+        assert_eq!(hidden, ["SET_NETWORK 3 ssid 536b7977617264", "SET_NETWORK 3 scan_ssid 536b7977617264", "SET_NETWORK 3 key_mgmt NONE"]);
     }
 
     #[test]

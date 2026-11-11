@@ -140,7 +140,7 @@ impl Worker {
                     let _ = told_tx.send(r);
                     signal(&rung);
                 };
-                let mut s = Station { cfg, modules, libraries, servers, state: Wlan::default(), running: None, back, tell: Box::new(tell) };
+                let mut s = Station { cfg, modules, libraries, servers, state: Wlan::default(), running: None, tried: Vec::new(), back, tell: Box::new(tell) };
                 s.run(&inbox, &poked);
             })
             .context("start the WLAN thread")?;
@@ -247,6 +247,9 @@ struct Station {
     servers: Servers,
     state: Wlan,
     running: Option<Running>,
+    /// The networks the store holds that have been tried and were not
+    /// within reach, so that the next one is tried.
+    tried: Vec<Vec<u8>>,
     back: Back,
     tell: Box<dyn Fn(Report) + Send>,
 }
@@ -413,6 +416,12 @@ impl Station {
     /// step is best effort: a store that cannot be read, or a network that
     /// does not answer, leaves the password to be typed as always.
     fn auto_join_saved(&mut self) {
+        // A network that is being joined, or joined, is left alone.
+        if let Some(j) = &self.state.joined {
+            if !matches!(j.stage, Stage::Failed | Stage::NotFound | Stage::WrongPassword) {
+                return;
+            }
+        }
         if !skyward_net::wificonf::readable() {
             let _ = skyward_sys::kmsg("the installed system's wifi store is not there to read");
             return;
@@ -422,8 +431,12 @@ impl Station {
             let _ = skyward_sys::kmsg("the installed system's wifi store names no network this reader knows");
             return;
         }
+        // The kernel keeps a line of a thousand characters or so, and the
+        // store of a phone that has been everywhere has a long list: only
+        // the first few are named.
         let names: Vec<String> = saved
             .iter()
+            .take(6)
             .map(|s| {
                 let name = String::from_utf8_lossy(&s.ssid).into_owned();
                 if s.psk.is_some() { name } else { format!("{name} (no password)") }
@@ -434,11 +447,19 @@ impl Station {
             saved.len(),
             names.join(", ")
         ));
-        // A network the phone has a password for comes first: an open one
-        // is often nothing but a phone's own hotspot sharing itself to the
-        // people around it.
-        let mut wanted: Vec<&skyward_net::wificonf::Saved> = saved.iter().filter(|s| s.joinable()).collect();
-        wanted.sort_by_key(|s| s.eagerness());
+        // A network the scan saw comes first: the store holds every
+        // network the phone has ever joined, and most of them are not
+        // within reach now. Among those in reach, one with a password
+        // comes before an open one, which is often nothing but a phone's
+        // own hotspot sharing itself to the people around it.
+        let in_reach = |s: &skyward_net::wificonf::Saved| {
+            self.running.as_ref().is_some_and(|r| r.found.iter().any(|b| b.ssid == s.ssid))
+        };
+        let mut wanted: Vec<&skyward_net::wificonf::Saved> = saved
+            .iter()
+            .filter(|s| s.joinable() && !self.tried.contains(&s.ssid))
+            .collect();
+        wanted.sort_by_key(|s| (!in_reach(s), s.eagerness()));
         let Some(s) = wanted.first() else {
             let _ = skyward_sys::kmsg("none of them carries a password the recovery can use");
             return;
@@ -459,6 +480,7 @@ impl Station {
                 joined.name,
                 s.psk.as_deref().map(|p| p.len()).unwrap_or(0)
             ));
+            self.tried.push(s.ssid.clone());
         }
     }
 
@@ -489,6 +511,9 @@ impl Station {
                     if let Err(e) = self.read_scan() {
                         return self.lost(e);
                     }
+                    // The scan is what says which networks are within
+                    // reach, so the network to join is chosen now.
+                    self.auto_join_saved();
                 }
                 Told::ScanFailed => {}
                 Told::Terminating => return self.lost(anyhow::anyhow!("wpa_supplicant ended")),

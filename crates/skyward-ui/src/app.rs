@@ -1235,8 +1235,6 @@ impl AodStyle {
 
 /// How far up the glass a finger must swipe for the AOD to believe it
 /// meant to wake the panel, in dp: farther than a pocket shifts.
-/// Waiting for the AOD to be wired into the panel loop.
-#[expect(dead_code)]
 const WAKE_SWIPE_DP: f32 = 64.0;
 
 /// Where the AOD sits, in dp from its usual place, one each minute in
@@ -3004,6 +3002,9 @@ pub struct App {
     dirty: bool,
     /// The double tap that lights a dark panel.
     double_tap: DoubleTap,
+    /// Where a finger landed on the dark glass, so that a swipe up from
+    /// there can be told from a tap.
+    aod_start: Option<f32>,
     /// When the power key went down, while a three-second hold is weighed
     /// against a short press.
     power_down_at: Option<u64>,
@@ -3088,6 +3089,7 @@ impl App {
             corners: 0.0,
             dirty: true,
             double_tap: DoubleTap::new(),
+            aod_start: None,
             power_down_at: None,
             power_menu_spent: false,
             power_pending_off: false,
@@ -6684,21 +6686,37 @@ impl App {
         // a finger on the dark glass lights nothing, as on the phone's own
         // system, where the power key lights it.
         if !self.display_on {
-            if !self.state.double_tap {
-                return Vec::new();
-            }
             let m = self.theme().m;
-            self.double_tap.set_slop(m.dp(doubletap::DOUBLE_TAP_SLOP_DP));
+            let swipe = m.dp(WAKE_SWIPE_DP);
             match ev {
-                Touch::Down(x, y) => self.double_tap.down(x, y, now),
-                Touch::Move(x, y) => self.double_tap.move_to(x, y, m.dp(doubletap::TAP_SLOP_DP)),
+                Touch::Down(x, y) => {
+                    if self.state.double_tap {
+                        self.double_tap.set_slop(m.dp(doubletap::DOUBLE_TAP_SLOP_DP));
+                        self.double_tap.down(x, y, now);
+                    }
+                    self.aod_start = Some(y);
+                }
+                Touch::Move(x, y) => {
+                    if self.state.double_tap {
+                        self.double_tap.move_to(x, y, m.dp(doubletap::TAP_SLOP_DP));
+                    }
+                    // A finger swiped up on the dark glass lights it, as
+                    // the phone's own always-on display is woken.
+                    if let Some(start) = self.aod_start {
+                        if start - y > swipe {
+                            self.aod_start = None;
+                            self.wake(now);
+                        }
+                    }
+                }
                 Touch::Up => {
-                    if self.double_tap.up(now) {
+                    if self.state.double_tap && self.double_tap.up(now) {
                         self.double_tap.reset();
                         // No lock screen: the panel comes up onto the page
                         // it went dark on.
                         self.wake(now);
                     }
+                    self.aod_start = None;
                 }
             }
             return Vec::new();
