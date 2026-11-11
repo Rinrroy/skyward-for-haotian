@@ -51,6 +51,12 @@ struct Written {
 
 /// Read a manifest's text. What it says, or why it cannot be read as one.
 pub fn manifest(text: &str) -> Result<Plugin, String> {
+    // A manifest is a JSON object, and is said so before serde sees it: serde
+    // reads a struct out of a sequence too, by position, so `[]` would come
+    // back as a plugin that says nothing rather than as the error it is.
+    if !text.trim_start().starts_with('{') {
+        return Err("plugin.json: a manifest is a JSON object, and this is not one".into());
+    }
     let written: Written = serde_json::from_str(text).map_err(|e| format!("plugin.json: {e}"))?;
     let needs = written.needs.iter().filter_map(|need| kept(need)).take(NEEDS_MOST).collect();
     Ok(Plugin {

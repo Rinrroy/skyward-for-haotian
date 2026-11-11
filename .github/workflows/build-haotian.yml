@@ -106,7 +106,19 @@ jobs:
       # The image is named for the build, the phone and the stock version it
       # is made on, as the releases name theirs; on a tag that is the tag.
       - name: Install the erofs reader
-        run: sudo apt-get update && sudo apt-get install --yes erofs-utils
+        # The archive this asks has failed to resolve mid-run more than once,
+        # which ends a build that had already downloaded and checksummed the
+        # stock package. Asking again is cheaper than all of that.
+        run: |
+          for try in 1 2 3 4; do
+            if sudo apt-get update && sudo apt-get install --yes erofs-utils; then
+              exit 0
+            fi
+            echo "the package archive did not answer (try $try); asking again"
+            sleep $((try * 20))
+          done
+          echo "erofs-utils could not be installed"
+          exit 1
 
       # Extract the motor firmware from the stock odm partition. It has to be
       # in the ramdisk before init's first probe; copying it after Skyward

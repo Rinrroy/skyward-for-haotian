@@ -8875,13 +8875,23 @@ mod tests {
         assert!(app.state.avb_pending.is_none(), "the request can be taken back");
         app.act(Action::AvbToggle(avbctl::Check::Verification), 3000);
         // The page has to draw the swipe before it can be worked, and it is
-        // the swipe that writes.
+        // the swipe that writes. Turning a check off takes two of them: the
+        // first only opens the step that says what the check was catching.
         app.frame(&f, &i);
+        assert!(swipe(&mut app, &f, &i, Confirm::Avb).is_empty(), "the first swipe writes nothing");
         assert_eq!(
-            swipe(&mut app, &f, &i, Confirm::Avb),
-            vec![Effect::SetAvb { expected: state, check: avbctl::Check::Verification, disabled: true }]
+            app.state.avb_pending,
+            Some((state.clone(), avbctl::Check::Verification, true)),
+            "the request is only a request still"
+        );
+        assert!(app.state.avb_confirming, "and the page is on the second step");
+        assert_eq!(
+            swipe(&mut app, &f, &i, Confirm::AvbDisable),
+            vec![Effect::SetAvb { expected: state, check: avbctl::Check::Verification, disabled: true }],
+            "the second swipe is the one that writes it"
         );
         assert!(app.state.avb_pending.is_none(), "and the request is spent");
+        assert!(!app.state.avb_confirming, "and the second step is over");
     }
 
     #[test]
@@ -9532,16 +9542,16 @@ mod tests {
         let snug = snug(&f, &info());
         let i = DeviceInfo { snapshot: SnapshotState::Snapshotted, ..info() };
         let mut app = App::new(Screen::Home, W, snug, PPD);
-        let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::Reboot));
+        let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::PowerOff));
         assert!(y > snug as f32, "below the screen to start with");
-        light_on(&mut app, &f, &i, Stop::Hit(Action::Open(Screen::Reboot)));
+        light_on(&mut app, &f, &i, Stop::Hit(Action::Open(Screen::PowerOff)));
         for ms in (0..3000).step_by(8) {
             app.tick(ms);
         }
-        let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::Reboot));
+        let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::PowerOff));
         assert!(y < snug as f32, "the page scrolled the lit row into view");
         press(&mut app, Key::Power, 3000);
-        assert_eq!(app.screen(), Screen::Reboot);
+        assert_eq!(app.screen(), Screen::PowerOff);
     }
 
     #[test]
@@ -9608,7 +9618,7 @@ mod tests {
         assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::About))));
         press(&mut app, Key::VolumeUp, 0);
         press(&mut app, Key::VolumeUp, 0);
-        assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::Reboot))), "up from the first goes round to the last");
+        assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::PowerOff))), "up from the first goes round to the last");
         app.tick(5000);
         let reboot = app.lit().expect("lit");
         assert!(app.shows(&reboot, app.top().1), "scrolled into view");
