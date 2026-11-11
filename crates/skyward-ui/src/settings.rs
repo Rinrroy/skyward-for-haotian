@@ -335,7 +335,6 @@ mod tests {
         assert!(!fresh.disable_avb, "a fresh file starts with AVB checks on");
         assert!(!fresh.remember_password, "a fresh file keeps no password");
     }
-    }
 
     #[test]
     fn each_value_is_kept_as_what_it_means() {
