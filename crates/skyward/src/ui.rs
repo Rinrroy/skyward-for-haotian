@@ -41,6 +41,7 @@ use skyward_ui::app::{
     Place, RenameRefused, Screen, Shot, Starter, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION,
     DOWNLOADS, INSTALL_UNFINISHED, USB_DRIVE, SkywardEnd, SkywardStage,
 };
+use skyward_ui::aod::{Shown, Want};
 use skyward_ui::settings::Keeper;
 use skyward_ui::surface::kms::KmsSurface;
 use skyward_ui::{Canvas, Fonts, Lang, Surface};
@@ -1259,6 +1260,14 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // Whether the panel's frame memory has been blacked out for an off
     // panel; cleared once a real frame is shown again.
     let mut blanked = false;
+    // The panel's own doze, on a phone whose configuration names one: a dark
+    // panel then keeps a face on the glass rather than being put out.
+    let mut doze = cfg.aod.as_ref().map(crate::aod::Panel::new);
+    // The clock the face was drawn for; drawn again as the minute turns.
+    let mut faced = String::new();
+    // Whether the settings page offers the switch: a phone whose panel keeps
+    // a doze of its own.
+    app.state.panel_dozes = cfg.aod.is_some();
     // When the panel gone dark began to rest.
     let mut rested_at: Option<Instant> = None;
     // Started for fastboot, the port goes to the phone's own fastbootd. The
@@ -1579,13 +1588,26 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             port_at = Instant::now();
         }
         let panel = app.panel(now);
+        // Whether the phone's display driver keeps a doze the panel can be
+        // put into, and has not yet refused one.
+        let dozes = doze.as_ref().is_some_and(crate::aod::Panel::usable);
         // A double tap that lights a dark panel needs its touch controller
         // to keep reporting. Xiaomi's rests with the panel, so while the
         // gesture is offered a dark panel is left powered, showing a black
         // frame at zero backlight, and the phone is not let suspend.
         let keep_touch = app.double_tap_wake() && !app.display_on();
+        // A dark panel is kept in its own doze rather than taken down: with
+        // the face on when the switch says so, and dark otherwise so that a
+        // tap can still be felt.
+        let dozing_want = dozes && (app.state.always_on || keep_touch);
         let mut shown = false;
         if panel.is_some() {
+            // Out of the panel's doze before the page goes over the face.
+            if blanked {
+                if let Some(p) = doze.as_mut() {
+                    p.want(Want::Lit);
+                }
+            }
             // A display turned off comes on again with a frame drawn for it.
             if app.take_dirty() || !surface.is_on() {
                 let t0 = Instant::now();
@@ -1598,6 +1620,39 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 shown = true;
             }
             blanked = false;
+        } else if dozing_want {
+            // The panel is put into its own doze rather than taken down, so
+            // the glass keeps what the frame holds: the face with the switch
+            // on, and nothing with it off, so a tap can still be felt.
+            if !blanked {
+                faced.clear();
+            }
+            if app.state.always_on {
+                if !blanked || faced != shown_clock {
+                    let facts = skyward_ui::aod::Facts {
+                        date: skyward_ui::fmt::date(app.state.lang, unix_now()?, app.state.time_zone),
+                        battery: info.battery.as_ref().map(|b| (b.level, b.plugged)),
+                        slot: info.slot.map(|s| s.letter().to_string()),
+                        data: skyward_ui::fmt::data(app.state.lang, &app.state.data).to_string(),
+                    };
+                    skyward_ui::aod::face(&mut screen, &fonts, &shown_clock, &facts, cfg.display.density as f32 / 160.0);
+                    surface.present(&screen)?;
+                    surface.settle()?;
+                    faced.clone_from(&shown_clock);
+                }
+            } else if !blanked {
+                screen.data.fill(0);
+                surface.present(&screen)?;
+                surface.settle()?;
+            }
+            if !blanked && doze.as_mut().is_some_and(|p| p.want(Want::Dark) == Shown::Blank) {
+                // The driver would not take the panel into its doze: the
+                // glass is blacked out the ordinary way instead.
+                screen.data.fill(0);
+                surface.present(&screen)?;
+                surface.settle()?;
+            }
+            blanked = true;
         } else if !blanked {
             // Black out the panel's frame memory before the backlight goes
             // to 0 and the display off, so an OLED that floors the backlight
@@ -1614,10 +1669,15 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             surface.settle()?;
         }
         backlight.show(panel)?;
+        // A panel kept in its own doze is neither rested nor turned off:
+        // either would take the glass, and the face with it, away.
+        let dozing = panel.is_none() && dozing_want;
         if panel.is_some() {
             // Lit, a panel that came on again switches to its fastest
             // refresh.
             surface.speed_up()?;
+            rested_at = None;
+        } else if dozing {
             rested_at = None;
         } else if keep_touch {
             // The panel stays powered so its touch controller keeps
@@ -1687,7 +1747,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             && usb_link()? != UsbLink::Connected;
         // A double tap needs the CPU awake to hear the panel's taps, so
         // offering the gesture keeps the phone out of suspend while dark.
-        sleeper.allow(may_sleep && !keep_touch);
+        sleeper.allow(may_sleep && !keep_touch && !dozing);
         let mut fds = vec![inputs.fd(), uevents.fd(), sleeper.fd()];
         if let Some(i) = &installer {
             fds.push(i.fd());
@@ -2208,6 +2268,12 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     }
                     closed = opening.closed;
                     show_closed(&mut app, &closed)?;
+                    // The store the installed system keeps is readable now:
+                    // a WLAN already up joins the network it remembers
+                    // without the password being typed again.
+                    if let Ok(w) = wlan_worker(&wlan) {
+                        w.send(wlan::Command::ReloadSaved);
+                    }
                 }
                 decrypt::Ended::Opened(Err(why)) => {
                     // A key service that never came up is why this failed;

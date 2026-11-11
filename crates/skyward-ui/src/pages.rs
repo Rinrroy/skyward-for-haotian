@@ -400,17 +400,19 @@ pub fn settings(cx: &Ctx) -> Frame {
     let general = widgets::list(&mut c, t, f, y, &[
         Row::new(l.pick(LANGUAGE)).icon(BLUE, Icon::Globe).trail(Trail::Value(l.name())),
         Row::new(l.pick(TIME_ZONE)).icon(ORANGE, Icon::Clock).trail(Trail::Value(l.pick(TIME_ZONES[s.time_zone].0))),
+        Row::new(l.pick(["息屏时钟", "息屏時鐘", "Always-on clock"])).icon(PURPLE, Icon::Clock).trail(Trail::Switch(s.always_on)),
         Row::new(l.pick(["双击亮屏", "雙擊亮屏", "Double-tap to wake"])).icon(PURPLE, Icon::Power).trail(Trail::Switch(s.double_tap)),
     ]);
     out.extend(hits(&general.rows, &[
         Action::Open(Screen::Language),
         Action::Open(Screen::TimeZone),
+        Action::Toggle(Switch::AlwaysOn),
         Action::Toggle(Switch::DoubleTap),
     ]));
     let note = l.pick([
-        "开启后熄屏时触控与面板保持上电，待机耗电会增加。",
-        "開啟後熄屏時觸控與面板保持上電，待機耗電會增加。",
-        "While on, the panel and touch controller stay powered when dark, which uses more standby power.",
+        "息屏时钟让暗屏在面板低功耗状态下显示时间；双击亮屏需保持触控上电。两者都会略增待机耗电。",
+        "息屏時鐘讓暗屏在面板低功耗狀態下顯示時間；雙擊亮屏需保持觸控上電。兩者都會略增待機耗電。",
+        "The dark panel keeps a clock in its own low-power doze; double-tap keeps the touch controller awake. Both use a little standby power.",
     ]);
     y = widgets::footnote(&mut c, t, f, general.bottom, note);
     y = widgets::section(&mut c, t, f, y, "USB");

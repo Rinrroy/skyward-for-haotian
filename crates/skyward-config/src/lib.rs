@@ -41,11 +41,60 @@ pub mod ramdisk {
     }
 }
 
+/// The panel's own doze, on phones whose display driver keeps one: a dark
+/// panel then holds a face on the glass with the backlight out, rather than
+/// being put out, and comes back out of it as the pages return.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Aod {
+    /// The display driver's folder for the panel: it holds the node that
+    /// lists the driver's features, and one node per feature.
+    #[serde(default = "default_aod_dir")]
+    pub dir: String,
+    /// The node a command set's number is written to, which has the driver
+    /// send that set to the panel.
+    #[serde(default = "default_aod_node")]
+    pub node: String,
+    /// The driver's features written as the panel goes into its doze, each
+    /// by the number `disp_param` gives it.
+    #[serde(default)]
+    pub enter: Vec<Feature>,
+    /// The command sets sent as it goes in.
+    #[serde(default)]
+    pub enter_cmds: Vec<u32>,
+    /// The features written as it comes back out.
+    #[serde(default)]
+    pub leave: Vec<Feature>,
+    /// The command sets sent as it comes back out.
+    #[serde(default)]
+    pub leave_cmds: Vec<u32>,
+}
+
+/// One of the display driver's features, as `disp_param` lists it: the number
+/// it gives the feature in brackets after its name, and the value to write.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Feature {
+    /// The number in brackets after the feature's name.
+    pub id: u32,
+    /// What is written to the feature's node, as text.
+    pub value: String,
+}
+
+fn default_aod_dir() -> String {
+    "/sys/class/mi_display/disp-DSI-0".into()
+}
+
+fn default_aod_node() -> String {
+    "/proc/mi_display/tx_cmd_set_prim".into()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeviceConfig {
     pub device: Device,
     #[serde(default)]
     pub display: Display,
+    /// The panel's own doze, on phones whose display driver keeps one.
+    #[serde(default)]
+    pub aod: Option<Aod>,
     #[serde(default)]
     pub modules: Modules,
     #[serde(default)]

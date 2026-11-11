@@ -1,3 +1,4 @@
+pub mod aod;
 pub mod app;
 pub mod blur;
 pub mod canvas;

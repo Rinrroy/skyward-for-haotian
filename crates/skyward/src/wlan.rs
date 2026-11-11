@@ -65,6 +65,9 @@ pub enum Command {
     Scan,
     Join { ssid: Vec<u8>, name: String, security: Security, password: String },
     Leave,
+    /// Read the installed system's store again now that the data partition
+    /// stands open, and join the first network it keeps.
+    ReloadSaved,
 }
 
 /// What comes to the thread: a command, how asking for an address went,
@@ -320,6 +323,13 @@ impl Station {
                     }
                 }
                 self.state.joined = None;
+            }
+            Command::ReloadSaved => {
+                // A WLAN that is off has nothing to join with; it reads the
+                // store as it comes on.
+                if self.running.is_some() {
+                    self.auto_join_saved();
+                }
             }
         }
     }

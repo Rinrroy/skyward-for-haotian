@@ -53,6 +53,9 @@ pub struct Settings {
     pub file_transfer: bool,
     /// A double tap on the dark panel lights it.
     pub double_tap: bool,
+    /// A dark panel keeps a clock on the glass in its own doze rather than
+    /// being put out.
+    pub always_on: bool,
     pub install: Install,
     pub backup: Backup,
     pub logs: Logs,
@@ -132,6 +135,7 @@ impl Settings {
             aod_style: state.aod_style,
             file_transfer: state.file_transfer,
             double_tap: state.double_tap,
+            always_on: state.always_on,
             install: Install { check_signature: state.check_signature, keep_recovery: state.keep_recovery },
             backup: Backup {
                 parts: names(&state.backup, &PARTS),
@@ -192,6 +196,7 @@ impl Settings {
         state.aod_style = self.aod_style;
         state.file_transfer = self.file_transfer;
         state.double_tap = self.double_tap;
+        state.always_on = self.always_on;
         state.check_signature = self.install.check_signature;
         state.keep_recovery = self.install.keep_recovery;
         state.backup = picked(&self.backup.parts, &PARTS);
@@ -311,6 +316,15 @@ mod tests {
         let mut state = State::default();
         kept.apply(&mut state);
         assert!(state.double_tap);
+    }
+
+    #[test]
+    fn a_file_without_the_clock_setting_keeps_the_clock_on() {
+        let kept = Settings::read(r#"{ "dark": true }"#).unwrap();
+        assert!(kept.always_on, "an older file starts with the clock on");
+        let mut state = State::default();
+        kept.apply(&mut state);
+        assert!(state.always_on);
     }
 
     #[test]
