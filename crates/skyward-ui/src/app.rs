@@ -8875,26 +8875,26 @@ mod tests {
         assert!(app.state.avb_pending.is_none(), "the request can be taken back");
         app.act(Action::AvbToggle(avbctl::Check::Verification), 3000);
         // The page offers no swipe at all while a disable is only asked for:
-        // the row it draws asks for the step that says what the disable costs.
+        // what it draws is the row that opens the step saying what a disable
+        // costs. So there is no track here for a swipe to reach, stale frame
+        // or not.
         app.frame(&f, &i);
         assert!(
             !app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Confirm(Confirm::Avb)),
             "a disable is never one swipe away"
         );
-        // Nor does the single-swipe arm write one, however it is reached: a
-        // stale frame's track, another screen's, or a touch worked through
-        // `act` by hand. It puts the page on the second step instead.
-        assert!(app.act(Action::Confirm(Confirm::Avb), 3500).is_empty(), "the single swipe writes nothing");
-        assert!(app.state.avb_confirming, "it puts the page on the second step");
+        // The second step is reached by that row, and only while a disable is
+        // pending: there is a check to turn off, so it opens.
+        app.act(Action::AvbConfirmOpen, 3500);
+        assert!(app.state.avb_confirming, "the row opens the second step");
         assert_eq!(
             app.state.avb_pending,
             Some((state.clone(), avbctl::Check::Verification, true)),
             "and the request is only a request still"
         );
         // The second step has its own swipe, and that one writes.
-        let written = swipe(&mut app, &f, &i, Confirm::AvbDisable);
         assert_eq!(
-            written,
+            swipe(&mut app, &f, &i, Confirm::AvbDisable),
             vec![Effect::SetAvb { expected: state, check: avbctl::Check::Verification, disabled: true }],
             "the second step's swipe is the one that writes it"
         );
