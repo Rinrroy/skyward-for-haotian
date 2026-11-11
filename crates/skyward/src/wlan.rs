@@ -140,7 +140,7 @@ impl Worker {
                     let _ = told_tx.send(r);
                     signal(&rung);
                 };
-                let mut s = Station { cfg, modules, libraries, servers, state: Wlan::default(), running: None, tried: Vec::new(), back, tell: Box::new(tell) };
+                let mut s = Station { cfg, modules, libraries, servers, state: Wlan::default(), running: None, tried: Vec::new(), left_on_purpose: false, back, tell: Box::new(tell) };
                 s.run(&inbox, &poked);
             })
             .context("start the WLAN thread")?;
@@ -250,6 +250,9 @@ struct Station {
     /// The networks the store holds that have been tried and were not
     /// within reach, so that the next one is tried.
     tried: Vec<Vec<u8>>,
+    /// Whether the network was left on purpose, in which case the store's
+    /// own networks are not joined again behind the owner's back.
+    left_on_purpose: bool,
     back: Back,
     tell: Box<dyn Fn(Report) + Send>,
 }
@@ -311,6 +314,11 @@ impl Station {
             }
             Command::Join { ssid, name, security, password } => {
                 self.unaddress();
+                // A network joined by hand is the owner's own choosing, so
+                // the store's networks are joined again after it: what it
+                // does of its own accord is done once, and a hand has said
+                // otherwise.
+                self.left_on_purpose = false;
                 let mut joined = Joined { ssid, name, security, stage: Stage::Joining };
                 if let Err(e) = self.join(&joined, &password) {
                     let _ = skyward_sys::kmsg(&format!("joining {} failed: {e:#}", joined.name));
@@ -326,11 +334,26 @@ impl Station {
                     }
                 }
                 self.state.joined = None;
+                // The network was left on purpose, so the store's own
+                // networks are not joined again behind the owner's back:
+                // what the phone does of its own accord is done once, and
+                // a network turned away by hand stays away.
+                self.left_on_purpose = true;
             }
             Command::ReloadSaved => {
                 // A WLAN that is off has nothing to join with; it reads the
                 // store as it comes on.
                 if self.running.is_some() {
+                    // The store is read now, and the network to join is
+                    // chosen from what the scan saw: so the scan is asked
+                    // for again, and the join is made when its answers
+                    // come back. A scan that is already under way is left
+                    // to finish, for its answers are the ones wanted.
+                    if let Some(r) = &self.running {
+                        if r.found.is_empty() {
+                            let _ = r.control.ask("SCAN");
+                        }
+                    }
                     self.auto_join_saved();
                 }
             }
@@ -416,7 +439,15 @@ impl Station {
     /// step is best effort: a store that cannot be read, or a network that
     /// does not answer, leaves the password to be typed as always.
     fn auto_join_saved(&mut self) {
-        // A network that is being joined, or joined, is left alone.
+        // A network that was left on purpose is not joined again on the
+        // phone's own: what it does of its own accord is done once, and
+        // what its owner turned away stays away.
+        if self.left_on_purpose {
+            return;
+        }
+        // A network that is being joined, or joined, is left alone: the
+        // scan ends every few seconds, and a second attempt at a network
+        // that is already on its way up would take the first one down.
         if let Some(j) = &self.state.joined {
             if !matches!(j.stage, Stage::Failed | Stage::NotFound | Stage::WrongPassword) {
                 return;
@@ -447,39 +478,49 @@ impl Station {
             saved.len(),
             names.join(", ")
         ));
-        // A network the scan saw comes first: the store holds every
+        // A network the scan saw is the one to join: the store holds every
         // network the phone has ever joined, and most of them are not
-        // within reach now. Among those in reach, one with a password
-        // comes before an open one, which is often nothing but a phone's
-        // own hotspot sharing itself to the people around it.
+        // within reach now, where the supplicant would look for them and
+        // not find them. Among those in reach, one with a password comes
+        // before an open one, which is often nothing but a phone's own
+        // hotspot sharing itself to the people around it.
         let in_reach = |s: &skyward_net::wificonf::Saved| {
             self.running.as_ref().is_some_and(|r| r.found.iter().any(|b| b.ssid == s.ssid))
         };
         let mut wanted: Vec<&skyward_net::wificonf::Saved> = saved
             .iter()
-            .filter(|s| s.joinable() && !self.tried.contains(&s.ssid))
+            .filter(|s| s.joinable() && !self.tried.contains(&s.ssid) && in_reach(s))
             .collect();
-        wanted.sort_by_key(|s| (!in_reach(s), s.eagerness()));
+        wanted.sort_by_key(|s| s.eagerness());
         let Some(s) = wanted.first() else {
-            let _ = skyward_sys::kmsg("none of them carries a password the recovery can use");
+            let _ = skyward_sys::kmsg("none of the networks the scan saw is one the recovery can use");
             return;
         };
         let _ = skyward_sys::kmsg(&format!(
             "joining {} from the store",
             String::from_utf8_lossy(&s.ssid)
         ));
-        let joined = Joined {
+        let mut joined = Joined {
             ssid: s.ssid.clone(),
             name: String::from_utf8_lossy(&s.ssid).into_owned(),
             security: s.security,
             stage: Stage::Joining,
         };
+        // The network is written down before the join is asked for, because
+        // the state machine that turns the supplicant's events into an
+        // address needs to know which network those events are about. A
+        // join that is not written down ends with the events that come
+        // back having no network to belong to, and the address is never
+        // asked for: the network is reached and no address is ever got.
+        self.state.joined = Some(joined.clone());
         if let Err(e) = self.join(&joined, s.psk.as_deref().unwrap_or("")) {
             let _ = skyward_sys::kmsg(&format!(
                 "joining {} from the store failed (a {}-character password): {e:#}",
                 joined.name,
                 s.psk.as_deref().map(|p| p.len()).unwrap_or(0)
             ));
+            joined.stage = Stage::Failed;
+            self.state.joined = Some(joined);
             self.tried.push(s.ssid.clone());
         }
     }
@@ -554,6 +595,7 @@ impl Station {
             _ => {}
         }
         let Some(j) = &mut self.state.joined else { return };
+        let ssid = j.ssid.clone();
         match j.on(told) {
             Next::Show => {}
             Next::Address => self.ask_address(),
@@ -565,6 +607,18 @@ impl Station {
                     }
                 }
             }
+        }
+        // A network that is not within reach, or whose password the
+        // access point turned down, is not one to try again: it goes on
+        // the list of those tried, so that the next network the store
+        // holds is the one that is tried next. Without this the same
+        // network is asked for at every scan, and no other is ever.
+        if matches!(
+            self.state.joined.as_ref().map(|j| &j.stage),
+            Some(Stage::NotFound | Stage::WrongPassword | Stage::Failed)
+        ) && !self.tried.contains(&ssid)
+        {
+            self.tried.push(ssid);
         }
     }
 

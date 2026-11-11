@@ -212,27 +212,26 @@ user = "root"
 groups = ["root"]
 
 # A build whose weaver asks the secure element through OMAPI needs a native
-# provider, which no Android framework supplies in recovery. These two
-# services supply it. They are deliberately not fenced by Android version:
-# a build that does not need them simply gains two optional daemons, and a
-# build that does need them gets the provider it was missing. Whether an
-# intermediate release needs OMAPI is not known from any device here, and
-# gating on a version would leave that release with no provider at all.
+# provider, which no Android framework supplies in recovery. The service
+# below supplies it.
 #
-# Both are optional and have no `ready_service`: waiting on a registration
-# that never comes costs 20 seconds and adds a name to the set
-# publish_descriptions() builds its file list from. The engine keeps the
-# first lines of a daemon's streams in the log, so a HAL that cannot link
-# says which library it wants, and one that starts says "aidl service
-# starts". None of this holds up the boot, and the description files the
-# directory is given stay identical in number to the older builds.
-[[service]]
-path = "/vendor/bin/hw/android.hardware.secure_element-service.qti"
-libraries = ["/kmlibs", "/vendor/lib64", "/vendor/lib64/hw", "/odm/lib64", "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap", "/mnt/system/lib64", "/mnt/system/system_ext/lib64", "/mnt/product/lib64", "/mnt/system_ext/lib64", "/mnt/system/odm/lib64", "/apex/com.android.vndk.v34/lib64"]
-user = "root"
-groups = ["root", "drmrpc"]
-optional = true
-
+# It is left out on this phone: the binary is the A14 port's own, and it
+# ends at once here -- it is started, it links what it can, and it is
+# gone before it has said anything, every time it is started. The engine
+# starts it again a second later, and again a second after that, for as
+# long as the recovery is up: a fork and a page fault every second, for a
+# provider nothing here asks for.
+#
+# Nothing that this recovery does needs it. The decryption opens through
+# the key service's own route -- the keymint and weaver services, which
+# come up and stay up -- and the OMAPI service below is not on this phone
+# either. So it is left out, as it was before the v0.2.4 config, and a
+# phone whose ROM does need a provider gets one from the service's own
+# vendor directory, which the stock recovery's own service list names.
+#
+# A service that is left out is not started at all, so nothing of it
+# costs the phone anything.
+#
 # The native OMAPI service, taken byte for byte from the A14 port's TWRP
 # (the desktop 小米14u-twrp-安卓15.img, which is byte-identical to the
 # Durex port's images/recovery.img and works on both A14 and A17). It is a

@@ -20,6 +20,21 @@ use std::time::{Duration, Instant};
 /// before it is started again.
 const RESTART_DELAY: Duration = Duration::from_secs(1);
 
+/// How long a program has to stay up before its ending is not taken for a
+/// crash: a program that ends at once is one that cannot run here.
+const ALIVE: Duration = Duration::from_secs(10);
+
+/// How long a program that keeps crashing is left alone between the
+/// tries, at the most: the wait grows as the crashes do, so a program
+/// that cannot run costs the phone less and less of its time, and one
+/// that comes up after a while is still found.
+const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// How many crashes in a row a program may have before it is left alone
+/// for good: some cannot ever run here, and starting them again and
+/// again costs a fork and a page fault each time, forever.
+const CRASHES_ALLOWED: usize = 5;
+
 /// How long a program gets to become what it says it will be.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 const READY_POLL: Duration = Duration::from_millis(100);
@@ -318,7 +333,19 @@ fn ready(s: &Service) -> Result<()> {
     }
 }
 
-fn supervise(s: &Service, who: &Credentials) -> ! {
+fn supervise(s: &Service, who: &Credentials) {
+    // A program that crashes at once is one that cannot run here. Left to
+    // itself it is started again a second later, and again a second after
+    // that, for as long as the recovery is up: a phone that boots a
+    // service which ends at once spends a fork and a page fault on it
+    // every second, and the recovery's own work -- a package being
+    // downloaded and checked, a disk being written -- goes slower for it.
+    //
+    // So the crashes are counted. The wait between the tries grows as
+    // they do, and after enough of them the program is left alone: what
+    // it was for is not said to be gone, but nothing is spent on it
+    // either. A program that stays up is started afresh, as before.
+    let mut crashes = 0usize;
     loop {
         let started = Instant::now();
         let ended = match running(&s.path) {
@@ -333,10 +360,43 @@ fn supervise(s: &Service, who: &Credentials) -> ! {
         // without a word.
         remember(line.clone());
         let _ = skyward_sys::kmsg(&line);
-        if started.elapsed() < RESTART_DELAY {
+        // A program that ran long enough was not a crash: it did what it
+        // was for, and its ending is not held against it.
+        if started.elapsed() >= ALIVE {
+            crashes = 0;
             thread::sleep(RESTART_DELAY);
+            continue;
+        }
+        crashes += 1;
+        if crashes > CRASHES_ALLOWED {
+            let line = format!("{}: it ended {crashes} times at once, and is left alone", s.path);
+            remember(line.clone());
+            let _ = skyward_sys::kmsg(&line);
+            // The thread ends with the program: nothing waits on it, and
+            // the page is told what happened.
+            return;
+        }
+        // The wait grows with the crashes, up to a minute: a program that
+        // is coming up late is found, and one that cannot run costs the
+        // phone less and less of its time.
+        let until = Instant::now() + wait_after(crashes);
+        while Instant::now() < until {
+            thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// How long to wait before starting a program again, after it has ended
+/// at once `crashes` times in a row.
+///
+/// The wait doubles each time, up to a minute: a program that is coming
+/// up late is found within it, and one that cannot run here costs the
+/// phone less and less of its time.
+fn wait_after(crashes: usize) -> Duration {
+    // The doubling is stopped where it would overflow, which is well
+    // before the cap below takes hold.
+    let factor = 1u32.checked_shl(crashes as u32).unwrap_or(u32::MAX);
+    RESTART_DELAY.saturating_mul(factor).min(RESTART_BACKOFF_MAX)
 }
 
 /// Start the program and wait for it to end, keeping the first lines it
@@ -611,6 +671,22 @@ mod tests {
     #[test]
     fn a_file_that_is_not_there_is_not_a_program() {
         assert!(!is_program("/nowhere/at/all/skyward"));
+    }
+
+    #[test]
+    fn a_program_that_ends_at_once_is_waited_for_longer_and_longer() {
+        use super::{wait_after, RESTART_BACKOFF_MAX, RESTART_DELAY};
+        // The first crash is waited out as before, and each after it
+        // twice as long.
+        assert_eq!(wait_after(1), RESTART_DELAY * 2);
+        assert_eq!(wait_after(2), RESTART_DELAY * 4);
+        assert_eq!(wait_after(3), RESTART_DELAY * 8);
+        // And it never grows past the cap, however many there are: a
+        // program that cannot run costs the phone a minute at a time,
+        // not more.
+        assert_eq!(wait_after(20), RESTART_BACKOFF_MAX);
+        assert_eq!(wait_after(1000), RESTART_BACKOFF_MAX);
+        assert!(wait_after(1) > RESTART_DELAY, "the wait grows");
     }
 
     #[test]

@@ -40,11 +40,32 @@ pub struct Build {
 impl Build {
     /// Where to download the zip from, in the order to try: the file's own
     /// short-lived address, where GitHub's API gave one, then the release's
-    /// link on github.com, which some networks do not reach.
+    /// link on github.com, which some networks do not reach, then the same
+    /// link through a mirror.
+    ///
+    /// The mirrors are for networks where github.com itself is reached but
+    /// slowly: GitHub serves its files from a CDN whose path out of the
+    /// mainland is narrow, and a phone on the far side of it downloads at
+    /// a few tens of kilobytes a second, where the same link through a
+    /// mirror comes at megabytes. What a mirror serves is checked against
+    /// the SHA-256 GitHub's own API gave, so a mirror can only be quick
+    /// or wrong -- never quietly different.
     pub fn sources(&self, located: Option<String>) -> Vec<String> {
-        located.into_iter().chain([self.link.clone()]).collect()
+        located
+            .into_iter()
+            .chain(std::iter::once(self.link.clone()))
+            .chain(MIRRORS.iter().map(|m| format!("{m}{}", self.link)))
+            .collect()
     }
 }
+
+/// The mirrors a release's file may be fetched through, each of them the
+/// link it is given followed by the address of the file.
+///
+/// They are tried after GitHub's own address, so a network that reaches
+/// GitHub quickly is never slowed by one that does not. A mirror that is
+/// not there answers with an error, and the next one is tried.
+const MIRRORS: &[&str] = &["https://ghfast.top/"];
 
 #[derive(Deserialize)]
 struct Release {
@@ -188,8 +209,35 @@ mod tests {
     fn a_zip_is_downloaded_from_where_github_sends_it_then_from_its_link() {
         let build = newest(ANSWERED_013, "ishtar", "0.1.2").unwrap().build.unwrap();
         let link = "https://github.com/kirklin/skyward/releases/download/v0.1.3/skyward-v0.1.3-ishtar-OS3.0.308.0.WMACNXM.zip";
-        assert_eq!(build.sources(Some("https://release-assets.githubusercontent.com/a?sig=1".into())), ["https://release-assets.githubusercontent.com/a?sig=1", link]);
-        assert_eq!(build.sources(None), [link], "where GitHub's API gave no address");
+        let sources = build.sources(Some("https://release-assets.githubusercontent.com/a?sig=1".into()));
+        // GitHub's own address first, then its link, and only then the
+        // mirrors: a network that reaches GitHub quickly is never slowed
+        // by one that does not.
+        assert_eq!(sources[0], "https://release-assets.githubusercontent.com/a?sig=1");
+        assert_eq!(sources[1], link);
+        // Where GitHub's API gave no address, its link is the first.
+        let sources = build.sources(None);
+        assert_eq!(sources[0], link);
+    }
+
+    #[test]
+    fn a_mirror_is_given_the_link_it_is_to_fetch() {
+        let build = newest(ANSWERED_013, "ishtar", "0.1.2").unwrap().build.unwrap();
+        let link = "https://github.com/kirklin/skyward/releases/download/v0.1.3/skyward-v0.1.3-ishtar-OS3.0.308.0.WMACNXM.zip";
+        let sources = build.sources(None);
+        // Every mirror is the link it is given followed by the address of
+        // the file, so that what it serves is the very file GitHub named.
+        let mirrored: Vec<&String> = sources.iter().filter(|s| s.contains(link)).collect();
+        assert!(!mirrored.is_empty(), "a mirror is tried");
+        for m in mirrored {
+            assert!(m.ends_with(link), "the mirror is given the link itself: {m}");
+        }
+        // And no two sources are the same, for the same file is not
+        // fetched twice over.
+        let mut all = sources.clone();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), sources.len(), "no source is tried twice");
     }
 
     /// A server on this computer that answers one request with `answer`,
