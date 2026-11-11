@@ -71,6 +71,30 @@ const TOUCH_WAIT: Duration = Duration::from_secs(5);
 /// no more.
 const AOD_LIGHT: f32 = 0.03;
 
+/// Tell the display driver how bright the panel is to stay while it dozes.
+/// The driver has the level in a switch of its own, where it has one; the
+/// phone's always-on display writes the higher of the two levels there
+/// before the panel dozes.
+fn doze_brightness() {
+    let root = Path::new("/sys/class/mi_display");
+    let mut path: Option<PathBuf> = None;
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let p = entry.path().join("doze_brightness");
+            if p.exists() {
+                path = Some(p);
+                break;
+            }
+        }
+    }
+    let Some(path) = path else {
+        return;
+    };
+    if let Err(e) = fs::write(&path, "1") {
+        let _ = skyward_sys::kmsg(&format!("the panel's doze brightness was not set: {e}"));
+    }
+}
+
 /// How long a panel gone dark rests, ready to light again at once, before
 /// the display turns off; the phone's own system keeps its panel dozing
 /// about as long after the screen goes off.
@@ -1597,6 +1621,12 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         let dozing_want = app.state.always_on || keep_touch;
         let mut shown = false;
         if panel.is_some() {
+            // A panel in its own doze leaves it for the page.
+            if surface.is_dozing() {
+                if let Err(e) = surface.wake() {
+                    let _ = skyward_sys::kmsg(&format!("the panel would not come out of its doze: {e:#}"));
+                }
+            }
             // A display turned off comes on again with a frame drawn for it.
             if app.take_dirty() || !surface.is_on() {
                 let t0 = Instant::now();
@@ -1631,6 +1661,17 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     surface.settle()?;
                     faced.clone_from(&shown_clock);
                 }
+                // The panel's own doze, as the phone's always-on display uses
+                // it: the driver sends the panel the commands for it, the
+                // light goes out, and the face stays on the glass. A panel
+                // that takes no doze keeps the light turned down instead,
+                // which is the recovery's own way of keeping a clock.
+                if !surface.is_dozing() && surface.can_doze() {
+                    doze_brightness();
+                    if let Err(e) = surface.doze() {
+                        let _ = skyward_sys::kmsg(&format!("the panel would not doze: {e:#}"));
+                    }
+                }
             } else if !blanked {
                 screen.data.fill(0);
                 surface.present(&screen)?;
@@ -1656,12 +1697,16 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         // a panel whose light is at zero gives nothing of the frame back.
         // Without the face, the light stays at zero and the panel is kept
         // powered only so that a tap can still be felt.
-        let back = match panel {
-            Some(v) => Some(v),
-            None if app.state.always_on => Some(AOD_LIGHT),
-            None => None,
-        };
-        backlight.show(back)?;
+        // A panel in its own doze has the light in the driver's hands: it
+        // writes what the panel keeps while it dozes.
+        if !surface.is_dozing() {
+            let back = match panel {
+                Some(v) => Some(v),
+                None if app.state.always_on => Some(AOD_LIGHT),
+                None => None,
+            };
+            backlight.show(back)?;
+        }
         // A panel that is kept lit is neither rested nor turned off: either
         // would take the glass, and the face with it, away.
         let dozing = panel.is_none() && dozing_want;
