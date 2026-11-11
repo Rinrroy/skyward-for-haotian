@@ -218,8 +218,10 @@ fn int_fields(block: &str, name: &str) -> Vec<i32> {
             between(rest, &open, "</int>").and_then(|v| v.trim().parse::<i32>().ok())
         } else {
             let from = at + attr.len();
-            let end = rest[from..].find('"')? + from;
-            rest[from..end].trim().parse::<i32>().ok()
+            match rest[from..].find('"') {
+                Some(end) => rest[from..from + end].trim().parse::<i32>().ok(),
+                None => None,
+            }
         };
         rest = &rest[at + 1..];
         match value {
