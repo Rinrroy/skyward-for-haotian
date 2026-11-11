@@ -726,7 +726,9 @@ mod tests {
         let mut file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
         let read = read_vbmeta(&mut file, &path, at).unwrap();
         assert_eq!(read, image, "the image's own bytes, exactly, and not a byte past them");
-        assert!(read.len() < partition.len() - footer, "the partition is far larger than the image");
+        // The room from the image's start to the footer is far larger than the
+        // image: a copy of the partition's prefix would not fit in this.
+        assert!(read.len() < footer - at as usize, "the partition is far larger than the image");
         assert_eq!(read.len(), skyward_vab::vbmeta::image_len(&image).unwrap());
         // The footer, which is not part of the image, is still where it was:
         // the extent stops before it.

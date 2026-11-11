@@ -44,6 +44,9 @@ eSE 的两个驱动和安全元件的 HAL 都起来之后才能访问它。本�
 Skyward 自身的更新来自[本仓库](https://github.com/Rinrroy/skyward-for-haotian/releases)
 的最新版本，并且资产就是镜像本身，不再套一层 zip。
 
+下载可以暂停再继续，下载完的安装包也可以删除。暂停只是停下不再写：已经下载的
+部分就留在那里成为 `.part`，继续时按这个文件的**实际长度**向服务器要剩下的部分。
+
 ### 备份和恢复
 
 ![系统、应用和 IMEI 都可以备份](slides/zh-CN/out/06-backup.png)
@@ -51,6 +54,10 @@ Skyward 自身的更新来自[本仓库](https://github.com/Rinrroy/skyward-for-
 ### 文件管理
 
 ![在 Skyward 中管理手机里的文件](slides/zh-CN/out/07-files.png)
+
+列表可以按名称、修改时间或文件类型排序，用的那条在列表下面。三种排序里文件夹
+都排在最前，而且比较是**全序**——名称相同的再按小写名、再按原始字节比，所以不会
+有文件停在文件系统返回的任意位置上。
 
 ### 终端
 
@@ -76,16 +83,25 @@ Skyward 自身的更新来自[本仓库](https://github.com/Rinrroy/skyward-for-
 
 ![出问题时先在这里修](slides/zh-CN/out/13-tools.png)
 
+关闭 AVB 校验需要**两次确认**：第一次滑动只是说明引导器不再校验意味着什么，
+第二次才真正写入。当前槽位的 `vbmeta` 可以存到内部存储或 U 盘，也可以写回——
+但只有副本的回滚索引**不低于**手机现在这个槽位的值时才允许写回，因为写回一个更
+旧的正是让引导器拒绝启动本槽位的原因。没有「强制写入」。
+
 ### 关于手机
 
 ![查看电池健康度和充电次数](slides/zh-CN/out/14-specs.png)
 
 ### 其他功能
 
-- 重启到系统、recovery、fastboot、bootloader 或 EDL，以及切换槽位
+- 重启到系统、recovery、fastboot、bootloader 或 EDL，切换槽位，以及在单独的
+  页面上关机
 - 浅色与深色主题；简体中文、繁体中文与英文
 - 挂载分区、修复和格式化文件系统
-- WLAN、MTP 文件传输、adb 与 fastbootd
+- WLAN、MTP 文件传输、adb 与 fastbootd；连过一次的网络会被记住，也可以在列表
+  里忘记它
+- 插件页，列出 `Skyward/plugins` 下的文件夹和它们 `plugin.json` 里写的内容——
+  这个版本只读只列，不执行任何东西
 
 ### 没有系统时
 

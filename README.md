@@ -50,6 +50,10 @@ Skyward's own updates come from the newest release in
 [this repository](https://github.com/Rinrroy/skyward-for-haotian/releases), as
 the image itself rather than a zip.
 
+A download can be paused and continued, and a package already downloaded can be
+deleted. A pause is only a stop: what was fetched stays as the `.part` it is,
+and continuing asks the server for the rest of it from that file's real length.
+
 ### Backup and restore
 
 ![Back up the system, apps and IMEI](slides/en/out/06-backup.png)
@@ -57,6 +61,11 @@ the image itself rather than a zip.
 ### File manager
 
 ![Manage the phone's files in Skyward](slides/en/out/07-files.png)
+
+The list sorts by name, modified time or file type, chosen from the bar under
+it. Folders stay first in all three, and every order is total — ties fall to the
+lowercased name and then the raw one — so no entry is left where the filesystem
+happened to return it.
 
 ### Terminal
 
@@ -82,16 +91,27 @@ the image itself rather than a zip.
 
 ![When something breaks, fix it here first](slides/en/out/13-tools.png)
 
+Turning AVB verification off takes two confirmations: the first swipe says what
+a bootloader that checks nothing means, and only the second writes. The running
+slot's `vbmeta` can be kept to internal storage or a USB drive and given back —
+but only when the copy's rollback index is **not below** the slot's own, because
+writing an older one back is exactly what makes a bootloader refuse to start
+this slot. There is no override.
+
 ### About phone
 
 ![Check battery health and charge cycles](slides/en/out/14-specs.png)
 
 ### Other features
 
-- Reboot to system, recovery, fastboot, bootloader or EDL, and switch slots
+- Reboot to system, recovery, fastboot, bootloader or EDL, switch slots, or turn
+  the phone off from a page of its own
 - Light and dark themes; Simplified Chinese, Traditional Chinese and English
 - Mount partitions, repair and format filesystems
-- WLAN, MTP file transfer, adb and fastbootd
+- WLAN, MTP file transfer, adb and fastbootd; a network joined once is
+  remembered and can be forgotten from the list
+- A plugins page, listing the folders under `Skyward/plugins` and what their
+  `plugin.json` says — this release reads and lists, it runs nothing
 
 ### Without a system
 
