@@ -458,7 +458,7 @@ pub fn settings(cx: &Ctx) -> Frame {
         Row::new(l.pick(LANGUAGE)).icon(BLUE, Icon::Globe).trail(Trail::Value(l.name())),
         Row::new(l.pick(TIME_ZONE)).icon(ORANGE, Icon::Clock).trail(Trail::Value(l.pick(TIME_ZONES[s.time_zone].0))),
         Row::new(l.pick(["双击亮屏", "雙擊亮屏", "Double-tap to wake"])).icon(PURPLE, Icon::Power).trail(Trail::Switch(s.double_tap)),
-    ]);
+    ];
     out.extend(hits(&general.rows, &[
         Action::Open(Screen::Language),
         Action::Open(Screen::TimeZone),
