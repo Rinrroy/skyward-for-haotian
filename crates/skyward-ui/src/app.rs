@@ -8874,24 +8874,49 @@ mod tests {
         app.act(Action::CancelAvb, 2000);
         assert!(app.state.avb_pending.is_none(), "the request can be taken back");
         app.act(Action::AvbToggle(avbctl::Check::Verification), 3000);
-        // The page has to draw the swipe before it can be worked, and it is
-        // the swipe that writes. Turning a check off takes two of them: the
-        // first only opens the step that says what the check was catching.
+        // The page offers no swipe at all while a disable is only asked for:
+        // the row it draws asks for the step that says what the disable costs.
         app.frame(&f, &i);
-        assert!(swipe(&mut app, &f, &i, Confirm::Avb).is_empty(), "the first swipe writes nothing");
+        assert!(
+            !app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Confirm(Confirm::Avb)),
+            "a disable is never one swipe away"
+        );
+        // Nor does the single-swipe arm write one, however it is reached: a
+        // stale frame's track, another screen's, or a touch worked through
+        // `act` by hand. It puts the page on the second step instead.
+        assert!(app.act(Action::Confirm(Confirm::Avb), 3500).is_empty(), "the single swipe writes nothing");
+        assert!(app.state.avb_confirming, "it puts the page on the second step");
         assert_eq!(
             app.state.avb_pending,
             Some((state.clone(), avbctl::Check::Verification, true)),
-            "the request is only a request still"
+            "and the request is only a request still"
         );
-        assert!(app.state.avb_confirming, "and the page is on the second step");
+        // The second step has its own swipe, and that one writes.
+        let written = swipe(&mut app, &f, &i, Confirm::AvbDisable);
         assert_eq!(
-            swipe(&mut app, &f, &i, Confirm::AvbDisable),
+            written,
             vec![Effect::SetAvb { expected: state, check: avbctl::Check::Verification, disabled: true }],
-            "the second swipe is the one that writes it"
+            "the second step's swipe is the one that writes it"
         );
         assert!(app.state.avb_pending.is_none(), "and the request is spent");
         assert!(!app.state.avb_confirming, "and the second step is over");
+    }
+
+    #[test]
+    fn turning_a_check_on_keeps_the_single_swipe_because_it_only_checks_more() {
+        use skyward_install::commands::avbctl;
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Avb, W, H, PPD);
+        let state = avbctl::State { suffix: "_a".into(), flags: 0b11, unlocked: true, digest: [0; 32] };
+        app.avb_read(Ok(state.clone()), None);
+        assert!(app.act(Action::AvbToggle(avbctl::Check::Verification), 1000).is_empty());
+        assert_eq!(app.state.avb_pending, Some((state.clone(), avbctl::Check::Verification, false)));
+        assert_eq!(
+            swipe(&mut app, &f, &i, Confirm::Avb),
+            vec![Effect::SetAvb { expected: state, check: avbctl::Check::Verification, disabled: false }],
+            "turning one on is the one direction that writes from a single swipe"
+        );
+        assert!(!app.state.avb_confirming, "and it never asks twice");
     }
 
     #[test]

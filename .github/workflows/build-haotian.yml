@@ -106,19 +106,21 @@ jobs:
       # The image is named for the build, the phone and the stock version it
       # is made on, as the releases name theirs; on a tag that is the tag.
       - name: Install the erofs reader
-        # The archive this asks has failed to resolve mid-run more than once,
-        # which ends a build that had already downloaded and checksummed the
-        # stock package. Asking again is cheaper than all of that.
+        # Best effort, never fatal: the kernel reads erofs itself, and the
+        # step below mounts the image before it reaches for this reader. The
+        # archive this asks has stopped resolving on whole runs of runners,
+        # which must not end a build that has already downloaded and
+        # checksummed the stock package.
         run: |
-          for try in 1 2 3 4; do
+          for try in 1 2 3; do
             if sudo apt-get update && sudo apt-get install --yes erofs-utils; then
+              echo "the userspace reader is installed"
               exit 0
             fi
             echo "the package archive did not answer (try $try); asking again"
             sleep $((try * 20))
           done
-          echo "erofs-utils could not be installed"
-          exit 1
+          echo "no userspace reader; the kernel mounts the image instead"
 
       # Extract the motor firmware from the stock odm partition. It has to be
       # in the ramdisk before init's first probe; copying it after Skyward
@@ -133,9 +135,12 @@ jobs:
           mounted=no
           if sudo mount -o loop,ro -t erofs stock/odm.img extracted 2>/dev/null; then
             mounted=yes
-          else
+          elif command -v fsck.erofs > /dev/null; then
             echo "no erofs support in the kernel; reading it in userspace"
             fsck.erofs --extract=extracted --no-preserve --overwrite stock/odm.img
+          else
+            echo "neither this kernel nor a userspace reader can read an erofs image" >&2
+            exit 1
           fi
           mkdir -p stock/firmware
           for name in cs40l26.wmfw cs40l26.bin cs40l26-svc.bin cs40l26-dvl.bin cs40l26-dbc.bin cs40l26-a2h.bin; do
