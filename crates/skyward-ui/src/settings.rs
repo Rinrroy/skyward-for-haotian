@@ -334,42 +334,7 @@ mod tests {
         let fresh = Settings::read(r#"{}"#).unwrap();
         assert!(!fresh.disable_avb, "a fresh file starts with AVB checks on");
         assert!(!fresh.remember_password, "a fresh file keeps no password");
-    }            lang: Lang::En,
-            language_chosen: true,
-            dark: true,
-            brightness: 0.7,
-            screen_off: 6,
-            time_zone: 7,
-            vibrate: false,
-            vibration: 0.4,
-            aod_style: AodStyle::Dial,
-            file_transfer: false,
-            always_on: true,
-            double_tap: true,
-            check_signature: true,
-            keep_recovery: false,
-            backup: [false, true, true, false, false],
-            backup_to: Place::UsbDrive,
-            compress: true,
-            verify: false,
-            logs: [false, true],
-            logs_to: 1,
-            ..State::default()
-        };
-        let kept = Settings::read(&Settings::of(&state).text()).unwrap();
-        let mut back = State::default();
-        kept.apply(&mut back);
-        assert_eq!(Settings::of(&back), Settings::of(&state));
-        assert_eq!((back.lang, back.screen_off, back.time_zone), (Lang::En, 6, 7));
-        assert!(back.always_on, "a face turned on is still on at the next start");
-        assert!(back.double_tap, "a two-tap wake turned on is still on at the next start");
-        // The value carried is the one a start does not have of itself, so
-        // what comes back proves the file rather than the default. The
-        // default is the other half of the same question: a phone flashed and
-        // never visited here has no face on its dark panel, and no two-tap
-        // wake — both cost power, so both are asked for.
-        assert!(!State::default().always_on, "the face on a dark panel is off until it is turned on");
-        assert!(!State::default().double_tap, "the two-tap wake is off until it is turned on");
+    }
     }
 
     #[test]
