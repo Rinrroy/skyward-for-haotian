@@ -1,7 +1,9 @@
 pub mod app;
+pub mod blur;
 pub mod canvas;
 pub mod charge;
 pub mod color;
+pub mod doubletap;
 pub mod editor;
 pub mod files;
 pub mod fling;
@@ -14,6 +16,7 @@ pub mod icons;
 pub mod lang;
 pub mod motion;
 pub mod pages;
+pub mod powermenu;
 pub mod search;
 pub mod settings;
 pub mod sprite;

@@ -22,6 +22,7 @@ use crate::widgets::{self, Caption, Detail, Fact, Outline, Row, Spec, SystemCard
 use skyward_info::{DeviceInfo, VERSION};
 use skyward_install::{Outcome, Reflash, Refusal, Stage};
 use skyward_net::download::Progress;
+use skyward_net::localsend::Phase as LocalSendPhase;
 use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Bands, Network, Power, Stage as Joining};
 use skyward_systems::Who;
@@ -108,6 +109,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::Clash => clash(cx),
         Screen::FileJob => file_job(cx),
         Screen::Wlan => wlan(cx),
+        Screen::LocalSend => local_send(cx),
         Screen::WlanPassword => wlan_password(cx),
         Screen::WlanNetwork => wlan_network(cx),
         Screen::WlanAdd => wlan_add(cx),
@@ -398,9 +400,20 @@ pub fn settings(cx: &Ctx) -> Frame {
     let general = widgets::list(&mut c, t, f, y, &[
         Row::new(l.pick(LANGUAGE)).icon(BLUE, Icon::Globe).trail(Trail::Value(l.name())),
         Row::new(l.pick(TIME_ZONE)).icon(ORANGE, Icon::Clock).trail(Trail::Value(l.pick(TIME_ZONES[s.time_zone].0))),
+        Row::new(l.pick(["双击亮屏", "雙擊亮屏", "Double-tap to wake"])).icon(PURPLE, Icon::Power).trail(Trail::Switch(s.double_tap)),
     ]);
-    out.extend(hits(&general.rows, &[Action::Open(Screen::Language), Action::Open(Screen::TimeZone)]));
-    y = widgets::section(&mut c, t, f, general.bottom, "USB");
+    out.extend(hits(&general.rows, &[
+        Action::Open(Screen::Language),
+        Action::Open(Screen::TimeZone),
+        Action::Toggle(Switch::DoubleTap),
+    ]));
+    let note = l.pick([
+        "开启后熄屏时触控与面板保持上电，待机耗电会增加。",
+        "開啟後熄屏時觸控與面板保持上電，待機耗電會增加。",
+        "While on, the panel and touch controller stay powered when dark, which uses more standby power.",
+    ]);
+    y = widgets::footnote(&mut c, t, f, general.bottom, note);
+    y = widgets::section(&mut c, t, f, y, "USB");
     let usb = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(["文件传输", "檔案傳輸", "File transfer"])).icon(BLUE, Icon::Usb).trail(Trail::Switch(s.file_transfer))]);
     out.extend(hits(&usb.rows, &[Action::Toggle(Switch::FileTransfer)]));
     let note = l.pick([
@@ -470,8 +483,8 @@ pub fn screen_off(cx: &Ctx) -> Frame {
 }
 
 /// Mount manager: the slot's partitions, each with a switch to mount it
-/// read-only or unmount it; one that programs are using says which, and
-/// stays.
+/// read-only or unmount it; one that programs are using says which, and can
+/// still be asked to go.
 pub fn mount(cx: &Ctx) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
     let mut c = long_page(cx);
@@ -501,19 +514,13 @@ pub fn mount(cx: &Ctx) -> Frame {
             let rows: Vec<Row> = mounts
                 .iter()
                 .zip(&subs)
-                .map(|(m, sub)| {
-                    let trail = if m.holders.is_empty() { Trail::Switch(m.mounted) } else { Trail::Text(l.pick(["使用中", "使用中", "In use"])) };
-                    Row::new(&m.base).subtitle(sub).trail(trail)
-                })
+                .map(|(m, sub)| Row::new(&m.base).subtitle(sub).trail(Trail::Switch(m.mounted)))
                 .collect();
             let list = widgets::list(&mut c, t, f, y, &rows);
-            out.extend(list.rows.iter().zip(mounts).enumerate().map(|(i, (&rect, m))| {
-                let action = match m.holders.is_empty() {
-                    true => Action::MountToggle(i),
-                    false => Action::Unavailable(l.pick(["无法卸载正在使用的分区", "無法卸載正在使用的分割區", "A partition in use can't be unmounted"])),
-                };
-                Hit { rect, action }
-            }));
+            // A partition in use still shows its switch, next to who holds
+            // it: being used is why a clean unmount fails, not a reason to
+            // take the choice away.
+            out.extend(list.rows.iter().enumerate().map(|(i, &rect)| Hit { rect, action: Action::MountToggle(i) }));
             let y = match &s.mount_failure {
                 Some(failure) => widgets::footnote(&mut c, t, f, list.bottom, &fmt::mount_failure(l, failure)),
                 None => list.bottom,
@@ -3346,7 +3353,25 @@ pub fn wlan(cx: &Ctx) -> Frame {
     let on = !matches!(w.power, Power::Off | Power::Failed(_));
     let switch = widgets::list(&mut c, t, f, top, &[Row::new(l.pick(WLAN)).trail(Trail::Switch(on))]);
     out.extend(hits(&switch.rows, &[Action::Toggle(Switch::Wlan)]));
-    let mut y = switch.bottom;
+    // LocalSend shares this WLAN. Its own page starts and stops the endpoint;
+    // the row here says how it stands so the entry is worth a tap.
+    let ls = &s.local_send;
+    let ls_state = match ls.phase {
+        LocalSendPhase::Off => l.pick(["未开启", "未開啟", "Off"]),
+        LocalSendPhase::Starting => l.pick(["正在启动", "正在啟動", "Starting"]),
+        LocalSendPhase::Listening => l.pick(["正在接收", "正在接收", "Receiving"]),
+        LocalSendPhase::Failed => l.pick(["启动失败", "啟動失敗", "Failed"]),
+    };
+    let ls_detail = format!("{} · {}", l.pick(LOCAL_SEND_ENTRY), ls_state);
+    let entry = widgets::list(
+        &mut c,
+        t,
+        f,
+        switch.bottom + t.m.card_gap,
+        &[Row::new(l.pick(LOCAL_SEND)).subtitle(&ls_detail)],
+    );
+    out.extend(hits(&entry.rows, &[Action::Open(Screen::LocalSend)]));
+    let mut y = entry.bottom;
     match &w.power {
         Power::Off => {
             let note = l.pick([
@@ -3423,6 +3448,107 @@ pub fn wlan(cx: &Ctx) -> Frame {
         }
     }
     Frame::new(t, fit(c, t, y), out, l.pick(WLAN), top)
+}
+
+const LOCAL_SEND: Text = ["LocalSend 文件传输", "LocalSend 檔案傳輸", "LocalSend file transfer"];
+const LOCAL_SEND_ENTRY: Text =
+    ["与同一 WLAN 下的设备互传文件", "與同一 Wi-Fi 下的裝置互傳檔案", "Send and receive files on this network"];
+
+/// A size a person can read, for a file LocalSend holds.
+fn local_send_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= KIB * KIB * KIB {
+        format!("{:.2} GB", b / (KIB * KIB * KIB))
+    } else if b >= KIB * KIB {
+        format!("{:.1} MB", b / (KIB * KIB))
+    } else if b >= KIB {
+        format!("{:.1} KB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// The LocalSend switch, what a sender needs to reach it, and the files it
+/// has taken in. The endpoint itself runs in the runtime, told by
+/// [`Effect::LocalSend`]; how it stands comes back with [`App::set_local_send`].
+pub fn local_send(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let st = &s.local_send;
+    let mut c = long_page(cx);
+    let mut out = Vec::new();
+    let top = t.m.content_top;
+    let on = matches!(st.phase, LocalSendPhase::Starting | LocalSendPhase::Listening);
+    let switch = widgets::list(&mut c, t, f, top, &[Row::new(l.pick(LOCAL_SEND)).trail(Trail::Switch(on))]);
+    out.extend(hits(&switch.rows, &[Action::Toggle(Switch::LocalSend)]));
+    let mut y = switch.bottom;
+
+    // What the endpoint needs and why it may not have come up. A recovery
+    // has no certificate authority to trust, so the sender's app has to be
+    // told to send in plain HTTP.
+    let note: String = match st.phase {
+        LocalSendPhase::Off => l
+            .pick([
+                "开启后，同一 WLAN 下的 LocalSend 可向本机发送文件。请先在 WLAN 页面连接网络，并在发送端关闭「使用 HTTPS 传输」。",
+                "開啟後，同一 Wi-Fi 下的 LocalSend 可向本機傳送檔案。請先在 Wi-Fi 頁面連線，並在傳送端關閉「使用 HTTPS 傳輸」。",
+                "Once on, a LocalSend app on the same Wi-Fi can send files here. Join a network on the Wi-Fi page first, and turn off \"Use HTTPS\" in the sending app.",
+            ])
+            .to_string(),
+        LocalSendPhase::Starting => l.pick(["正在启动 LocalSend 服务", "正在啟動 LocalSend 服務", "Starting the LocalSend endpoint"]).to_string(),
+        LocalSendPhase::Listening => l
+            .pick([
+                "可被同一 WLAN 下的 LocalSend 发现。也可用浏览器打开本机地址，把收到的文件取回。",
+                "可被同一 Wi-Fi 下的 LocalSend 發現。也可用瀏覽器開啟本機位址，把收到的檔案取回。",
+                "Discoverable by LocalSend on the same Wi-Fi. A browser opened at the address below can also take the received files back.",
+            ])
+            .to_string(),
+        LocalSendPhase::Failed => match &st.error {
+            Some(why) => format!("{}：{why}", l.pick(["启动失败", "啟動失敗", "Couldn't start"])),
+            None => l.pick(["启动失败", "啟動失敗", "Couldn't start"]).to_string(),
+        },
+    };
+    y = widgets::footnote(&mut c, t, f, y, &note);
+
+    if st.phase == LocalSendPhase::Listening {
+        let endpoint = match st.address {
+            Some(a) => format!("{}:{}", a, st.port),
+            None => format!(":{}", st.port),
+        };
+        let rows = [
+            Row::new(l.pick(["设备名称", "裝置名稱", "Device name"])).trail(Trail::Text(st.alias.as_str())),
+            Row::new(l.pick(["本机地址", "本機位址", "Address"])).trail(Trail::Text(&endpoint)),
+            Row::new(l.pick(["接收目录", "接收目錄", "Saved to"])).trail(Trail::Text(st.directory.as_str())),
+        ];
+        let info = widgets::list(&mut c, t, f, y + t.m.card_gap, &rows);
+        y = info.bottom;
+
+        // A file on its way in, shown above those already kept.
+        if let Some(p) = &st.receiving {
+            let progress = format!("{} / {}", local_send_size(p.done), local_send_size(p.total));
+            let row = [Row::new(p.name.as_str()).trail(Trail::Text(&progress))];
+            let receiving = widgets::list(&mut c, t, f, y + t.m.card_gap, &row);
+            y = receiving.bottom;
+        }
+        if !st.received.is_empty() {
+            y = widgets::section(&mut c, t, f, y, l.pick(["已接收", "已接收", "Received"]));
+            let recent: Vec<_> = st.received.iter().rev().take(8).collect();
+            let sizes: Vec<String> = recent.iter().map(|r| local_send_size(r.size)).collect();
+            let rows: Vec<Row> = recent
+                .iter()
+                .zip(&sizes)
+                .map(|(r, size)| Row::new(r.name.as_str()).trail(Trail::Text(size.as_str())))
+                .collect();
+            let list = widgets::list(&mut c, t, f, y, &rows);
+            y = list.bottom;
+        }
+        if !st.peers.is_empty() {
+            y = widgets::section(&mut c, t, f, y, l.pick(["附近的设备", "附近的裝置", "Nearby devices"]));
+            let rows: Vec<Row> = st.peers.iter().take(8).map(|p| Row::new(p.as_str()).trail(Trail::None)).collect();
+            let list = widgets::list(&mut c, t, f, y, &rows);
+            y = list.bottom;
+        }
+    }
+    Frame::new(t, fit(c, t, y), out, l.pick(LOCAL_SEND), top)
 }
 
 const ADD_NETWORK: Text = ["添加网络", "新增網路", "Add network"];

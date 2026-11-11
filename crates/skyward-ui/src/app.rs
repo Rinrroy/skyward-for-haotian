@@ -1,6 +1,8 @@
+use crate::blur;
 use crate::canvas::{Canvas, Run};
 use crate::charge;
 use crate::color::Rgba;
+use crate::doubletap::{self, DoubleTap};
 use crate::editor::{self, Editor};
 use crate::files::{self, FileType};
 use crate::fling::{Fling, Tracker};
@@ -12,6 +14,7 @@ use crate::glow::{self, GlowClock};
 use crate::lang::{Lang, Text};
 use crate::motion::{self, Spring};
 use crate::pages::{self, Band, Ctx};
+use crate::powermenu;
 use crate::sprite::{Blurs, Sprite};
 use crate::search;
 use crate::settings::Settings;
@@ -23,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use skyward_info::DeviceInfo;
 use skyward_install::{Event, ImageKind, Outcome, Reflash, Refusal, Stage};
 use skyward_net::download::{Failure, Progress};
+use skyward_net::localsend::{Phase as LocalSendPhase, Status as LocalSendStatus};
 use skyward_net::github::{Build, Newest};
 use skyward_net::release::{Release, Unanswered};
 use skyward_net::supplicant::Security;
@@ -137,6 +141,8 @@ pub enum Screen {
     /// The WLAN switch, the network chosen and how joining it goes, and
     /// the networks in range.
     Wlan,
+    /// Sending and receiving files with LocalSend over the WLAN.
+    LocalSend,
     /// The password of the network chosen, typed on the screen's keyboard.
     WlanPassword,
     /// The network joined, and the address and the rest it gave.
@@ -550,6 +556,10 @@ pub enum Slider {
     Vibration,
 }
 
+/// How long the power key is held before the power menu comes up. Short
+/// of this, letting go does what a short press has always done.
+pub const POWER_MENU_MS: u64 = 3_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Switch {
     Vibrate,
@@ -566,6 +576,10 @@ pub enum Switch {
     /// over.
     KeepRecovery,
     Wlan,
+    /// Turn the LocalSend file transfer endpoint on or off.
+    LocalSend,
+    /// Hear a double tap on the dark panel and light it.
+    DoubleTap,
     /// Show the password typed rather than a dot for each character.
     ShowPassword,
 }
@@ -1742,6 +1756,9 @@ pub struct Queued {
 pub struct State {
     /// The language the pages speak.
     pub lang: Lang,
+    /// A double tap on the dark panel lights it. Keeping the touch
+    /// controller awake costs some standby power, so this can be turned off.
+    pub double_tap: bool,
     /// The language was chosen on the language page, now or at an earlier
     /// start, where otherwise it is the one the system names.
     pub language_chosen: bool,
@@ -1928,6 +1945,9 @@ pub struct State {
     /// The WLAN, as the runtime last told it; none on a phone whose WLAN the
     /// recovery does not bring up.
     pub wlan: Option<Wlan>,
+    /// The LocalSend endpoint, as the runtime last told it. It starts off
+    /// until its switch is turned on.
+    pub local_send: LocalSendStatus,
     /// The network the password page is for, and what is typed there.
     pub joining: Option<Network>,
     /// The network the details page is of, as it was found.
@@ -1959,6 +1979,7 @@ impl Default for State {
             aod_date: String::new(),
             aod_style: AodStyle::Digits,
             lang: Lang::Hans,
+            double_tap: true,
             language_chosen: false,
             dark: false,
             brightness: SLIDER_START,
@@ -2036,6 +2057,7 @@ impl Default for State {
             part_work: None,
             update: Standing::None,
             wlan: None,
+            local_send: LocalSendStatus::default(),
             joining: None,
             details: None,
             adding: None,
@@ -2121,12 +2143,13 @@ impl State {
         self.skyward_job.as_ref().is_some_and(|j| j.outcome.is_none())
     }
 
-    /// Whether the phone has the page `screen`: the WLAN page where the
-    /// recovery brings the phone's WLAN up, and updating Skyward where the
-    /// phone also keeps its recovery in a partition of each slot.
+    /// Whether the phone has the page `screen`: the WLAN page and the
+    /// LocalSend page it leads to where the recovery brings the phone's WLAN
+    /// up, and updating Skyward where the phone also keeps its recovery in a
+    /// partition of each slot.
     pub fn offers(&self, screen: Screen) -> bool {
         match screen {
-            Screen::Wlan => self.wlan.is_some(),
+            Screen::Wlan | Screen::LocalSend => self.wlan.is_some(),
             Screen::SkywardUpdate => self.wlan.is_some() && self.recovery_partitions,
             Screen::Systems => self.dual_boot,
             _ => true,
@@ -2331,6 +2354,9 @@ pub enum Effect {
     ScanWlan,
     JoinWlan { ssid: Vec<u8>, name: String, security: Security, password: Secret },
     LeaveWlan,
+    /// Start or stop the LocalSend endpoint; how it stands comes back with
+    /// [`App::set_local_send`].
+    LocalSend(bool),
     /// Ask the update server for the newest system, telling what it
     /// answered with [`App::update_checked`].
     CheckUpdate,
@@ -2966,6 +2992,22 @@ pub struct App {
     /// How round the screen's corners are, in pixels.
     corners: f32,
     dirty: bool,
+    /// The double tap that lights a dark panel.
+    double_tap: DoubleTap,
+    /// When the power key went down, while a three-second hold is weighed
+    /// against a short press.
+    power_down_at: Option<u64>,
+    /// This hold has already opened the menu: its release does nothing.
+    power_menu_spent: bool,
+    /// A short press on a lit panel owes it a screen-off, paid when the key
+    /// comes up so a three-second hold never darkens the panel first.
+    power_pending_off: bool,
+    /// The power menu is up over the page.
+    power_menu: bool,
+    /// The page blurred behind the menu, worked out once as it opens.
+    power_bg: Option<Canvas>,
+    /// The pill a finger is dragging, if any.
+    power_drag: Option<powermenu::Drag>,
     w: u32,
     h: u32,
     px_per_dp: f32,
@@ -3035,6 +3077,13 @@ impl App {
             backdrop: None,
             corners: 0.0,
             dirty: true,
+            double_tap: DoubleTap::new(),
+            power_down_at: None,
+            power_menu_spent: false,
+            power_pending_off: false,
+            power_menu: false,
+            power_bg: None,
+            power_drag: None,
             w,
             h,
             px_per_dp,
@@ -3045,6 +3094,17 @@ impl App {
     /// leading corners of a page sliding over another.
     pub fn set_screen_corners(&mut self, radius: f32) {
         self.corners = radius;
+    }
+
+    /// Whether a double tap on the dark panel should light it. The runtime
+    /// keeps the touch controller powered while this is so.
+    pub fn double_tap_wake(&self) -> bool {
+        self.state.double_tap
+    }
+
+    /// Whether the power menu is up over the page.
+    pub fn power_menu_open(&self) -> bool {
+        self.power_menu
     }
 
     pub fn theme(&self) -> Theme {
@@ -3110,7 +3170,10 @@ impl App {
         };
         let blink = self.blink_at(now).filter(|_| self.display_on).map(|(_, next)| next);
         let chord = self.chord.map(|(_, at)| at + CHORD_MS);
-        [self.toast.as_ref().map(|t| t.1), easing, self.idle_due(), held, repeat, blink, darkens, chord].into_iter().flatten().min()
+        // A power key being held has to wake the loop at the three-second
+        // mark even when nothing else is due and the panel is dark.
+        let power = self.power_down_at.filter(|_| !self.power_menu_spent).map(|at| at + POWER_MENU_MS);
+        [self.toast.as_ref().map(|t| t.1), easing, self.idle_due(), held, repeat, blink, darkens, chord, power].into_iter().flatten().min()
     }
 
     /// Whether a text field's cursor shows at `now`, and when it next turns;
@@ -3151,6 +3214,16 @@ impl App {
     /// deadline goes away.
     pub fn tick(&mut self, now: u64) -> Vec<Effect> {
         let mut fx = Vec::new();
+        // Held three seconds, the power key opens the menu. The hold is
+        // judged on time passing rather than on a release, so the panel
+        // comes up at the third second, not whenever the finger happens to
+        // lift. Nothing is asked of the runtime: this only changes a layer.
+        if !self.power_menu_spent && self.power_down_at.is_some_and(|at| now >= at + POWER_MENU_MS) {
+            self.power_menu_spent = true;
+            self.power_pending_off = false;
+            self.wake(now);
+            self.open_power_menu(now);
+        }
         // The key waiting for its partner in a screenshot, left alone long
         // enough, does what it does alone.
         if self.chord.is_some_and(|(_, at)| now >= at + CHORD_MS) {
@@ -3436,6 +3509,9 @@ impl App {
         self.darkening = self.panel(now);
         self.curtain.set(false, now);
         self.display_on = false;
+        self.power_menu = false;
+        self.power_bg = None;
+        self.power_drag = None;
         self.bright = full_brightness();
         match std::mem::replace(&mut self.drag, Drag::Idle) {
             Drag::Confirm { .. } => {
@@ -3832,11 +3908,22 @@ impl App {
             return;
         }
         self.state.wlan = Some(w);
-        if matches!(self.screen(), Screen::Home | Screen::Wlan | Screen::WlanNetwork | Screen::Update | Screen::SkywardUpdate) {
+        if matches!(self.screen(), Screen::Home | Screen::Wlan | Screen::LocalSend | Screen::WlanNetwork | Screen::Update | Screen::SkywardUpdate) {
             self.refresh();
         }
         // The status bar shows the network joined over every page.
         self.dirty = true;
+    }
+
+    /// How the LocalSend endpoint stands, as the runtime last told it.
+    pub fn set_local_send(&mut self, s: LocalSendStatus) {
+        if self.state.local_send == s {
+            return;
+        }
+        self.state.local_send = s;
+        if matches!(self.screen(), Screen::Wlan | Screen::LocalSend) {
+            self.refresh();
+        }
     }
 
     /// How fast data went over the network joined in the last second, which
@@ -4534,6 +4621,11 @@ impl App {
     /// while a cable has just gone in, both as dark as the content stands
     /// as the panel goes off or comes up.
     pub fn compose(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64) {
+        if self.power_menu {
+            self.compose_power_menu(out, f, info, clock, now);
+            out.dim(self.curtain.level(now));
+            return;
+        }
         let charge = self.charging.as_ref().map_or(0.0, |c| c.shown.level(now));
         if charge < 1.0 {
             self.compose_page(out, f, info, clock, now);
@@ -4542,6 +4634,79 @@ impl App {
             self.compose_charging(out, f, info, charge, now);
         }
         out.dim(self.curtain.level(now));
+    }
+
+    /// Put the power menu up over whatever page was showing. The page
+    /// itself is left alone: nothing is pushed, nothing is popped.
+    fn open_power_menu(&mut self, now: u64) {
+        self.power_menu = true;
+        self.power_bg = None;
+        self.power_drag = None;
+        self.double_tap.reset();
+        self.drop_button();
+        self.chord = None;
+        self.drag = Drag::Idle;
+        self.dirty = true;
+        self.stir(now);
+    }
+
+    fn close_power_menu(&mut self, now: u64) {
+        self.power_menu = false;
+        self.power_bg = None;
+        self.power_drag = None;
+        self.dirty = true;
+        self.refresh();
+        self.stir(now);
+    }
+
+    /// The page the menu covers is blurred once, when the menu opens, and
+    /// kept: the page cannot change while the menu is up, and a Gaussian
+    /// convolution of the whole panel is far too much work for every frame.
+    fn compose_power_menu(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64) {
+        if self.power_bg.is_none() {
+            let mut page = Canvas::new(out.w, out.h);
+            self.compose_page(&mut page, f, info, clock, now);
+            let mut bg = blur::gaussian(&page);
+            powermenu::tint(&mut bg);
+            self.power_bg = Some(bg);
+        }
+        out.lay(self.power_bg.as_ref().expect("drawn above"), 0, 0, 1.0);
+        let (t, l) = (self.theme(), self.state.lang);
+        let g = powermenu::geometry(&t.m);
+        powermenu::draw(out, &t, f, l, &g, self.power_drag);
+    }
+
+    /// A finger on the menu works one pill at a time. Let go past the
+    /// threshold, the pill's target goes to the runtime as it always does
+    /// from the reboot page. A press outside the pills sends the menu away.
+    fn touch_power_menu(&mut self, ev: Touch, now: u64) -> Vec<Effect> {
+        self.stir(now);
+        let g = powermenu::geometry(&self.theme().m);
+        match ev {
+            Touch::Down(x, y) => match powermenu::hit(&g, x, y) {
+                Some(index) => {
+                    self.power_drag = Some(powermenu::Drag { index, progress: 0.0 });
+                    self.dirty = true;
+                }
+                None => self.close_power_menu(now),
+            },
+            Touch::Move(x, _) => {
+                if let Some(mut d) = self.power_drag {
+                    d.progress = powermenu::progress(&g, d.index, x);
+                    self.power_drag = Some(d);
+                    self.dirty = true;
+                }
+            }
+            Touch::Up => {
+                let done = self.power_drag.take().filter(|d| d.progress >= powermenu::CONFIRM_AT);
+                self.dirty = true;
+                if let Some(d) = done {
+                    self.close_power_menu(now);
+                    return vec![Effect::Reboot(powermenu::CHOICES[d.index].target())];
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// The charging screen, `level` of the way over the page drawn on `out`.
@@ -5666,9 +5831,20 @@ impl App {
                 self.refresh();
                 return vec![Effect::Wlan(on)];
             }
+            // So does LocalSend's: the runtime starts or stops the endpoint,
+            // then tells how it stands. Starting it needs the address the
+            // joined network gave, which only the runtime holds.
+            Action::Toggle(Switch::LocalSend) => {
+                let on = matches!(self.state.local_send.phase, LocalSendPhase::Off | LocalSendPhase::Failed);
+                self.state.local_send.phase = if on { LocalSendPhase::Starting } else { LocalSendPhase::Off };
+                self.state.local_send.error = None;
+                self.refresh();
+                return vec![Effect::LocalSend(on)];
+            }
             Action::Toggle(switch) => {
                 let on = match switch {
                     Switch::Vibrate => &mut self.state.vibrate,
+                    Switch::DoubleTap => &mut self.state.double_tap,
                     Switch::FileTransfer => &mut self.state.file_transfer,
                     Switch::Compress => &mut self.state.compress,
                     Switch::Verify => &mut self.state.verify,
@@ -5676,6 +5852,7 @@ impl App {
                     Switch::KeepRecovery => &mut self.state.keep_recovery,
                     Switch::ShowPassword => &mut self.state.show_password,
                     Switch::Wlan => unreachable!("the WLAN switch is turned above"),
+                    Switch::LocalSend => unreachable!("the LocalSend switch is turned above"),
                 };
                 *on = !*on;
                 let now_on = *on;
@@ -6493,9 +6670,30 @@ impl App {
     }
 
     pub fn touch(&mut self, ev: Touch, f: &Fonts, now: u64) -> Vec<Effect> {
-        // A finger on the dark panel lights nothing, as on the phone's own
+        if self.power_menu {
+            return self.touch_power_menu(ev, now);
+        }
+        // A double tap lights the dark panel; with the gesture turned off,
+        // a finger on the dark glass lights nothing, as on the phone's own
         // system, where the power key lights it.
         if !self.display_on {
+            if !self.state.double_tap {
+                return Vec::new();
+            }
+            let m = self.theme().m;
+            self.double_tap.set_slop(m.dp(doubletap::DOUBLE_TAP_SLOP_DP));
+            match ev {
+                Touch::Down(x, y) => self.double_tap.down(x, y, now),
+                Touch::Move(x, y) => self.double_tap.move_to(x, y, m.dp(doubletap::TAP_SLOP_DP)),
+                Touch::Up => {
+                    if self.double_tap.up(now) {
+                        self.double_tap.reset();
+                        // No lock screen: the panel comes up onto the page
+                        // it went dark on.
+                        self.wake(now);
+                    }
+                }
+            }
             return Vec::new();
         }
         // A finger on the charging screen sends it away for the page, and
@@ -6856,6 +7054,20 @@ impl App {
     /// goes down first waits [`CHORD_MS`] for the other, or until it is let
     /// go, and then does what it does alone, as pressed when it went down.
     pub fn key(&mut self, key: Key, now: u64) -> Vec<Effect> {
+        // A menu up over the page takes the keys for itself: a tap of the
+        // power or back key sends it away, the rest do nothing.
+        if self.power_menu {
+            if matches!(key, Key::Power | Key::Back) {
+                self.close_power_menu(now);
+            }
+            self.button = Some((key, Press::Spent));
+            return Vec::new();
+        }
+        if key == Key::Power {
+            self.power_down_at = Some(now);
+            self.power_menu_spent = false;
+            self.power_pending_off = false;
+        }
         // Any button stops a gliding page, and brings a sliding one to rest.
         self.fling = None;
         self.end_turn();
@@ -6866,8 +7078,9 @@ impl App {
         }
         let mut fx = self.let_chord_go(now);
         if !self.display_on {
-            // The power key lights the dark panel, and does only that, as on
-            // the phone's own system; the other keys leave it dark.
+            // The power key lights the dark panel at once, as the phone's
+            // own does; holding it past three seconds then brings the power
+            // menu up over the page it lit.
             if key == Key::Power {
                 self.wake(now);
             }
@@ -6882,9 +7095,11 @@ impl App {
             return fx;
         }
         // A button pressed just after the panel lit only keeps it awake, so
-        // a power press meant to wake it does not turn it back off.
+        // a power press meant to wake it does not turn it back off. It is
+        // not the start of a three-second hold either.
         if self.just_woke(now) {
             self.stir(now);
+            self.power_down_at = None;
             self.button = Some((key, Press::Spent));
             return fx;
         }
@@ -6952,6 +7167,13 @@ impl App {
                     // Turning the screen off, the key ticks the motor.
                     None => {
                         self.button = Some((key, Press::Spent));
+                        if self.power_down_at.is_some() {
+                            // A hold may still become the power menu: owe
+                            // the screen-off to the release instead of
+                            // turning the panel dark under the finger.
+                            self.power_pending_off = true;
+                            return Vec::new();
+                        }
                         self.sleep(now);
                         return vec![Effect::Ticks];
                     }
@@ -6966,6 +7188,22 @@ impl App {
     /// partner in a screenshot came, the key waiting for it first does what
     /// it does alone.
     pub fn key_up(&mut self, key: Key, now: u64) -> Vec<Effect> {
+        if key == Key::Power {
+            let spent = std::mem::take(&mut self.power_menu_spent);
+            self.power_down_at = None;
+            let off = std::mem::take(&mut self.power_pending_off);
+            if spent {
+                // The hold already opened the menu. Its release must not
+                // also turn the panel off or work a control behind it.
+                self.button = None;
+                return Vec::new();
+            }
+            if off {
+                self.button = None;
+                self.sleep(now);
+                return vec![Effect::Ticks];
+            }
+        }
         let mut fx = match self.chord {
             Some((first, _)) if first == key => self.let_chord_go(now),
             _ => Vec::new(),
@@ -8531,7 +8769,7 @@ mod tests {
     }
 
     #[test]
-    fn a_partition_in_use_cannot_be_unmounted() {
+    fn a_partition_in_use_still_offers_its_switch() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Mount, &f, &i);
         let held = vec!["touch_report".to_string(), "touchsensor".to_string()];
@@ -8540,12 +8778,9 @@ mod tests {
             MountRow { base: "vendor".into(), point: "/vendor".into(), mounted: true, holders: Vec::new() },
         ]));
         let frame = app.frame(&f, &i);
-        assert!(matches!(frame.hits[0].action, Action::Unavailable(_)), "the programs using odm keep it");
+        assert_eq!(frame.hits[0].action, Action::MountToggle(0), "a partition in use can still be asked to go");
         assert_eq!(frame.hits[1].action, Action::MountToggle(1));
-        let busy = frame.hits[0].action;
-        assert!(tap(&mut app, &f, &i, busy).is_empty());
-        app.tick(1000);
-        assert_eq!(app.deadline(1000), Some(TOAST_MS), "it says why");
+        assert_eq!(app.act(Action::MountToggle(0), 0), vec![Effect::Unmount("odm".into())]);
     }
 
     #[test]
@@ -9052,10 +9287,9 @@ mod tests {
 
     #[test]
     fn a_control_that_cannot_work_explains_itself() {
-        let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Mount, W, H, PPD);
         app.set_mounts(Ok(vec![MountRow { base: "odm".into(), point: "/odm".into(), mounted: true, holders: vec!["qseecomd".into()] }]));
-        tap(&mut app, &f, &i, Action::Unavailable("无法卸载正在使用的分区"));
+        app.act(Action::Unavailable("无法卸载正在使用的分区"), 0);
         assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("无法卸载正在使用的分区"));
         // Once the row tapped has faded back, only the message waits.
         app.tick(1000);
@@ -9086,7 +9320,7 @@ mod tests {
         tap_back(&mut app, &f, &i, 2000);
         app.tick(3000);
         tap(&mut app, &f, &i, Action::Open(Screen::Mount));
-        tap(&mut app, &f, &i, Action::Unavailable("A partition in use can't be unmounted"));
+        app.act(Action::Unavailable("A partition in use can't be unmounted"), 3000);
         assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("A partition in use can't be unmounted"), "as do its messages");
     }
 
@@ -11321,6 +11555,65 @@ mod tests {
     }
 
     #[test]
+    fn the_wlan_page_leads_to_local_send_whose_switch_starts_and_stops_it() {
+        use skyward_net::localsend::{Phase as LocalSendPhase, Status as LocalSendStatus};
+        use std::net::Ipv4Addr;
+
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        assert!(!app.state.offers(Screen::LocalSend), "a phone with no WLAN has no LocalSend page");
+        app.state.wlan = Some(Wlan::default());
+        app.refresh();
+        assert!(app.state.offers(Screen::LocalSend));
+
+        app.act(Action::Open(Screen::Wlan), 0);
+        let entry = app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Open(Screen::LocalSend));
+        assert!(entry, "the WLAN page leads to LocalSend");
+        tap(&mut app, &f, &i, Action::Open(Screen::LocalSend));
+        assert_eq!(app.screen(), Screen::LocalSend);
+
+        // Turning it on asks the runtime to start the endpoint at once.
+        assert_eq!(tap(&mut app, &f, &i, Action::Toggle(Switch::LocalSend)), vec![Effect::LocalSend(true)]);
+        assert_eq!(app.state.local_send.phase, LocalSendPhase::Starting, "the switch moves at once");
+
+        // The runtime tells how it stands; the page keeps its switch on.
+        app.set_local_send(LocalSendStatus {
+            phase: LocalSendPhase::Listening,
+            address: Some(Ipv4Addr::new(192, 168, 1, 23)),
+            port: 53317,
+            alias: "Skyward (shennong)".into(),
+            directory: "/sdcard/LocalSend".into(),
+            ..Default::default()
+        });
+        assert_eq!(app.state.local_send.phase, LocalSendPhase::Listening);
+        assert!(app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Toggle(Switch::LocalSend)));
+
+        assert_eq!(tap(&mut app, &f, &i, Action::Toggle(Switch::LocalSend)), vec![Effect::LocalSend(false)]);
+        assert_eq!(app.state.local_send.phase, LocalSendPhase::Off);
+    }
+
+    #[test]
+    fn a_local_send_that_failed_can_be_started_again() {
+        use skyward_net::localsend::{Phase as LocalSendPhase, Status as LocalSendStatus};
+
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.wlan = Some(Wlan::default());
+        app.refresh();
+        app.act(Action::Open(Screen::Wlan), 0);
+        tap(&mut app, &f, &i, Action::Open(Screen::LocalSend));
+        app.set_local_send(LocalSendStatus {
+            phase: LocalSendPhase::Failed,
+            error: Some("请先连接 WLAN，再开启 LocalSend。".into()),
+            ..Default::default()
+        });
+        assert!(app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Toggle(Switch::LocalSend)));
+        assert_eq!(tap(&mut app, &f, &i, Action::Toggle(Switch::LocalSend)), vec![Effect::LocalSend(true)]);
+        assert_eq!(app.state.local_send.phase, LocalSendPhase::Starting);
+        assert!(app.state.local_send.error.is_none(), "a new start puts the old error away");
+    }
+
+    #[test]
     fn the_wlan_page_joins_a_network_with_its_password_and_leaves_it() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Home, W, H, PPD);
@@ -11907,9 +12200,10 @@ mod tests {
         assert!(app.key(Key::Power, 0).is_empty());
         assert_eq!(app.panel(0), Some(SLIDER_START), "it waits for volume down first");
         assert_eq!(app.deadline(0), Some(CHORD_MS));
-        assert_eq!(app.tick(CHORD_MS), vec![Effect::Ticks], "held on alone, it turns the panel off, ticking the motor");
+        assert!(app.tick(CHORD_MS).is_empty(), "a key still held does not darken the panel yet");
+        assert!(app.display_on(), "the panel stays lit while the hold is weighed");
+        assert_eq!(app.key_up(Key::Power, CHORD_MS + 50), vec![Effect::Ticks], "let go, it turns the panel off");
         assert!(!app.display_on());
-        assert!(app.key_up(Key::Power, CHORD_MS + 50).is_empty());
         assert!(app.key(Key::Power, CHORD_MS + 60).is_empty());
         assert_eq!(app.panel(CHORD_MS + 60), Some(SLIDER_START));
         assert!(app.key_up(Key::Power, CHORD_MS + 100).is_empty());
@@ -12055,6 +12349,120 @@ mod tests {
         assert_eq!(app.screen(), Screen::Settings, "the tap counts");
         assert_eq!(app.panel(DIMS + 800), Some(SLIDER_START), "back to full brightness");
         assert_eq!(app.deadline(DIMS + 800), Some(DIMS + 650 + DIMS), "the wait starts over");
+    }
+
+    #[test]
+    fn a_double_tap_on_the_dark_panel_lights_it_onto_the_page_it_left() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Settings, &f, &i);
+        press(&mut app, Key::Power, 0);
+        assert!(!app.display_on());
+        app.touch(Touch::Down(700.0, 1600.0), &f, 1_000);
+        app.touch(Touch::Up, &f, 1_080);
+        assert!(!app.display_on(), "one tap does nothing");
+        app.touch(Touch::Down(706.0, 1604.0), &f, 1_200);
+        app.touch(Touch::Up, &f, 1_280);
+        assert!(app.display_on(), "the second tap lights it");
+        assert_eq!(app.screen(), Screen::Settings, "straight back to the page, no lock screen");
+        assert!(!app.power_menu_open());
+    }
+
+    #[test]
+    fn a_dark_panel_hears_nothing_with_double_tap_turned_off() {
+        let f = fonts();
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.double_tap = false;
+        press(&mut app, Key::Power, 0);
+        app.touch(Touch::Down(700.0, 1600.0), &f, 1_000);
+        app.touch(Touch::Up, &f, 1_080);
+        app.touch(Touch::Down(706.0, 1604.0), &f, 1_200);
+        app.touch(Touch::Up, &f, 1_280);
+        assert!(!app.display_on());
+    }
+
+    #[test]
+    fn holding_the_power_key_three_seconds_opens_the_menu_without_darkening_first() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        assert!(app.key(Key::Power, 0).is_empty());
+        assert!(app.tick(CHORD_MS).is_empty(), "a hold does not darken the panel");
+        assert!(app.display_on());
+        assert_eq!(app.deadline(CHORD_MS), Some(POWER_MENU_MS), "the loop wakes at three seconds");
+        assert!(app.tick(POWER_MENU_MS - 1).is_empty());
+        assert!(!app.power_menu_open());
+        assert!(app.tick(POWER_MENU_MS).is_empty(), "time passing asks nothing of the runtime");
+        assert!(app.power_menu_open());
+        assert!(app.display_on());
+        assert!(app.key_up(Key::Power, POWER_MENU_MS + 100).is_empty(), "the release is spent");
+        assert!(app.power_menu_open(), "and does not turn the panel off");
+    }
+
+    #[test]
+    fn a_short_power_press_never_opens_the_menu() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        assert_eq!(press(&mut app, Key::Power, 1_000), vec![Effect::Ticks]);
+        assert!(!app.power_menu_open());
+        assert!(!app.display_on());
+        app.tick(POWER_MENU_MS + 1_000);
+        assert!(!app.power_menu_open(), "a released key starts no hold");
+    }
+
+    #[test]
+    fn each_pill_reboots_into_its_own_target() {
+        let f = fonts();
+        let targets = [Target::PowerOff, Target::System, Target::Recovery, Target::Fastboot];
+        for (i, target) in targets.into_iter().enumerate() {
+            let mut app = App::new(Screen::Home, W, H, PPD);
+            app.key(Key::Power, 0);
+            app.tick(POWER_MENU_MS);
+            app.key_up(Key::Power, POWER_MENU_MS + 50);
+            assert!(app.power_menu_open());
+            let g = crate::powermenu::geometry(&app.theme().m);
+            let row = g.rows[i];
+            app.touch(Touch::Down(row.rest_x(), row.cy()), &f, 5_000);
+            app.touch(Touch::Move(row.rest_x() + row.travel(), row.cy()), &f, 5_100);
+            assert_eq!(app.touch(Touch::Up, &f, 5_200), vec![Effect::Reboot(target)]);
+            assert!(!app.power_menu_open());
+        }
+    }
+
+    #[test]
+    fn a_short_slide_confirms_nothing_and_a_tap_outside_closes_the_menu() {
+        let f = fonts();
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.key(Key::Power, 0);
+        app.tick(POWER_MENU_MS);
+        app.key_up(Key::Power, POWER_MENU_MS + 50);
+        let g = crate::powermenu::geometry(&app.theme().m);
+        let row = g.rows[0];
+        app.touch(Touch::Down(row.rest_x(), row.cy()), &f, 4_000);
+        app.touch(Touch::Move(row.rest_x() + row.travel() * 0.3, row.cy()), &f, 4_100);
+        assert!(app.touch(Touch::Up, &f, 4_200).is_empty(), "not far enough");
+        assert!(app.power_menu_open());
+        app.touch(Touch::Down(20.0, 20.0), &f, 4_300);
+        assert!(!app.power_menu_open(), "a tap outside sends it away");
+    }
+
+    #[test]
+    fn a_power_key_tap_dismisses_the_menu_and_touches_nothing_behind_it() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.key(Key::Power, 0);
+        app.tick(POWER_MENU_MS);
+        app.key_up(Key::Power, POWER_MENU_MS + 50);
+        assert!(app.power_menu_open());
+        assert!(press(&mut app, Key::Power, POWER_MENU_MS + 200).is_empty());
+        assert!(!app.power_menu_open());
+        assert_eq!(app.screen(), Screen::Home);
+        assert!(app.display_on());
+    }
+
+    #[test]
+    fn the_double_tap_switch_is_kept_in_the_settings() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Settings, &f, &i);
+        assert!(app.state.double_tap);
+        assert!(tap_at(&mut app, &f, &i, Action::Toggle(Switch::DoubleTap), 1_000).is_empty());
+        assert!(!app.state.double_tap);
+        assert!(!Settings::of(&app.state).double_tap);
     }
 
     #[test]

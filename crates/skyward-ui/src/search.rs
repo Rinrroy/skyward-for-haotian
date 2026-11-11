@@ -30,6 +30,12 @@ const MOUNT: Text = ["挂载", "掛載", "Mount"];
 pub const ENTRIES: &[Entry] = &[
     entry(["WLAN", "Wi-Fi", "Wi-Fi"], HOME, Screen::Wlan, &["wuxianwangluo", "wxwl", "wangluo", "wl", "lianwang", "wifi", "wlan"]),
     entry(
+        ["LocalSend 文件传输", "LocalSend 檔案傳輸", "LocalSend file transfer"],
+        ["WLAN", "Wi-Fi", "Wi-Fi"],
+        Screen::LocalSend,
+        &["localsend", "ls", "wenjianhuchuan", "wjhc", "huchuan", "hc", "send", "receive"],
+    ),
+    entry(
         ["双系统", "雙系統", "Dual boot"],
         HOME,
         Screen::Systems,
@@ -81,6 +87,7 @@ pub const ENTRIES: &[Entry] = &[
     entry(["深色模式", "深色模式", "Dark mode"], SETTINGS, Screen::Settings, &["shensemoshi", "ssms", "dark", "theme"]),
     entry(["屏幕亮度", "螢幕亮度", "Screen brightness"], SETTINGS, Screen::Settings, &["pingmuliangdu", "pmld", "liangdu", "ld", "brightness"]),
     entry(["息屏时间", "螢幕自動關閉", "Screen timeout"], SETTINGS, Screen::ScreenOff, &["xipingshijian", "xpsj", "timeout"]),
+    entry(["双击亮屏", "雙擊亮屏", "Double-tap to wake"], SETTINGS, Screen::Settings, &["shuangjiliangping", "sjlp", "doubletap", "wake"]),
     entry(["振动强度", "震動強度", "Vibration intensity"], SETTINGS, Screen::Settings, &["zhendongqiangdu", "zdqd", "qiangdu", "qd", "intensity", "strength"]),
     entry(["触摸振动", "觸控震動", "Touch vibration"], SETTINGS, Screen::Settings, &["chumozhendong", "cmzd", "zhendong", "vibrate", "haptic"]),
     entry(["文件传输", "檔案傳輸", "File transfer"], SETTINGS, Screen::Settings, &["wenjianchuanshu", "wjcs", "chuanshu", "mtp", "usb"]),

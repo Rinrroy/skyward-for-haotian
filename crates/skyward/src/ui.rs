@@ -29,6 +29,7 @@ use skyward_files::Ownership;
 use skyward_block::usb::{self, Drive};
 use skyward_net::download::{self, Failure};
 use skyward_net::http::Servers;
+use skyward_net::localsend::{self, Config as LocalSendConfig, Status as LocalSendStatus};
 use skyward_net::release::{Installed, Release, Unanswered};
 use skyward_net::wlan::{Power as WlanPower, Stage as Joining, Wlan};
 use skyward_sys::sleep::{Sleeper, Slept};
@@ -88,10 +89,13 @@ struct Backlight {
     top: u32,
     /// The raw level last written; at first the one the bootloader left.
     level: u32,
+    /// How far the slider's position is raised before it is written, so
+    /// that the light the panel gives rises evenly to the eye.
+    gamma: f32,
 }
 
 impl Backlight {
-    fn open() -> Result<Self> {
+    fn open(gamma: f32) -> Result<Self> {
         let mut dirs: Vec<PathBuf> = fs::read_dir("/sys/class/backlight")
             .context("read /sys/class/backlight")?
             .map(|e| e.map(|e| e.path()))
@@ -113,13 +117,16 @@ impl Backlight {
         };
         let top = normal_max(read("max_brightness")?)?;
         let level = read("brightness")?;
-        Ok(Backlight { path: dir.join("brightness"), top, level })
+        Ok(Backlight { path: dir.join("brightness"), top, level, gamma })
     }
 
     /// Light the panel at `level` of its normal maximum, or turn it off
     /// with `None`. The file is written only when the raw level changes.
     fn show(&mut self, level: Option<f32>) -> Result<()> {
-        let raw = level.map_or(0, |v| ((v.clamp(0.0, 1.0) * self.top as f32).round() as u32).max(1));
+        let raw = level.map_or(0, |v| {
+            let lit = v.clamp(0.0, 1.0).powf(self.gamma);
+            ((lit * self.top as f32).round() as u32).max(1)
+        });
         if raw != self.level {
             fs::write(&self.path, raw.to_string()).with_context(|| format!("write {}", self.path.display()))?;
             eprintln!("backlight {raw}");
@@ -307,6 +314,30 @@ fn list(app: &mut App, folder: String) -> Result<()> {
 fn list_place(app: &mut App, place: Place, folder: String) -> Result<()> {
     let files = read_folder(&in_place(place, &folder)).map_err(|e| format!("{e:#}"));
     app.set_place(place, folder, files, unix_now()?);
+    Ok(())
+}
+
+/// Whether the port is given to a drive as its host rather than kept as the
+/// device the recovery's own adb and MTP need.
+static PORT_HOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Give the port to a drive as host, so one plugged into it is enumerated
+/// and shows as a drive, or back to the recovery's own adb and MTP. The
+/// gadget is taken off the controller before it turns, and put back after.
+fn host_port(host: bool) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    if PORT_HOST.load(Ordering::Relaxed) == host {
+        return Ok(());
+    }
+    if host {
+        skyward_sys::usb::set("none", USB_TIMEOUT)?;
+        skyward_block::usb::set_host(true)?;
+    } else {
+        skyward_block::usb::set_host(false)?;
+        skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT)?;
+    }
+    PORT_HOST.store(host, Ordering::Relaxed);
+    skyward_sys::kmsg(&format!("the USB port is a {}", if host { "host, for a drive" } else { "device, for adb and MTP" }))?;
     Ok(())
 }
 
@@ -1164,7 +1195,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // adbd and fastbootd ask over it to go over to fastboot and back.
     let control = Control::open()?;
     let mut haptics = cfg.haptics.as_ref().map(Haptics::open).transpose()?;
-    let mut backlight = Backlight::open()?;
+    let mut backlight = Backlight::open(cfg.display.gamma)?;
     let first = match &request.work {
         Work::Fastboot => Screen::Fastboot,
         Work::PromptWipeData => Screen::CantStart,
@@ -1458,6 +1489,10 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         }
         None => None,
     };
+    // The LocalSend endpoint, started from its page once a WLAN is joined.
+    // It runs until its switch is turned off or the recovery leaves the
+    // screen; dropping it stops its listener, announcer and watcher.
+    let mut local_send: Option<localsend::Worker> = None;
     let mut scanned_at = Instant::now();
     app.state.update_server = cfg.update.is_some();
     // Asking the update server, and downloading the full package.
@@ -1544,6 +1579,11 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             port_at = Instant::now();
         }
         let panel = app.panel(now);
+        // A double tap that lights a dark panel needs its touch controller
+        // to keep reporting. Xiaomi's rests with the panel, so while the
+        // gesture is offered a dark panel is left powered, showing a black
+        // frame at zero backlight, and the phone is not let suspend.
+        let keep_touch = app.double_tap_wake() && !app.display_on();
         let mut shown = false;
         if panel.is_some() {
             // A display turned off comes on again with a frame drawn for it.
@@ -1578,6 +1618,16 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             // Lit, a panel that came on again switches to its fastest
             // refresh.
             surface.speed_up()?;
+            rested_at = None;
+        } else if keep_touch {
+            // The panel stays powered so its touch controller keeps
+            // reporting taps. Should the gesture have been turned on after
+            // the panel had already rested or gone off, one black frame
+            // turns it back on without lighting the backlight.
+            if !surface.is_on() {
+                screen.data.fill(0);
+                surface.present(&screen)?;
+            }
             rested_at = None;
         } else if surface.is_on() {
             // With the backlight off, the panel rests, and the touch
@@ -1619,6 +1669,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             || downloader.is_some()
             || skyward_checker.is_some()
             || skyward_updater.is_some()
+            || local_send.is_some()
             || systems_busy;
         let joining = app.state.wlan.as_ref().and_then(|w| w.joined.as_ref()).is_some_and(|j| matches!(j.stage, Joining::Joining | Joining::Addressing));
         let running = match &shell {
@@ -1634,7 +1685,9 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             && !running
             && asked.is_none()
             && usb_link()? != UsbLink::Connected;
-        sleeper.allow(may_sleep);
+        // A double tap needs the CPU awake to hear the panel's taps, so
+        // offering the gesture keeps the phone out of suspend while dark.
+        sleeper.allow(may_sleep && !keep_touch);
         let mut fds = vec![inputs.fd(), uevents.fd(), sleeper.fd()];
         if let Some(i) = &installer {
             fds.push(i.fd());
@@ -1667,6 +1720,9 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             fds.push(p.fd());
         }
         if let Some(w) = &wlan {
+            fds.push(w.fd());
+        }
+        if let Some(w) = &local_send {
             fds.push(w.fd());
         }
         if let Some(c) = &checker {
@@ -2024,6 +2080,11 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             if let Some(t) = traffic {
                 app.set_traffic(t);
             }
+        }
+        // The LocalSend page follows the endpoint the same way: its worker
+        // wakes the poll whenever a peer, a file or the phase changes.
+        if let Some(status) = local_send.as_ref().and_then(|w| w.told()) {
+            app.set_local_send(status);
         }
         // The WLAN page scans again now and then while it shows, as the
         // stock settings do.
@@ -2446,8 +2507,18 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         let job = decrypt::Job::Unlock { closed: closed.clone(), user, credential: code.into_bytes() };
                         decryptor = Some(Decryptor::start(job)?);
                     }
-                    Effect::ReadDir(folder) => list(&mut app, folder)?,
-                    Effect::ReadPlace(place, folder) => list_place(&mut app, place, folder)?,
+                    Effect::ReadDir(folder) => {
+                        if let Err(e) = host_port(false) {
+                            skyward_sys::kmsg(&format!("the USB port is left as it was: {e:#}"))?;
+                        }
+                        list(&mut app, folder)?
+                    }
+                    Effect::ReadPlace(place, folder) => {
+                        if let Err(e) = host_port(place == Place::UsbDrive) {
+                            skyward_sys::kmsg(&format!("the USB port is left as it was: {e:#}"))?;
+                        }
+                        list_place(&mut app, place, folder)?
+                    }
                     // A name taken where an entry goes is the user's to
                     // decide on before anything is written.
                     Effect::Paste { op, path, into, clash } => {
@@ -2642,6 +2713,69 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         wlan_worker(&wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0 })
                     }
                     Effect::LeaveWlan => wlan_worker(&wlan)?.send(wlan::Command::Leave),
+                    Effect::LocalSend(on) => {
+                        if !on {
+                            local_send = None;
+                            app.set_local_send(LocalSendStatus { phase: localsend::Phase::Off, ..Default::default() });
+                        } else if local_send.is_none() {
+                            // Announcing and binding need the address the
+                            // joined network gave, which only the runtime
+                            // holds. Without one, say so on the page.
+                            let address = app
+                                .state
+                                .wlan
+                                .as_ref()
+                                .and_then(|w| w.joined.as_ref())
+                                .and_then(|j| match &j.stage {
+                                    Joining::Connected(link) => Some(link.address),
+                                    _ => None,
+                                });
+                            match address {
+                                None => {
+                                    let why = app.state.lang.pick([
+                                        "请先连接 WLAN，再开启 LocalSend。",
+                                        "請先連線 Wi-Fi，再開啟 LocalSend。",
+                                        "Join a Wi-Fi network before turning LocalSend on.",
+                                    ]);
+                                    skyward_sys::kmsg("LocalSend needs the address a joined WLAN gives")?;
+                                    app.set_local_send(LocalSendStatus {
+                                        phase: localsend::Phase::Failed,
+                                        error: Some(why.to_string()),
+                                        ..Default::default()
+                                    });
+                                }
+                                Some(address) => {
+                                    // Files go to internal storage where it
+                                    // is open, so a package sent over can be
+                                    // installed straight away; otherwise to
+                                    // the recovery's own writable folder.
+                                    let directory = if app.state.data.storage_open() {
+                                        PathBuf::from(skyward_crypto::data::SDCARD).join("LocalSend")
+                                    } else {
+                                        PathBuf::from(skyward_sys::RUN).join("localsend")
+                                    };
+                                    let cfg = LocalSendConfig {
+                                        alias: format!("Skyward ({})", info.codename),
+                                        model: info.model.clone(),
+                                        address,
+                                        directory,
+                                        port: localsend::PORT,
+                                    };
+                                    match localsend::Worker::start(cfg) {
+                                        Ok(w) => local_send = Some(w),
+                                        Err(e) => {
+                                            skyward_sys::kmsg(&format!("LocalSend did not start: {e:#}"))?;
+                                            app.set_local_send(LocalSendStatus {
+                                                phase: localsend::Phase::Failed,
+                                                error: Some(format!("{e:#}")),
+                                                ..Default::default()
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // What the installed system is called is the page's to
                     // report when it cannot be read.
                     Effect::CheckUpdate => {
