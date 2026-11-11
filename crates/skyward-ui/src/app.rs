@@ -6743,13 +6743,15 @@ impl App {
                     // where the finger has brought it and not all at once.
                     if let Some(start) = self.aod_start {
                         let gone = (start - y).max(0.0);
-                        if gone > swipe {
-                            self.aod_start = None;
-                            self.aod_drag = None;
-                            self.wake(now);
-                        } else if swipe_wakes {
-                            self.aod_drag = Some(gone);
-                            self.dirty = true;
+                        if swipe_wakes {
+                            if gone > swipe {
+                                self.aod_start = None;
+                                self.aod_drag = None;
+                                self.wake(now);
+                            } else {
+                                self.aod_drag = Some(gone);
+                                self.dirty = true;
+                            }
                         }
                     }
                 }
