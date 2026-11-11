@@ -166,6 +166,7 @@ fn one(block: &str) -> Option<Saved> {
     if kinds.iter().any(|k| UNJOINABLE.contains(k)) {
         return None;
     }
+    let has = |k: i32| kinds.contains(&k);
     let raw = field(block, "SSID")?;
     let ssid = unquote(&raw);
     if ssid.is_empty() {
@@ -176,13 +177,18 @@ fn one(block: &str) -> Option<Saved> {
     let psk = field(block, "PreSharedKey")
         .map(|v| String::from_utf8_lossy(&unquote(&v)).into_owned())
         .filter(|p| !p.is_empty());
-    let security = match kinds.as_slice() {
-        _ if kinds.iter().any(|k| *k == 2 || *k == 10) => Security::Psk,
-        _ if kinds.iter().any(|k| *k == 4) => Security::Sae,
-        _ if kinds.iter().any(|k| *k == 6) => Security::Owe,
-        _ if kinds.iter().any(|k| *k == 0) => Security::Open,
-        _ if kinds.iter().any(|k| *k == 1) => Security::Wep,
-        _ => Security::Psk,
+    let security = if has(2) || has(10) {
+        Security::Psk
+    } else if has(4) {
+        Security::Sae
+    } else if has(6) {
+        Security::Owe
+    } else if has(0) {
+        Security::Open
+    } else if has(1) {
+        Security::Wep
+    } else {
+        Security::Psk
     };
     let auto_join = bool_field(block, "AutoJoinEnabled").unwrap_or(true);
     Some(Saved { ssid, security, psk, auto_join })
