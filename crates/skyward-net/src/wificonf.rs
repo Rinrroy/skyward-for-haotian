@@ -51,6 +51,8 @@ pub struct Saved {
     pub ssid: Vec<u8>,
     pub security: Security,
     pub psk: Option<String>,
+    /// Whether the system would join this one on its own.
+    pub auto_join: bool,
 }
 
 impl Saved {
@@ -58,9 +60,23 @@ impl Saved {
     /// one, or one whose password the store carries. The enterprise kinds
     /// it cannot join at all, and the reader leaves them out already.
     pub fn joinable(&self) -> bool {
+        if !self.auto_join {
+            return false;
+        }
         match self.security {
             Security::Open | Security::Owe => true,
             _ => self.psk.is_some(),
+        }
+    }
+
+    /// How soon this one is worth joining: a network the phone has a
+    /// password for comes before an open one, which may be nothing more
+    /// than a phone's own hotspot sharing to the people around it.
+    pub fn eagerness(&self) -> u8 {
+        match self.security {
+            Security::Psk | Security::Sae | Security::PskSae => 0,
+            Security::Open | Security::Owe => 1,
+            _ => 2,
         }
     }
 }
@@ -143,8 +159,11 @@ fn parse(text: &str) -> Result<Vec<Saved>> {
 /// What one block of the store says: the network's name, how it is
 /// protected, and the password it joins with.
 fn one(block: &str) -> Option<Saved> {
-    let kind = int_field(block, "SecurityType");
-    if kind.is_some_and(|k| UNJOINABLE.contains(&k)) {
+    // A network may name more than one kind of protection -- a phone that
+    // takes both a password and the newer one says so -- and the kind that
+    // can be joined with a password comes first.
+    let kinds = int_fields(block, "SecurityType");
+    if kinds.iter().any(|k| UNJOINABLE.contains(k)) {
         return None;
     }
     let raw = field(block, "SSID")?;
@@ -152,16 +171,21 @@ fn one(block: &str) -> Option<Saved> {
     if ssid.is_empty() {
         return None;
     }
+    // A password the store writes as an empty element is one it does not
+    // have, and one it writes as a null is one it has no use for.
     let psk = field(block, "PreSharedKey")
         .map(|v| String::from_utf8_lossy(&unquote(&v)).into_owned())
         .filter(|p| !p.is_empty());
-    let security = match kind {
-        Some(0) => Security::Open,
-        Some(1) => Security::Wep,
-        Some(4) => Security::Sae,
+    let security = match kinds.as_slice() {
+        _ if kinds.iter().any(|k| *k == 2 || *k == 10) => Security::Psk,
+        _ if kinds.iter().any(|k| *k == 4) => Security::Sae,
+        _ if kinds.iter().any(|k| *k == 6) => Security::Owe,
+        _ if kinds.iter().any(|k| *k == 0) => Security::Open,
+        _ if kinds.iter().any(|k| *k == 1) => Security::Wep,
         _ => Security::Psk,
     };
-    Some(Saved { ssid, security, psk })
+    let auto_join = bool_field(block, "AutoJoinEnabled").unwrap_or(true);
+    Some(Saved { ssid, security, psk, auto_join })
 }
 
 /// One `<string name="...">value</string>` inside a block of the store, or
@@ -178,16 +202,52 @@ fn field(block: &str, name: &str) -> Option<String> {
     Some(entities(block[rest..end].trim()))
 }
 
-/// One `<int name="...">value</int>`, likewise.
-fn int_field(block: &str, name: &str) -> Option<i32> {
+/// Every `<int name="...">value</int>` in a block, in the order they are
+/// written: a network may name more than one kind of protection.
+fn int_fields(block: &str, name: &str) -> Vec<i32> {
+    let mut out = Vec::new();
     let open = format!(r#"<int name="{name}">"#);
-    if let Some(value) = between(block, &open, "</int>") {
-        return value.trim().parse().ok();
-    }
     let attr = format!(r#"<int name="{name}" value=""#);
-    let rest = block.find(&attr)? + attr.len();
-    let end = block[rest..].find('"')? + rest;
-    block[rest..end].trim().parse().ok()
+    let mut rest = block;
+    loop {
+        let next = rest.find(&open).map(|at| (at, true)).or_else(|| rest.find(&attr).map(|at| (at, false)));
+        let Some((at, element)) = next else {
+            break;
+        };
+        let value = if element {
+            between(rest, &open, "</int>").and_then(|v| v.trim().parse::<i32>().ok())
+        } else {
+            let from = at + attr.len();
+            let end = rest[from..].find('"')? + from;
+            rest[from..end].trim().parse::<i32>().ok()
+        };
+        rest = &rest[at + 1..];
+        match value {
+            Some(v) => out.push(v),
+            None => continue,
+        }
+    }
+    out
+}
+
+/// One `<boolean name="...">value</boolean>`, or the same as an attribute.
+fn bool_field(block: &str, name: &str) -> Option<bool> {
+    let open = format!(r#"<boolean name="{name}">"#);
+    if let Some(value) = between(block, &open, "</boolean>") {
+        return match value.trim() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        };
+    }
+    let attr = format!(r#"<boolean name="{name}" value=""#);
+    let from = block.find(&attr)? + attr.len();
+    let end = block[from..].find('"')? + from;
+    match block[from..end].trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 /// What stands between an opening tag and the one that closes it.

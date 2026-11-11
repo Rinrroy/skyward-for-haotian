@@ -434,7 +434,12 @@ impl Station {
             saved.len(),
             names.join(", ")
         ));
-        let Some(s) = saved.iter().find(|s| s.joinable()) else {
+        // A network the phone has a password for comes first: an open one
+        // is often nothing but a phone's own hotspot sharing itself to the
+        // people around it.
+        let mut wanted: Vec<&skyward_net::wificonf::Saved> = saved.iter().filter(|s| s.joinable()).collect();
+        wanted.sort_by_key(|s| s.eagerness());
+        let Some(s) = wanted.first() else {
             let _ = skyward_sys::kmsg("none of them carries a password the recovery can use");
             return;
         };
