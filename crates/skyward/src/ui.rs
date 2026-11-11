@@ -1654,9 +1654,11 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         }
         // A dark panel with the face on it is turned down rather than off:
         // a panel whose light is at zero gives nothing of the frame back.
+        // Without the face, the light stays at zero and the panel is kept
+        // powered only so that a tap can still be felt.
         let back = match panel {
             Some(v) => Some(v),
-            None if dozing_want => Some(AOD_LIGHT),
+            None if app.state.always_on => Some(AOD_LIGHT),
             None => None,
         };
         backlight.show(back)?;
