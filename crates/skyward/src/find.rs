@@ -8,14 +8,23 @@
 //! that answers a thousand times over must not build a list nothing can
 //! scroll through.
 //!
+//! The walk is also cheap on purpose. It reads the names of a folder and
+//! whether each entry is a folder, and asks [`crate::ui::read_row`] about
+//! the entries it is going to show and no others. Listing a folder the way
+//! the page does costs a stat for every entry and a count of the contents of
+//! every folder in it; a walk that paid both on every entry of every folder
+//! it passed is a walk that makes a keystroke wait, and the box takes a
+//! keystroke at a time.
+//!
 //! A folder that cannot be read is skipped, not reported: a search that
 //! stopped on the first folder it was not allowed in would be useless on
 //! `/data`, where most folders belong to someone else. A link is never
 //! followed into a folder, since a link can lead back up.
 
-use anyhow::Result;
-use skyward_ui::app::{FileKind, Found, SortKey};
+use anyhow::{Context, Result};
+use skyward_ui::app::{FileRow, Found, SortKey};
 use std::collections::VecDeque;
+use std::fs;
 use std::path::Path;
 
 /// How many folders below the one shown are opened at the most.
@@ -40,41 +49,68 @@ pub fn find(root: &Path, query: &str, sort: SortKey) -> Result<Vec<Found>> {
     let mut found = Vec::new();
     let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
     let (mut folders, mut seen) = (0, 0);
+    let mut spent = false;
     while let Some((dir, depth)) = queue.pop_front() {
         folders += 1;
         if folders > MOST_FOLDERS {
             break;
         }
-        let mut rows = match crate::ui::read_folder(&dir) {
-            Ok(rows) => rows,
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
             // The folder the page shows is the one a reason is worth
             // giving for; one below it that will not open is passed over.
             Err(e) if dir != root => {
                 let _ = e;
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e).with_context(|| format!("read {}", dir.display())),
         };
-        // The folder's own rows in the order the list would show them, so
-        // that the box's answer moves with the button beside it.
-        skyward_ui::sort::sort(&mut rows, sort);
-        for row in rows {
+        // The matches in this folder, in the order the list would show them.
+        let mut here: Vec<FileRow> = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) if dir != root => {
+                    let _ = e;
+                    continue;
+                }
+                Err(e) => return Err(e).with_context(|| format!("read {}", dir.display())),
+            };
             seen += 1;
             if seen > MOST_ENTRIES {
-                return Ok(found);
+                spent = true;
+                break;
             }
-            let name = row.name.to_lowercase();
-            if name.contains(&needle) {
-                found.push(Found { folder: dir.to_string_lossy().into_owned(), entry: row.clone() });
-                if found.len() >= MOST_FOUND {
-                    return Ok(found);
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // The kind comes with the name from the folder's own listing on
+            // any filesystem that keeps it, which is the difference between
+            // reading a tree and stating every entry in it.
+            let folder = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            if name.to_lowercase().contains(&needle) {
+                // Only what is shown is looked at closely: its size, its
+                // time and what kind of thing it is are what its row says.
+                if let Some(row) = crate::ui::read_row(&entry.path())? {
+                    here.push(row);
                 }
             }
             // Only a folder of the folder's own is gone into: a link to one
             // may point anywhere, including back up this tree.
-            if matches!(row.kind, FileKind::Folder { .. }) && depth < MOST_DEPTH {
-                queue.push_back((dir.join(&row.name), depth + 1));
+            if folder && depth < MOST_DEPTH {
+                queue.push_back((entry.path(), depth + 1));
             }
+        }
+        skyward_ui::sort::sort(&mut here, sort);
+        if !here.is_empty() {
+            let at = dir.to_string_lossy().into_owned();
+            for row in here {
+                found.push(Found { folder: at.clone(), entry: row });
+                if found.len() >= MOST_FOUND {
+                    return Ok(found);
+                }
+            }
+        }
+        if spent {
+            break;
         }
     }
     Ok(found)
@@ -83,7 +119,6 @@ pub fn find(root: &Path, query: &str, sort: SortKey) -> Result<Vec<Found>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     /// A tree under a folder of its own, gone at the end of the test.
     struct Tree(std::path::PathBuf);
@@ -174,5 +209,26 @@ mod tests {
         }
         let found = find(&tree.0, "sea", SortKey::Name).expect("a tree that reads");
         assert_eq!(found.len(), MOST_FOUND);
+    }
+
+    #[test]
+    fn what_a_match_is_is_told_apart_from_what_a_name_says() {
+        let tree = Tree::made("kinds");
+        tree.file("sea.jpg");
+        fs::create_dir_all(tree.0.join("sea-folder")).expect("a folder to find");
+        std::os::unix::fs::symlink("sea.jpg", tree.0.join("sea-link")).expect("a link to find");
+
+        let found = find(&tree.0, "sea", SortKey::Name).expect("a tree that reads");
+        let mut kinds: Vec<(&str, bool)> = found
+            .iter()
+            .map(|f| {
+                let folder = matches!(f.entry.kind, skyward_ui::app::FileKind::Folder { .. } | skyward_ui::app::FileKind::Link { folder: true, .. });
+                (f.entry.name.as_str(), folder)
+            })
+            .collect();
+        kinds.sort();
+        // The folder is one, the link to a file is not, and the file is not:
+        // the walk tells them apart without opening every folder it passes.
+        assert_eq!(kinds, vec![("sea-folder", true), ("sea-link", false), ("sea.jpg", false)]);
     }
 }

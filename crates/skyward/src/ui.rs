@@ -964,45 +964,59 @@ fn waiting_of(closed: &[Closed]) -> Vec<skyward_crypto::users::Waiting> {
 /// many entries it holds. An entry gone by the time it is looked at, as
 /// processes in /proc go, is left out.
 pub(crate) fn read_folder(path: &Path) -> Result<Vec<FileRow>> {
-    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
     let mut rows = Vec::new();
     for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
         let full = entry.with_context(|| format!("read {}", path.display()))?.path();
-        let meta = match fs::symlink_metadata(&full) {
-            Ok(meta) => meta,
-            Err(e) if gone(&e) => continue,
-            Err(e) => return Err(e).with_context(|| format!("stat {}", full.display())),
-        };
-        let kind = if meta.file_type().is_symlink() {
-            let target = fs::read_link(&full).with_context(|| format!("read the link {}", full.display()))?;
-            // A link to nothing leads to no folder.
-            let folder = match fs::metadata(&full) {
-                Ok(to) => to.is_dir(),
-                Err(e) if gone(&e) => false,
-                Err(e) => return Err(e).with_context(|| format!("follow {}", full.display())),
-            };
-            FileKind::Link { target: target.to_string_lossy().into_owned(), folder }
-        } else if meta.is_dir() {
-            // A folder that may not be read shows that in place of a count.
-            let items = match fs::read_dir(&full) {
-                Ok(inside) => Some(inside.count()),
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
-                Err(e) if gone(&e) => continue,
-                Err(e) => return Err(e).with_context(|| format!("read {}", full.display())),
-            };
-            FileKind::Folder { items }
-        } else if meta.is_file() {
-            FileKind::File
-        } else {
-            FileKind::Special
-        };
-        let name = full.file_name().with_context(|| format!("{} has no name", full.display()))?.to_string_lossy().into_owned();
-        rows.push(FileRow { name, kind, size: meta.len(), modified: meta.mtime(), mode: meta.mode(), uid: meta.uid(), gid: meta.gid() });
+        if let Some(row) = read_row(&full)? {
+            rows.push(row);
+        }
     }
     // The order is not decided here: `skyward_ui::sort::sort` is the one
     // place that decides one, so that the file page's switch and the choose
     // pages cannot disagree with each other about the same folder.
     Ok(rows)
+}
+
+/// What the file manager shows for one entry of a folder: its name, what
+/// kind of thing it is, and the size, time and owner its row says. `Ok(None)`
+/// is an entry gone by the time it is looked at, as processes in /proc go.
+///
+/// This is the only place one entry is looked at closely, so that a walk of
+/// a whole tree can ask it about the entries it is going to show and not
+/// about every entry it passes: a stat per entry, and a count of the
+/// contents of every folder passed, is what makes such a walk slow.
+pub(crate) fn read_row(full: &Path) -> Result<Option<FileRow>> {
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let meta = match fs::symlink_metadata(full) {
+        Ok(meta) => meta,
+        Err(e) if gone(&e) => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("stat {}", full.display())),
+    };
+    let kind = if meta.file_type().is_symlink() {
+        let target = fs::read_link(full).with_context(|| format!("read the link {}", full.display()))?;
+        // A link to nothing leads to no folder.
+        let folder = match fs::metadata(full) {
+            Ok(to) => to.is_dir(),
+            Err(e) if gone(&e) => false,
+            Err(e) => return Err(e).with_context(|| format!("follow {}", full.display())),
+        };
+        FileKind::Link { target: target.to_string_lossy().into_owned(), folder }
+    } else if meta.is_dir() {
+        // A folder that may not be read shows that in place of a count.
+        let items = match fs::read_dir(full) {
+            Ok(inside) => Some(inside.count()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(e) if gone(&e) => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("read {}", full.display())),
+        };
+        FileKind::Folder { items }
+    } else if meta.is_file() {
+        FileKind::File
+    } else {
+        FileKind::Special
+    };
+    let name = full.file_name().with_context(|| format!("{} has no name", full.display()))?.to_string_lossy().into_owned();
+    Ok(Some(FileRow { name, kind, size: meta.len(), modified: meta.mtime(), mode: meta.mode(), uid: meta.uid(), gid: meta.gid() }))
 }
 
 /// The slot's logical partitions and how each shows now, for the mount page.
