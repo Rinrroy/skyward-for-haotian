@@ -723,6 +723,23 @@ pub enum FileKind {
     Special,
 }
 
+/// An entry a search found, and the folder it is in: what the search box
+/// shows is the whole tree under the folder on the page, so a row of that
+/// list has to say which folder its entry came from — two folders can hold
+/// the same name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Found {
+    /// The folder the entry is in.
+    pub folder: String,
+    /// The entry, named as it is in that folder.
+    pub entry: FileRow,
+}
+
+/// The folder an entry a search found is in, and its name, as one path.
+pub fn found_path(found: &Found) -> String {
+    std::path::Path::new(&found.folder).join(&found.entry.name).to_string_lossy().into_owned()
+}
+
 /// A folder as a list of its entries shows it: where it is, what is in it
 /// as the runtime read it or why it could not, and when it was read, in
 /// Unix seconds: dates in the list are told against that day.
@@ -1380,6 +1397,9 @@ pub enum Action {
     /// Open the file manager's entry at this place in the folder: a folder
     /// to look in, a text file to edit, or what can be done with any other.
     OpenEntry(usize),
+    /// Open row `i` of what the file manager's search box found, which may
+    /// be in any folder below the one the page shows.
+    OpenFound(usize),
     /// Open the terminal in the folder the file manager shows.
     TerminalHere,
     /// Open the entry at this place in a place's folder: a folder to look
@@ -1878,6 +1898,19 @@ pub struct State {
     /// Whether the file manager's keyboard stands at the bottom of it,
     /// typing into that box.
     pub files_search: bool,
+    /// What that box found in the folders below the one shown: `None` while
+    /// nothing is typed or while the search runs, and the reason it could
+    /// not run when it could not.
+    pub found: Option<Result<Vec<Found>, String>>,
+    /// A search is looking through the folders below the one shown.
+    pub finding: bool,
+    /// Which search an answer belongs to: typing over a query asks for
+    /// another search, and an answer to a query already typed over is
+    /// dropped rather than shown under the new one.
+    pub find_gen: u64,
+    /// Where the entry the file page describes is, when a search found it
+    /// and it is therefore not in the folder the list shows.
+    pub file_path: Option<String>,
     /// Whether the recovery's own update reaches GitHub through a mirror in
     /// the mainland. On by default: the check goes direct first either way,
     /// so trying the mirror costs nothing when GitHub answers.
@@ -2105,6 +2138,10 @@ impl Default for State {
             sort: SortKey::default(),
             files_query: String::new(),
             files_search: false,
+            found: None,
+            finding: false,
+            find_gen: 0,
+            file_path: None,
             mirror: true,
             remember_wlan: true,
             storage: Folder::new(""),
@@ -2358,6 +2395,10 @@ pub enum Effect {
     Unmount(String),
     /// List the folder at this path for the file manager.
     ReadDir(String),
+    /// Look through the folders below `root` for the entries `query` names,
+    /// telling what it found with [`App::found_files`] against search `gen`
+    /// so that an answer to a query already typed over is dropped.
+    FindFiles { root: String, query: String, gen: u64, sort: SortKey },
     /// List the folder at this path from the top of a place, to choose a
     /// file to install in, telling what it holds with [`App::set_place`].
     ReadPlace(Place, String),
@@ -3899,6 +3940,7 @@ impl App {
         if self.screen() == Screen::FileInfo {
             self.leave(false);
             self.state.file = None;
+            self.state.file_path = None;
             self.state.asking_delete = false;
             self.stack.pop();
         }
@@ -4610,13 +4652,16 @@ impl App {
         if screen == Screen::Files && folder != self.state.files.path {
             self.state.files_query.clear();
             self.state.files_search = false;
+            self.clear_found();
         }
-        let query = if screen == Screen::Files { self.state.files_query.clone() } else { String::new() };
         let shown = self.state.folder_mut(screen);
         shown.path = folder;
         shown.entries = files;
         shown.listed = listed;
-        shown.keep(&query);
+        // The rows of a folder are all of them: what the box finds is the
+        // tree below it, and that is a list of its own, so nothing here is
+        // kept back by the text in the box.
+        shown.keep("");
         self.refresh();
     }
 
@@ -6158,7 +6203,36 @@ impl App {
                         return self.install_opened(path, entry.size, now);
                     }
                     FileKind::File | FileKind::Link { folder: false, .. } | FileKind::Special => {
+                        self.state.file_path = None;
                         self.state.file = Some(entry);
+                        self.open(Screen::FileInfo);
+                    }
+                }
+            }
+            // What a search found is opened from its own row, whatever folder
+            // under this one it is in: a folder goes to that folder, with the
+            // box emptied, and anything else opens as it would there.
+            Action::OpenFound(i) => {
+                let Some(found) = self.state.found.as_ref().and_then(|f| f.as_ref().ok()).and_then(|list| list.get(i)).cloned() else {
+                    return Vec::new();
+                };
+                let path = found_path(&found);
+                match found.entry.kind {
+                    FileKind::Folder { .. } | FileKind::Link { folder: true, .. } => {
+                        let scroll = self.top().1;
+                        self.state.files.leave(scroll);
+                        self.clear_found();
+                        return vec![Effect::ReadDir(found.folder)];
+                    }
+                    FileKind::File if matches!(files::file_type(&found.entry.name), FileType::Text | FileType::Code) => {
+                        return vec![Effect::OpenText(path)];
+                    }
+                    _ if installs(&found.entry) => {
+                        return self.install_opened(path, found.entry.size, now);
+                    }
+                    FileKind::File | FileKind::Link { folder: false, .. } | FileKind::Special => {
+                        self.state.file_path = Some(path);
+                        self.state.file = Some(found.entry);
                         self.open(Screen::FileInfo);
                     }
                 }
@@ -6384,6 +6458,12 @@ impl App {
                 let next = SORT_KEYS[(at + 1) % SORT_KEYS.len()];
                 self.state.sort = next;
                 self.refresh();
+                // What the box found is ordered by the same key, so it is
+                // looked for again in the new order rather than left in the
+                // old one under a button that says otherwise.
+                if !self.state.files_query.trim().is_empty() {
+                    return self.find_files();
+                }
                 return vec![Effect::ReadDir(self.state.files.path.clone())];
             }
             Action::FilesSearch => {
@@ -6402,6 +6482,7 @@ impl App {
                 if !self.state.files_query.is_empty() {
                     self.state.files_query.clear();
                     self.state.files.keep("");
+                    self.clear_found();
                     self.edits += 1;
                     self.refresh();
                 }
@@ -6514,7 +6595,13 @@ impl App {
     /// with the work it just began still going.
     fn entry_path(&self) -> Option<String> {
         let entry = self.state.file.as_ref()?;
-        Some(self.state.files.inside(&entry.name))
+        // An entry a search found is in a folder the list does not show, and
+        // its own path says where: joining it to the folder on the page would
+        // name a file that is not there.
+        Some(match &self.state.file_path {
+            Some(path) => path.clone(),
+            None => self.state.files.inside(&entry.name),
+        })
     }
 
     /// What a page whose entry has gone says, instead of acting on nothing.
@@ -6776,7 +6863,7 @@ impl App {
         // key; the pages that type above their keyboard keep it as it was.
         if self.screen() == Screen::Files {
             if matches!(cap, Cap::Char(_) | Cap::Space | Cap::Backspace) {
-                self.filter_files();
+                return self.find_files();
             }
             self.refresh();
         } else if matches!(cap, Cap::Char(_) | Cap::Space | Cap::Backspace) && self.state.layer == layer {
@@ -6788,10 +6875,46 @@ impl App {
         Vec::new()
     }
 
-    /// Keep the file manager's rows down to the entries its box finds.
-    fn filter_files(&mut self) {
-        let query = self.state.files_query.clone();
-        self.state.files.keep(&query);
+    /// Look through the folders below the one shown for what the box says,
+    /// which is what its list shows while anything is typed. The folder's own
+    /// entries stay whole behind it, so emptying the box puts them back
+    /// without reading the folder again.
+    fn find_files(&mut self) -> Vec<Effect> {
+        self.state.files.keep("");
+        let query = self.state.files_query.trim().to_owned();
+        self.state.find_gen += 1;
+        let gen = self.state.find_gen;
+        if query.is_empty() {
+            self.clear_found();
+            self.refresh();
+            return Vec::new();
+        }
+        // Nothing to show until the answer comes: an older answer would be
+        // rows of the query before this one.
+        self.state.found = None;
+        self.state.finding = true;
+        self.refresh();
+        vec![Effect::FindFiles { root: self.state.files.path.clone(), query, gen, sort: self.state.sort }]
+    }
+
+    /// Forget what a search found, because its text is gone or the folder
+    /// under it has changed.
+    fn clear_found(&mut self) {
+        self.state.found = None;
+        self.state.finding = false;
+        self.state.find_gen += 1;
+    }
+
+    /// What the search `gen` found, or why it could not look: an answer to a
+    /// query typed over since is dropped, since the rows under the box are
+    /// the rows of the text that is in it now.
+    pub fn found_files(&mut self, gen: u64, found: Result<Vec<Found>, String>) {
+        if gen != self.state.find_gen {
+            return;
+        }
+        self.state.finding = false;
+        self.state.found = Some(found);
+        self.refresh();
     }
 
     pub fn touch(&mut self, ev: Touch, f: &Fonts, now: u64) -> Vec<Effect> {
@@ -11028,7 +11151,7 @@ mod tests {
     }
 
     #[test]
-    fn the_file_page_searches_inside_the_folder_and_one_button_cycles_the_order() {
+    fn the_file_page_searches_below_its_folder_and_one_button_cycles_the_order() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Files, W, H, PPD);
         app.set_files(
@@ -11055,28 +11178,39 @@ mod tests {
         assert_eq!(app.screen(), Screen::Files, "the keyboard does not leave the page");
 
         // A key in the strip is where the finger is: the dock's hits are in
-        // its own corner, and the screen adds the strip's height back.
-        assert!(tap_at(&mut app, &f, &i, Action::Type(Cap::Char('b')), 1010).is_empty());
+        // its own corner, and the screen adds the strip's height back. What
+        // it asks for is a walk of the folders below this one, since a name
+        // three folders down is what a search of one folder cannot find.
+        assert_eq!(
+            tap_at(&mut app, &f, &i, Action::Type(Cap::Char('b')), 1010),
+            vec![Effect::FindFiles { root: "/sdcard".into(), query: "b".into(), gen: 1, sort: SortKey::Name }]
+        );
         assert_eq!(app.state.files_query, "b");
-        let shown: Vec<String> = app.state.files.shown_entries().iter().map(|e| e.name.clone()).collect();
-        assert_eq!(shown, vec!["beta.zip".to_string()], "only the name holding what was typed");
+        assert!(app.state.finding, "the page says it is looking");
+        assert_eq!(app.state.files.shown_entries().len(), 3, "the folder's own list stays whole behind the box");
+        assert_eq!(app.frame(&f, &i).rows.as_ref().map(|r| r.count()), None, "nothing is listed until the answer comes");
 
-        // The row that is drawn is the entry the row opens, even though it is
-        // the second entry in the folder: the row asks for row 0 of the list,
-        // which is entry 1.
-        assert_eq!(app.state.files.entry(0).map(|e| e.name.as_str()), Some("beta.zip"));
+        // The answer is the list: a row per entry found, wherever it is.
+        app.found_files(1, Ok(vec![Found { folder: "/sdcard/DCIM/Camera".into(), entry: entry("beach.jpg", FileKind::File) }]));
+        assert!(!app.state.finding);
+        assert_eq!(app.frame(&f, &i).rows.as_ref().map(|r| r.count()), Some(1), "the entry found below the folder is the list");
 
-        // One button, and it turns: name, then modified, then kind, then name.
+        // One button, and it turns: name, then modified, then kind, then
+        // name. With the box holding something it looks again in the new
+        // order rather than leaving the rows in the old one.
         assert_eq!(app.state.sort, SortKey::Name);
-        for expected in [SortKey::Modified, SortKey::Kind, SortKey::Name] {
-            assert_eq!(tap_at(&mut app, &f, &i, Action::CycleSort, 1015), vec![Effect::ReadDir("/sdcard".into())], "the folder is listed again");
+        for (n, expected) in [SortKey::Modified, SortKey::Kind, SortKey::Name].into_iter().enumerate() {
+            let asked = tap_at(&mut app, &f, &i, Action::CycleSort, 1015);
+            assert_eq!(asked, vec![Effect::FindFiles { root: "/sdcard".into(), query: "b".into(), gen: 2 + n as u64, sort: expected }], "the tree is walked again in the new order");
             assert_eq!(app.state.sort, expected);
         }
 
         // The cross on the box shows everything again, and Done puts the
         // keyboard away without leaving the page.
         assert!(tap_at(&mut app, &f, &i, Action::ClearFilesQuery, 1020).is_empty(), "clearing is not a listing");
+        assert!(app.state.found.is_none(), "what was found is gone with the text");
         assert_eq!(app.state.files.shown_entries().len(), 3, "every entry comes back");
+        assert_eq!(app.frame(&f, &i).rows.as_ref().map(|r| r.count()), Some(3));
         assert!(app.act(Action::CloseFilesSearch, 1025).is_empty());
         assert!(app.frame(&f, &i).dock.is_none(), "the keyboard goes away");
 
@@ -11086,6 +11220,55 @@ mod tests {
         app.set_files("/sdcard/DCIM".into(), Ok(vec![entry("photo.jpg", FileKind::File)]), LISTED);
         assert_eq!(app.state.files_query, "", "a folder opened is searched from nothing");
         assert_eq!(app.state.files.shown_entries().len(), 1);
+    }
+
+    #[test]
+    fn what_a_search_found_opens_where_it_is_and_not_where_the_page_is() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Files, W, H, PPD);
+        app.set_files("/sdcard".into(), Ok(vec![entry("DCIM", folder(2))]), LISTED);
+        tap(&mut app, &f, &i, Action::FilesSearch);
+        tap_at(&mut app, &f, &i, Action::Type(Cap::Char('b')), 1000);
+        app.found_files(
+            1,
+            Ok(vec![
+                Found { folder: "/sdcard/DCIM/Camera".into(), entry: entry("beach.jpg", FileKind::File) },
+                Found { folder: "/sdcard/DCIM/Camera".into(), entry: entry("backup", folder(3)) },
+            ]),
+        );
+
+        // A file found opens the page about it, and that page acts on the
+        // path it was found at: joined to the folder on the file page, its
+        // name would be a file that is not there.
+        assert!(app.act(Action::OpenFound(0), 1005).is_empty());
+        assert_eq!(app.screen(), Screen::FileInfo);
+        assert_eq!(app.state.file.as_ref().map(|e| e.name.as_str()), Some("beach.jpg"));
+        assert_eq!(app.act(Action::EditEntry, 1006), vec![Effect::OpenText("/sdcard/DCIM/Camera/beach.jpg".into())]);
+
+        // A folder found goes to that folder, and the box empties: what is
+        // typed is for the tree it was typed over.
+        app.act(Action::Back, 1007);
+        assert_eq!(app.screen(), Screen::Files);
+        assert_eq!(app.act(Action::OpenFound(1), 1011), vec![Effect::ReadDir("/sdcard/DCIM/Camera".into())]);
+        assert_eq!(app.state.files_query, "");
+        assert!(app.state.found.is_none());
+    }
+
+    #[test]
+    fn an_answer_to_a_query_typed_over_is_dropped() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Files, W, H, PPD);
+        app.set_files("/sdcard".into(), Ok(vec![entry("alpha.txt", FileKind::File)]), LISTED);
+        tap(&mut app, &f, &i, Action::FilesSearch);
+        tap_at(&mut app, &f, &i, Action::Type(Cap::Char('a')), 1000);
+        tap_at(&mut app, &f, &i, Action::Type(Cap::Char('l')), 1001);
+
+        // The answer to "a" arrives while the box says "al": its rows are
+        // not the rows of the text in the box, so they are not shown.
+        app.found_files(1, Ok(vec![Found { folder: "/sdcard".into(), entry: entry("alpha.txt", FileKind::File) }]));
+        assert!(app.state.found.is_none(), "an answer to a query typed over is not the list");
+        app.found_files(2, Ok(vec![Found { folder: "/sdcard/x".into(), entry: entry("alfa.txt", FileKind::File) }]));
+        assert!(app.state.found.is_some(), "the answer to what the box says now is");
     }
 
     #[test]

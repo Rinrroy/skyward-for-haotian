@@ -74,9 +74,13 @@ happened to return it.
 
 A search box above the list keeps only the names that contain what is typed,
 ignoring case; it is pinned under the bar, so scrolling cannot take it away, and
-the keyboard it brings up sits at the bottom of the same page. The order is one
-button beside the box that turns on each tap — name, time, type — rather than
-three buttons that are all there at once.
+the keyboard it brings up sits at the bottom of the same page. The search walks the
+folders *below* the one on the page too, and each row names the folder its entry is
+in; a file found opens on its own page, a folder found goes into it. The walk is
+capped (2000 folders, 40000 entries, 200 results, 12 levels) so it can never hang
+the screen, and unreadable folders are skipped. The order is one button beside the
+box that turns on each tap — name, time, type — rather than three buttons that are
+all there at once.
 
 ### Terminal
 

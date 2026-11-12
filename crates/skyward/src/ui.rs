@@ -963,7 +963,7 @@ fn waiting_of(closed: &[Closed]) -> Vec<skyward_crypto::users::Waiting> {
 /// links to folders first, then by name ignoring case, each folder with how
 /// many entries it holds. An entry gone by the time it is looked at, as
 /// processes in /proc go, is left out.
-fn read_folder(path: &Path) -> Result<Vec<FileRow>> {
+pub(crate) fn read_folder(path: &Path) -> Result<Vec<FileRow>> {
     let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
     let mut rows = Vec::new();
     for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
@@ -2765,6 +2765,15 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         }
                     },
                     Effect::ReadDir(folder) => list(&mut app, folder, &closed)?,
+                    // The box's answer is bounded work done here rather than
+                    // on a thread of its own: it stops at a couple of
+                    // thousand folders, so the page waits a moment and the
+                    // run cannot be held by a tree that never ends. Failing
+                    // to walk it says so on the page; it does not end the run.
+                    Effect::FindFiles { root, query, gen, sort } => {
+                        let found = crate::find::find(Path::new(&root), &query, sort).map_err(|e| format!("{e:#}"));
+                        app.found_files(gen, found);
+                    }
                     Effect::ReadPlace(place, folder) => list_place(&mut app, place, folder)?,
                     // A name taken where an entry goes is the user's to
                     // decide on before anything is written.

@@ -1,4 +1,4 @@
-use crate::app::{Action, FileKind, FileRow, Hit, Pinned, Rows};
+use crate::app::{Action, FileKind, FileRow, Found, Hit, Pinned, Rows};
 use crate::canvas::Canvas;
 use crate::color::{mix, Rgba};
 use crate::fmt;
@@ -35,6 +35,11 @@ pub const SEARCHED_ROWS_TOP_DP: f32 = ROWS_TOP_DP + HEAD_DP;
 const ROW_DP: f32 = 72.0;
 /// What a second line of name adds to a row.
 const NAME_LINE_DP: f32 = 22.33;
+/// What the line naming the folder of an entry a search found adds to its
+/// row, and where that line's ink sits below the line it follows.
+const FOUND_LINE_DP: f32 = 20.0;
+const FOUND_BASE_DP: f32 = 13.0;
+const FOUND_DP: f32 = 10.4;
 const SIDE_DP: f32 = 28.0;
 const ICON_DP: f32 = 40.0;
 const TEXT_X_DP: f32 = 84.0;
@@ -223,6 +228,47 @@ pub fn rows(t: &Theme, f: &Fonts, top: f32, entries: &[&FileRow], action: fn(usi
         edges.push(y);
     }
     Rows { edges, action: Some(action) }
+}
+
+/// The rows of what a search found, each a line taller than a folder's own
+/// rows: the folder the entry is in is written under it, because one list of
+/// a whole tree can hold two entries of the same name.
+pub fn found_rows(t: &Theme, f: &Fonts, top: f32, found: &[&Found], action: fn(usize) -> Action) -> Rows {
+    let m = &t.m;
+    let w = name_width(t);
+    let mut y = m.dp(top).round();
+    let mut edges = Vec::with_capacity(found.len() + 1);
+    edges.push(y);
+    for e in found {
+        let lines = name_lines(&f.heading, m.dp(NAME_DP), &e.entry.name, w).len();
+        y += (m.dp(ROW_DP) + m.dp(NAME_LINE_DP) * (lines - 1) as f32 + m.dp(FOUND_LINE_DP)).round();
+        edges.push(y);
+    }
+    Rows { edges, action: Some(action) }
+}
+
+/// What a search found, drawn as its entry's row with the folder it is in
+/// under it, named from the folder searched in rather than from the top of
+/// the filesystem.
+#[allow(clippy::too_many_arguments)]
+pub fn found_row(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, found: &Found, root: &str, now: i64, zone: usize) {
+    row(c, t, f, l, &found.entry, now, zone);
+    let m = &t.m;
+    let (x, w) = (m.dp(TEXT_X_DP), name_width(t));
+    let lines = name_lines(&f.heading, m.dp(NAME_DP), &found.entry.name, w).len();
+    let y = m.dp(LINE_BASE_DP + NAME_LINE_DP * (lines - 1) as f32 + FOUND_BASE_DP);
+    c.text(&f.value, &in_folder(&found.folder, root), x, y, m.dp(FOUND_DP), palette(t).note, Some(w));
+}
+
+/// The folder a found entry is in, said from the one searched in: the part
+/// of the path below it, or the folder searched in itself for an entry of
+/// that folder.
+fn in_folder(folder: &str, root: &str) -> String {
+    let under = Path::new(folder).strip_prefix(root).map(|rest| rest.to_string_lossy().into_owned()).unwrap_or_default();
+    match under.trim_matches('/') {
+        "" => Path::new(root).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| folder.to_string()),
+        rest => rest.to_string(),
+    }
 }
 
 /// Entry `e`'s row over the whole of `c`, sized for it: its icon, its name

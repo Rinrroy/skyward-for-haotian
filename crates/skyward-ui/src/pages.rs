@@ -1,6 +1,6 @@
 use crate::app::{
     Action, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop, Field, FileKind,
-    FileOp, FileRow, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
+    FileOp, FileRow, FileTask, Fold, Folder, Found, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
     SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, SortKey, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink,
     Wipe, ADDABLE, BACKUP_PARTS, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES,
     USB_DRIVE_UNREADABLE, USB_DRIVE_WANTED, WIPES, installs, starting,
@@ -3570,23 +3570,15 @@ fn file_listing(cx: &Ctx) -> Frame {
             files::note(&mut c, t, f, files::SEARCHED_ROWS_TOP_DP, l.pick(["无法读取该文件夹", "無法讀取這個資料夾", "This folder can't be read"]), Some(why));
             None
         }
+        Ok(_) if !s.files_query.trim().is_empty() => search_rows(cx, &mut c),
         Ok(entries) if entries.is_empty() => {
             files::note(&mut c, t, f, files::SEARCHED_ROWS_TOP_DP, l.pick(["暂无文件", "沒有檔案", "No files"]), None);
             None
         }
-        Ok(entries) if s.files_query.trim().is_empty() => {
+        Ok(_) => {
             let shown = folder_rows(&s.files);
             Some(files::rows(t, f, files::SEARCHED_ROWS_TOP_DP, &shown, Action::OpenEntry))
         }
-        Ok(_) => match folder_rows(&s.files) {
-            found if found.is_empty() => {
-                let typed = s.files_query.trim();
-                let none = tr!(l, "没有名称含“{typed}”的条目", "沒有名稱含「{typed}」的項目", "Nothing here is named “{typed}”");
-                files::note(&mut c, t, f, files::SEARCHED_ROWS_TOP_DP, &none, None);
-                None
-            }
-            found => Some(files::rows(t, f, files::SEARCHED_ROWS_TOP_DP, &found, Action::OpenEntry)),
-        },
     };
     let root = l.pick(["根目录", "根目錄", "Root"]);
     let hint = l.pick(FILES_SEARCH_HINT);
@@ -3600,6 +3592,34 @@ fn file_listing(cx: &Ctx) -> Frame {
 /// The entries a folder's rows show, in order, as the rows take them.
 fn folder_rows(folder: &Folder) -> Vec<&FileRow> {
     folder.shown_entries()
+}
+
+/// The rows of what the search box found in the folders below this one, or
+/// in place of them why there is nothing to show yet: the search still
+/// looking, or that it could not look at all.
+fn search_rows(cx: &Ctx, c: &mut Canvas) -> Option<Rows> {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let typed = s.files_query.trim();
+    let top = files::SEARCHED_ROWS_TOP_DP;
+    match &s.found {
+        None => {
+            files::note(c, t, f, top, l.pick(["正在搜索…", "正在搜尋…", "Searching…"]), None);
+            None
+        }
+        Some(Err(why)) => {
+            files::note(c, t, f, top, l.pick(["无法搜索该文件夹", "無法搜尋這個資料夾", "This folder can't be searched"]), Some(why));
+            None
+        }
+        Some(Ok(found)) if found.is_empty() => {
+            let none = tr!(l, "没有名称含“{typed}”的条目，子文件夹也搜过了", "沒有名稱含「{typed}」的項目，子資料夾也搜過了", "Nothing below here is named “{typed}”, subfolders included");
+            files::note(c, t, f, top, &none, None);
+            None
+        }
+        Some(Ok(found)) => {
+            let shown: Vec<&Found> = found.iter().collect();
+            Some(files::found_rows(t, f, top, &shown, Action::OpenFound))
+        }
+    }
 }
 
 const FILES_SEARCH_HINT: Text = ["搜索文件", "搜尋檔案", "Search files"];
@@ -3682,6 +3702,13 @@ fn listing(
 /// drawn as the row comes into view.
 pub fn row(screen: Screen, cx: &Ctx, i: usize, c: &mut Canvas) {
     match screen {
+        // What the search box found comes from anywhere below the folder on
+        // the page, so its rows are not the folder's rows.
+        Screen::Files if !cx.state.files_query.trim().is_empty() => {
+            let Some(list) = cx.state.found.as_ref().and_then(|f| f.as_ref().ok()) else { return };
+            let Some(found) = list.get(i) else { return };
+            files::found_row(c, cx.t, cx.f, cx.state.lang, found, &cx.state.files.path, cx.state.files.listed, cx.state.time_zone);
+        }
         Screen::Files | Screen::Choose(_) => {
             let folder = cx.state.folder(screen);
             let Some(e) = folder.entry(i) else { return };
