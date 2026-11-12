@@ -72,17 +72,26 @@ impl Worker {
         let (tell, told) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let halting = stop.clone();
+        let saying = tell.clone();
         let thread = thread::Builder::new()
             .name("plugin".into())
             .spawn(move || {
-                let ended = match fetch(&store, &servers, &halting, &tell, lang) {
+                let ended = match fetch(&store, &servers, &halting, &saying, lang) {
                     Ok(Some((name, size))) => Ended::Installed { name, size },
                     Ok(None) => Ended::Stopped,
                     Err(e) => Ended::Failed(format!("{e:#}")),
                 };
-                let _ = tell.send(Event::Ended(ended));
-            })
-            .ok();
+                let _ = saying.send(Event::Ended(ended));
+            });
+        // A thread that could not be made says so at once rather than leaving
+        // the page saying it is looking forever.
+        let thread = match thread {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                let _ = tell.send(Event::Ended(Ended::Failed(format!("start the download: {e}"))));
+                None
+            }
+        };
         Worker { told, stop, thread }
     }
 

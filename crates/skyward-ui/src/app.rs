@@ -4396,34 +4396,24 @@ impl App {
     }
 
     /// Installing the browser has ended: the page says how, lit for the user
-    /// to read. What was installed is read again, so the list shows it.
+    /// to read. What the phone holds is read again by the caller, so the list
+    /// shows what is there now rather than what was there before.
     pub fn plugin_ended(&mut self, end: PluginEnd, now: u64) {
         let Some(job) = self.state.plugin_job.as_mut() else { return };
         job.stopping = false;
-        job.outcome = Some(end.clone());
+        job.outcome = Some(end);
         self.wake(now);
         self.refresh();
-        if matches!(end, PluginEnd::Installed { .. }) {
-            self.state.plugins = None;
-        }
     }
 
-    /// Deleting an installed plugin went this way: the list is read again
-    /// either way, because a folder that would not go is one the page should
-    /// still show.
+    /// Deleting an installed plugin went this way: the list is read again by
+    /// the caller either way, because a folder that would not go is one the
+    /// page should still show.
     pub fn plugin_deleted(&mut self, outcome: Result<(), String>, now: u64) {
         let l = self.state.lang;
         match outcome {
-            Ok(()) => {
-                self.state.plugins = None;
-                self.refresh();
-                self.say(l.pick(["插件已删除", "外掛已刪除", "The plugin is deleted"]), now);
-            }
-            Err(why) => {
-                self.state.plugins = None;
-                self.refresh();
-                self.report(&tr!(l, "删除插件失败：{why}", "刪除外掛失敗：{why}", "Couldn't delete the plugin: {why}"), now);
-            }
+            Ok(()) => self.say(l.pick(["插件已删除", "外掛已刪除", "The plugin is deleted"]), now),
+            Err(why) => self.report(&tr!(l, "删除插件失败：{why}", "刪除外掛失敗：{why}", "Couldn't delete the plugin: {why}"), now),
         }
     }
 
@@ -6756,7 +6746,7 @@ impl App {
                 if self.state.plugin_job.as_ref().is_some_and(|job| job.outcome.is_none()) {
                     let said = self.state.lang.pick(["浏览器正在下载", "瀏覽器正在下載", "The browser is already coming"]);
                     self.say(said, now);
-                } else if !self.state.plugins.as_ref().is_some_and(|found| found.as_ref().is_ok_and(|list| list.data_open)) {
+                } else if self.state.plugins.as_ref().is_some_and(|found| found.as_ref().is_ok_and(|list| !list.data_open)) {
                     // Nothing would be installable: the plugins live under the
                     // data partition, so it has to be open before one can go
                     // there. Saying so is better than a download that ends in

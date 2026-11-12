@@ -2353,6 +2353,10 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         };
                         let _ = skyward_sys::kmsg(&format!("installing the browser plugin ended: {end:?}"));
                         app.plugin_ended(end, now);
+                        // What the phone holds is read again here rather than
+                        // asked for again: the page is already up, and an
+                        // arrival is not what re-reads a list.
+                        app.set_plugins(crate::plugins::read(app.state.lang));
                         came_in = true;
                     }
                 }
@@ -2819,6 +2823,9 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             let _ = skyward_sys::kmsg(&format!("deleting {folder}: {why}"));
                         }
                         app.plugin_deleted(gone, now);
+                        // Read again either way: a folder that would not go is
+                        // one the page should still show.
+                        app.set_plugins(crate::plugins::read(app.state.lang));
                     }
                     // The phone changes hands: the display is the plugin's
                     // while it runs, so the card is let go before the payload
