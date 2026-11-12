@@ -27,6 +27,11 @@ const ARROW_GAP_DP: f32 = 6.0;
 const ARROW_DP: f32 = 14.0;
 /// Where the first row starts on an unscrolled page.
 pub const ROWS_TOP_DP: f32 = 223.7;
+/// How much taller the file manager's header is than its path: the row the
+/// search box and the button that changes the order stand in, above it.
+pub const HEAD_DP: f32 = 56.0;
+/// Where the first row starts on a page whose header holds that row too.
+pub const SEARCHED_ROWS_TOP_DP: f32 = ROWS_TOP_DP + HEAD_DP;
 const ROW_DP: f32 = 72.0;
 /// What a second line of name adds to a row.
 const NAME_LINE_DP: f32 = 22.33;
@@ -204,13 +209,12 @@ fn middle(c: &Canvas, face: &Face, px: f32, text: &str, w: f32) -> String {
     format!("{}…{}", chars[..left].iter().collect::<String>(), chars[right..].iter().collect::<String>())
 }
 
-/// The list's rows for `entries`, the first starting where an unscrolled
-/// page puts it, each touched for `action`; a row grows by a line for a
-/// name on two.
-pub fn rows(t: &Theme, f: &Fonts, entries: &[FileRow], action: fn(usize) -> Action) -> Rows {
+/// The list's rows for `entries`, the first starting `top` dp down the page,
+/// each touched for `action`; a row grows by a line for a name on two.
+pub fn rows(t: &Theme, f: &Fonts, top: f32, entries: &[&FileRow], action: fn(usize) -> Action) -> Rows {
     let m = &t.m;
     let w = name_width(t);
-    let mut y = m.dp(ROWS_TOP_DP).round();
+    let mut y = m.dp(top).round();
     let mut edges = Vec::with_capacity(entries.len() + 1);
     edges.push(y);
     for e in entries {
@@ -471,13 +475,58 @@ pub fn strip(t: &Theme, f: &Fonts, top: &str, folder: &str) -> Pinned {
     Pinned { canvas: c, top: m.dp(STRIP_TOP_DP), hits }
 }
 
-/// What the page says in place of the list, centred below the path, with
-/// the reason under it when there is one.
-pub fn note(c: &mut Canvas, t: &Theme, f: &Fonts, title: &str, why: Option<&str>) {
+/// What the file manager holds still over its list: the search box with the
+/// button that changes the order beside it, over the path. Every rect is in
+/// the strip's own coordinates, so a touch lands on the numbers it was
+/// drawn at.
+pub struct Head {
+    pub pinned: Pinned,
+    pub field: Rect,
+    pub clear: Option<Rect>,
+    pub order: Rect,
+}
+
+impl Head {
+    /// The strip as a page takes it, with the box, its clear button and the
+    /// order button answering to `field`, `clear` and `order`.
+    pub fn hits(mut self, field: Action, clear: Action, order: Action) -> Pinned {
+        self.pinned.hits.push(Hit { rect: self.field, action: field });
+        if let Some(rect) = self.clear {
+            self.pinned.hits.push(Hit { rect, action: clear });
+        }
+        self.pinned.hits.push(Hit { rect: self.order, action: order });
+        self.pinned
+    }
+}
+
+/// The strip the file manager holds still over its list: `query` typed so
+/// far or `hint` while there is none, the order it is in in `order`, over
+/// the path to `folder` under `top`.
+pub fn head(t: &Theme, f: &Fonts, query: &str, hint: &str, order: &str, top: &str, folder: &str) -> Head {
+    let m = &t.m;
+    let path = strip(t, f, top, folder);
+    let down = m.dp(HEAD_DP).round() as i32;
+    let mut c = Canvas::new(m.w, path.canvas.h + down as u32);
+    c.clear(palette(t).page);
+    let cy = down as f32 / 2.0;
+    let order = widgets::order_button(&mut c, t, f, m.w as f32 - m.margin, cy, order);
+    let field = Rect::new(m.margin, cy - m.search_h / 2.0, order.x - m.dp(10.0) - m.margin, m.search_h);
+    let clear = widgets::search_box(&mut c, t, f, field, query, hint);
+    c.put(&path.canvas, down);
+    let mut hits = path.hits;
+    for hit in &mut hits {
+        hit.rect.y += down as f32;
+    }
+    Head { pinned: Pinned { canvas: c, top: path.top, hits }, field, clear, order }
+}
+
+/// What the page says in place of the list, `top` dp down the page (where
+/// its rows would have started), with the reason under it when there is one.
+pub fn note(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, title: &str, why: Option<&str>) {
     let m = &t.m;
     let p = palette(t);
     let cx = m.w as f32 / 2.0;
-    let cy = m.dp(ROWS_TOP_DP + NOTE_DP);
+    let cy = m.dp(top + NOTE_DP);
     c.text_center(&f.body, title, cx, cy, m.dp(NOTE_TEXT_DP), p.note);
     let Some(why) = why else { return };
     let lines = widgets::wrap(c, &f.body, why, m.sub_px, m.w as f32 - m.dp(SIDE_DP) * 2.0);

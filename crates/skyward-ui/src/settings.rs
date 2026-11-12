@@ -10,6 +10,11 @@ use crate::Lang;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// What a switch that is not named in the file is: on.
+fn yes() -> bool {
+    true
+}
+
 /// How long settings stand unchanged before they are written, so a slider
 /// dragged across the page is written once, after the hand stops.
 pub const WAIT_MS: u64 = 2000;
@@ -70,6 +75,13 @@ pub struct Settings {
     /// The order the file manager shows a folder in, by name: by name,
     /// modified or kind.
     pub sort: String,
+    /// The recovery's own update reaches GitHub through a mirror in the
+    /// mainland. A file that names none leaves it on: the check asks GitHub
+    /// first either way, so the mirror is only tried when that does not
+    /// answer, and a phone that cannot reach GitHub at all is the phone this
+    /// is for.
+    #[serde(default = "yes")]
+    pub mirror: bool,
     pub install: Install,
     pub backup: Backup,
     pub logs: Logs,
@@ -157,6 +169,7 @@ impl Settings {
                 SortKey::Kind => 2,
             }]
             .to_string(),
+            mirror: state.mirror,
             install: Install { check_signature: state.check_signature, keep_recovery: state.keep_recovery },
             backup: Backup {
                 parts: names(&state.backup, &PARTS),
@@ -219,6 +232,7 @@ impl Settings {
         state.double_tap = self.double_tap;
         state.disable_avb = self.disable_avb;
         state.remember_password = self.remember_password;
+        state.mirror = self.mirror;
         // A name this version does not know leaves the order as it is, as an
         // unknown time zone or place does.
         if let Some(at) = SORTS.iter().position(|name| *name == self.sort) {
@@ -360,6 +374,23 @@ mod tests {
         // the phone must not carry it.
         let text = Settings::of(&State { remembered: Some("1234".into()), ..state }).text();
         assert!(!text.contains("1234"), "the credential is not in the settings file");
+    }
+
+    #[test]
+    fn the_mirror_is_on_unless_the_file_says_otherwise() {
+        // A phone that has never reached the settings page still tries the
+        // mirror, because the check asks GitHub first either way: the only
+        // phone the mirror takes anything away from is one whose owner
+        // turned it off.
+        let mut fresh = State::default();
+        Settings::of(&State::default()).apply(&mut fresh);
+        assert!(fresh.mirror, "the mirror is on before anything is chosen");
+        assert!(Settings::read("{}").unwrap().mirror, "a file naming no mirror leaves it on");
+
+        let off = Settings::of(&State { mirror: false, ..State::default() }).text();
+        let mut back = State::default();
+        Settings::read(&off).unwrap().apply(&mut back);
+        assert!(!back.mirror, "a switch turned off stays off across a start");
     }
 
     #[test]

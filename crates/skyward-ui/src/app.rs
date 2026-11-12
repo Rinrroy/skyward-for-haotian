@@ -591,6 +591,10 @@ pub enum Switch {
     /// Keep the network joined, with its password, so that the recovery
     /// joins it by itself at the next start.
     RememberWlan,
+    /// Reach GitHub through a mirror in the mainland for the recovery's own
+    /// update: the check and the download both, since both hosts that serve
+    /// them are commonly out of reach there. Direct first, then the mirror.
+    Mirror,
 }
 
 /// What a backup can take, in the order the backup page lists it.
@@ -727,6 +731,9 @@ pub struct Folder {
     pub path: String,
     pub entries: Result<Vec<FileRow>, String>,
     pub listed: i64,
+    /// Which entries the rows show, in the order they are in: row `i` of
+    /// the list is entry `shown[i]`. Every entry while nothing is typed.
+    shown: Vec<usize>,
     /// The folders left for one inside them, outermost first, with how far
     /// each was scrolled.
     left: Vec<(String, f32)>,
@@ -735,12 +742,37 @@ pub struct Folder {
 impl Folder {
     /// The folder at `path`, not read yet.
     pub fn new(path: &str) -> Folder {
-        Folder { path: path.into(), entries: Ok(Vec::new()), listed: 0, left: Vec::new() }
+        Folder { path: path.into(), entries: Ok(Vec::new()), listed: 0, shown: Vec::new(), left: Vec::new() }
     }
 
-    /// The entry at this place in the list.
-    fn entry(&self, i: usize) -> &FileRow {
-        &self.entries.as_ref().expect("an entry touched is one the list shows")[i]
+    /// The entry at this place in the list, or none when the list no longer
+    /// has a row there — a listing that shrank between a tap and the tap
+    /// landing shows nothing rather than ending the recovery.
+    pub fn entry(&self, i: usize) -> Option<&FileRow> {
+        let entries = self.entries.as_ref().ok()?;
+        entries.get(*self.shown.get(i)?)
+    }
+
+    /// The entries the rows show, in the order they are in.
+    pub fn shown_entries(&self) -> Vec<&FileRow> {
+        match &self.entries {
+            Ok(entries) => self.shown.iter().filter_map(|i| entries.get(*i)).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Keep the entries `query` picks out, in the order they were read in;
+    /// a query with nothing in it keeps all of them. Matched without case
+    /// and anywhere in the name, as the stock file manager matches it.
+    pub fn keep(&mut self, query: &str) {
+        self.shown.clear();
+        let Ok(entries) = &self.entries else { return };
+        let needle = query.trim().to_lowercase();
+        for (i, e) in entries.iter().enumerate() {
+            if needle.is_empty() || e.name.to_lowercase().contains(&needle) {
+                self.shown.push(i);
+            }
+        }
     }
 
     /// Where the entry of this name in the folder is.
@@ -1245,6 +1277,15 @@ pub enum Action {
     /// Order the file manager's list by this key, and keep it for the rest
     /// of the start.
     SortFiles(SortKey),
+    /// Order the file manager's list by the next key after the one it is in,
+    /// the button beside the search box going round the three.
+    CycleSort,
+    /// Open the file manager's keyboard on its search box.
+    FilesSearch,
+    /// Put the file manager's keyboard away, keeping what it found.
+    CloseFilesSearch,
+    /// Empty the file manager's search box and show the whole folder again.
+    ClearFilesQuery,
     /// Forget the network the WLAN page's details are of: its password and
     /// how it is protected, from what the phone keeps. A swipe then does it.
     ForgetNetwork,
@@ -1831,6 +1872,16 @@ pub struct State {
     pub files: Folder,
     /// How the file manager orders a folder's entries.
     pub sort: SortKey,
+    /// What is typed in the file manager's search box, which keeps the rows
+    /// of the folder shown down to the names it finds.
+    pub files_query: String,
+    /// Whether the file manager's keyboard stands at the bottom of it,
+    /// typing into that box.
+    pub files_search: bool,
+    /// Whether the recovery's own update reaches GitHub through a mirror in
+    /// the mainland. On by default: the check goes direct first either way,
+    /// so trying the mirror costs nothing when GitHub answers.
+    pub mirror: bool,
     /// A network joined keeps its password, so that the recovery joins it by
     /// itself at the next start. It starts on, because joining a network and
     /// typing its password again at every start is the thing this spares
@@ -2052,6 +2103,9 @@ impl Default for State {
             held: None,
             files: Folder::new("/"),
             sort: SortKey::default(),
+            files_query: String::new(),
+            files_search: false,
+            mirror: true,
             remember_wlan: true,
             storage: Folder::new(""),
             usb_drive: None,
@@ -2261,6 +2315,9 @@ pub enum Effect {
     Screenshot { storage: bool },
     /// Offer internal storage to a computer over USB, or stop.
     FileTransfer(bool),
+    /// Reach GitHub through a mirror in the mainland for the recovery's own
+    /// update, or go to it directly only.
+    SetMirror(bool),
     /// Start receiving a package over USB.
     Sideload,
     /// Start installing the file at this path from the top of a place,
@@ -3215,7 +3272,7 @@ impl App {
     /// Open what can be done with entry `i` of the folder shown, held long
     /// enough to, with a tap of the motor.
     fn held_entry(&mut self, i: usize) -> Vec<Effect> {
-        let entry = self.state.files.entry(i).clone();
+        let Some(entry) = self.state.files.entry(i).cloned() else { return Vec::new() };
         self.state.file = Some(entry);
         self.state.asking_delete = false;
         self.open(Screen::FileInfo);
@@ -4547,10 +4604,19 @@ impl App {
                 }
             }
         }
+        // A folder gone into starts without a query: the one typed was for
+        // the folder left behind. Reading the same folder again, as after a
+        // file is deleted or the order changes, keeps it.
+        if screen == Screen::Files && folder != self.state.files.path {
+            self.state.files_query.clear();
+            self.state.files_search = false;
+        }
+        let query = if screen == Screen::Files { self.state.files_query.clone() } else { String::new() };
         let shown = self.state.folder_mut(screen);
         shown.path = folder;
         shown.entries = files;
         shown.listed = listed;
+        shown.keep(&query);
         self.refresh();
     }
 
@@ -5736,6 +5802,7 @@ impl App {
                     Switch::AlwaysOn => &mut self.state.always_on,
                     Switch::DoubleTap => &mut self.state.double_tap,
                     Switch::RememberWlan => &mut self.state.remember_wlan,
+                    Switch::Mirror => &mut self.state.mirror,
                     Switch::Wlan => unreachable!("the WLAN switch is turned above"),
                 };
                 *on = !*on;
@@ -5746,6 +5813,9 @@ impl App {
                 self.refresh();
                 if switch == Switch::FileTransfer {
                     return vec![Effect::FileTransfer(now_on)];
+                }
+                if switch == Switch::Mirror {
+                    return vec![Effect::SetMirror(now_on)];
                 }
                 // Turning remembering off has to take the sealed file away,
                 // not only the copy the pages hold: a credential left on the
@@ -6052,7 +6122,7 @@ impl App {
                 self.refresh();
             }
             Action::OpenEntry(i) => {
-                let entry = self.state.files.entry(i).clone();
+                let Some(entry) = self.state.files.entry(i).cloned() else { return Vec::new() };
                 match entry.kind {
                     FileKind::Folder { .. } | FileKind::Link { folder: true, .. } => {
                         let scroll = self.top().1;
@@ -6089,7 +6159,7 @@ impl App {
                 let screen = self.screen();
                 let Screen::Choose(place) = screen else { unreachable!("only a place's folder is chosen in") };
                 let folder = self.state.folder(screen);
-                let entry = folder.entry(i).clone();
+                let Some(entry) = folder.entry(i).cloned() else { return Vec::new() };
                 let path = folder.inside(&entry.name);
                 match entry.kind {
                     FileKind::Folder { .. } | FileKind::Link { folder: true, .. } => {
@@ -6286,6 +6356,35 @@ impl App {
                     return vec![Effect::ReadDir(self.state.files.path.clone())];
                 }
             }
+            // One button for three orders: each tap moves on to the next and
+            // the list is read again in it.
+            Action::CycleSort => {
+                let at = SORT_KEYS.iter().position(|key| *key == self.state.sort).unwrap_or(0);
+                let next = SORT_KEYS[(at + 1) % SORT_KEYS.len()];
+                self.state.sort = next;
+                self.refresh();
+                return vec![Effect::ReadDir(self.state.files.path.clone())];
+            }
+            Action::FilesSearch => {
+                if !self.state.files_search {
+                    self.state.files_search = true;
+                    self.refresh();
+                }
+            }
+            Action::CloseFilesSearch => {
+                if self.state.files_search {
+                    self.state.files_search = false;
+                    self.refresh();
+                }
+            }
+            Action::ClearFilesQuery => {
+                if !self.state.files_query.is_empty() {
+                    self.state.files_query.clear();
+                    self.state.files.keep("");
+                    self.edits += 1;
+                    self.refresh();
+                }
+            }
             // Taking a check off is what the second confirmation is for: the
             // AVB page says what it costs, and the confirmation alone writes.
             Action::AvbConfirmOpen => {
@@ -6369,6 +6468,7 @@ impl App {
     fn typing(&mut self) -> &mut String {
         match self.screen() {
             Screen::Search => &mut self.state.search,
+            Screen::Files => &mut self.state.files_query,
             Screen::Decrypt => &mut self.state.code,
             Screen::Rename => &mut self.state.new_name,
             Screen::WlanPassword => &mut self.state.password,
@@ -6560,6 +6660,9 @@ impl App {
                         return self.act(Action::Open(first.screen), now);
                     }
                 }
+                // Return puts the file manager's keyboard away, keeping what
+                // the box found: the list stays as it is under the box.
+                Screen::Files => return self.act(Action::CloseFilesSearch, now),
                 Screen::Decrypt if self.state.code.is_empty() => self.say(l.pick(["请输入锁屏密码", "請輸入螢幕鎖定密碼", "Enter the screen lock"]), now),
                 Screen::Decrypt => {
                     let code = std::mem::take(&mut self.state.code);
@@ -6631,15 +6734,27 @@ impl App {
                 other => unreachable!("{other:?} shows no keyboard"),
             },
         }
-        // What is typed shows above the keyboard, which stays as it was
-        // while its keys do.
-        if matches!(cap, Cap::Char(_) | Cap::Space | Cap::Backspace) && self.state.layer == layer {
+        // The file manager's box stands in the strip held over its list, and
+        // what the box finds is that list, so both are drawn again on every
+        // key; the pages that type above their keyboard keep it as it was.
+        if self.screen() == Screen::Files {
+            if matches!(cap, Cap::Char(_) | Cap::Space | Cap::Backspace) {
+                self.filter_files();
+            }
+            self.refresh();
+        } else if matches!(cap, Cap::Char(_) | Cap::Space | Cap::Backspace) && self.state.layer == layer {
             let t = self.theme();
             self.refresh_rows(0, (t.m.h as f32 - widgets::keyboard_height(&t)).floor() as u32);
         } else {
             self.refresh();
         }
         Vec::new()
+    }
+
+    /// Keep the file manager's rows down to the entries its box finds.
+    fn filter_files(&mut self) {
+        let query = self.state.files_query.clone();
+        self.state.files.keep(&query);
     }
 
     pub fn touch(&mut self, ev: Touch, f: &Fonts, now: u64) -> Vec<Effect> {
@@ -10869,6 +10984,67 @@ mod tests {
     }
 
     #[test]
+    fn the_file_page_searches_inside_the_folder_and_one_button_cycles_the_order() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Files, W, H, PPD);
+        app.set_files(
+            "/sdcard".into(),
+            Ok(vec![
+                entry("alpha.txt", FileKind::File),
+                entry("beta.zip", FileKind::File),
+                entry("DCIM", folder(2)),
+            ]),
+            LISTED,
+        );
+        assert_eq!(app.state.files.shown_entries().len(), 3, "every entry is shown before anything is typed");
+        let frame = app.frame(&f, &i);
+        assert!(frame.pinned.is_some(), "the search box is pinned under the bar");
+        assert!(frame.dock.is_none(), "no keyboard is drawn until the box is touched");
+
+        // The keyboard arrives in the strip at the bottom, where the page
+        // cannot scroll it away. The box itself is a hit under the bar, and
+        // touching it is what brings the keys up.
+        assert!(tap(&mut app, &f, &i, Action::FilesSearch).is_empty(), "the box only opens the keys");
+        let frame = app.frame(&f, &i);
+        let dock = frame.dock.as_ref().expect("the keyboard is drawn in the strip");
+        assert!(!dock.hits.is_empty(), "the keys are reachable");
+        assert_eq!(app.screen(), Screen::Files, "the keyboard does not leave the page");
+
+        // A key in the strip is where the finger is: the dock's hits are in
+        // its own corner, and the screen adds the strip's height back.
+        assert!(tap_at(&mut app, &f, &i, Action::Type(Cap::Char('b')), 1010).is_empty());
+        assert_eq!(app.state.files_query, "b");
+        let shown: Vec<String> = app.state.files.shown_entries().iter().map(|e| e.name.clone()).collect();
+        assert_eq!(shown, vec!["beta.zip".to_string()], "only the name holding what was typed");
+
+        // The row that is drawn is the entry the row opens, even though it is
+        // the second entry in the folder: the row asks for row 0 of the list,
+        // which is entry 1.
+        assert_eq!(app.state.files.entry(0).map(|e| e.name.as_str()), Some("beta.zip"));
+
+        // One button, and it turns: name, then modified, then kind, then name.
+        assert_eq!(app.state.sort, SortKey::Name);
+        for expected in [SortKey::Modified, SortKey::Kind, SortKey::Name] {
+            assert_eq!(tap_at(&mut app, &f, &i, Action::CycleSort, 1015), vec![Effect::ReadDir("/sdcard".into())], "the folder is listed again");
+            assert_eq!(app.state.sort, expected);
+        }
+
+        // The cross on the box shows everything again, and Done puts the
+        // keyboard away without leaving the page.
+        assert!(tap_at(&mut app, &f, &i, Action::ClearFilesQuery, 1020).is_empty(), "clearing is not a listing");
+        assert_eq!(app.state.files.shown_entries().len(), 3, "every entry comes back");
+        assert!(app.act(Action::CloseFilesSearch, 1025).is_empty());
+        assert!(app.frame(&f, &i).dock.is_none(), "the keyboard goes away");
+
+        // Another folder is another search: what was typed is not carried.
+        app.act(Action::Type(Cap::Char('a')), 1030);
+        assert_eq!(app.state.files_query, "a");
+        app.set_files("/sdcard/DCIM".into(), Ok(vec![entry("photo.jpg", FileKind::File)]), LISTED);
+        assert_eq!(app.state.files_query, "", "a folder opened is searched from nothing");
+        assert_eq!(app.state.files.shown_entries().len(), 1);
+    }
+
+    #[test]
     fn the_bars_round_button_darkens_under_a_finger_on_the_frames_drawn() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Files, W, H, PPD);
@@ -11900,6 +12076,7 @@ mod tests {
                 size: 42_739_608,
                 sha256: "62b66f7d13a0eb6c9af3359b5ec6f9c223fd9a86b1f8abab3e9d2646cb2ce534".into(),
             }),
+            via: None,
         }
     }
 

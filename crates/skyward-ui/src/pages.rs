@@ -1,8 +1,8 @@
 use crate::app::{
     Action, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop, Field, FileKind,
-    FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
+    FileOp, FileRow, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
     SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, SortKey, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink,
-    Wipe, ADDABLE, BACKUP_PARTS, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, SORT_KEYS, TARGETS, TIME_ZONES,
+    Wipe, ADDABLE, BACKUP_PARTS, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES,
     USB_DRIVE_UNREADABLE, USB_DRIVE_WANTED, WIPES, installs, starting,
 };
 use crate::canvas::Canvas;
@@ -498,8 +498,28 @@ pub fn settings(cx: &Ctx) -> Frame {
     }
     let about = widgets::list(&mut c, t, f, y, &rows);
     out.extend(hits(&about.rows, &opens));
+    // A phone on the mainland cannot reach either host the update comes
+    // from, so the mirror is offered beside the entry it serves. It is tried
+    // only when GitHub does not answer, so leaving it on costs nothing
+    // anywhere else.
+    if s.offers(Screen::SkywardUpdate) {
+        y = widgets::section(&mut c, t, f, about.bottom, l.pick(MIRROR_SECTION));
+        let mirror = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(MIRROR)).switch(s.mirror)]);
+        out.extend(hits(&mirror.rows, &[Action::Toggle(Switch::Mirror)]));
+        let note = l.pick(MIRROR_NOTE);
+        let bottom = widgets::footnote(&mut c, t, f, mirror.bottom, note);
+        return Frame::new(t, fit(c, t, bottom), out, l.pick(SETTINGS), top);
+    }
     Frame::new(t, fit(c, t, about.bottom), out, l.pick(SETTINGS), top)
 }
+
+const MIRROR_SECTION: Text = ["更新来源", "更新來源", "Updates"];
+const MIRROR: Text = ["国内镜像", "中國大陸鏡像", "Mirror in the mainland"];
+const MIRROR_NOTE: Text = [
+    "先直接访问 GitHub，连不上时再试镜像。下载的安装包同样会校验 SHA-256。",
+    "先直接連線 GitHub，連不上時再試鏡像。下載的安裝檔同樣會校驗 SHA-256。",
+    "GitHub is asked first; a mirror is tried only when it does not answer. The package is checked against its SHA-256 either way.",
+];
 
 /// What the settings page says beside its Skyward update entry: an update
 /// under way, or a newer release found.
@@ -3503,14 +3523,17 @@ pub fn wlan_network(cx: &Ctx) -> Frame {
     Frame::new(t, fit(c, t, forget.bottom), out, title, top)
 }
 
-/// The file manager, every entry of the folder shown, folders first.
+/// The file manager, every entry of the folder shown that its search box
+/// finds, folders first. The box and the button that changes the order are
+/// held over the list, and the keyboard stands at the bottom while it is
+/// open.
 pub fn files(cx: &Ctx) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
     // An entry picked to copy or move goes to the folder shown, from the
-    // bar held at the bottom; with nothing picked that bar is of what the
-    // entries are in the order of, as the stock manager holds it there.
-    let dock = match &s.clip {
-        Some(clip) => {
+    // bar held at the bottom; the keyboard, while it is up, holds that
+    // place; with neither, nothing is held there.
+    let dock = match (&s.clip, s.files_search) {
+        (Some(clip), false) => {
             let go = l.pick(match clip.op {
                 FileOp::Copy => ["复制到此处", "複製到這裡", "Copy here"],
                 FileOp::Move => ["移动到此处", "移動到這裡", "Move here"],
@@ -3518,18 +3541,69 @@ pub fn files(cx: &Ctx) -> Frame {
             let (canvas, rects) = widgets::dock_bar(t, f, files::page(t), &[l.pick(CANCEL), go]);
             Some(Dock { canvas, hits: hits(&rects, &[Action::Unpick, Action::Paste]) })
         }
-        None => {
-            let names = SORT_KEYS.map(|key| sort_label(l, key));
-            let chosen = SORT_KEYS.iter().position(|key| *key == s.sort);
-            let (canvas, rects) = widgets::chosen_bar(t, f, files::page(t), &names, chosen);
-            let actions = SORT_KEYS.map(Action::SortFiles);
-            Some(Dock { canvas, hits: hits(&rects, &actions) })
-        }
+        (_, true) => Some(keyboard_dock(cx, s)),
+        _ => None,
     };
     let button = Some((widgets::Glyph::Terminal, Action::TerminalHere));
-    let root = l.pick(["根目录", "根目錄", "Root"]);
-    Frame { dock, button, ..listing(cx, &s.files, root, None, l.pick(["暂无文件", "沒有檔案", "No files"]), Action::OpenEntry, l.pick(FILES)) }
+    Frame { dock, button, ..file_listing(cx) }
 }
+
+/// The file manager's keyboard, held at the bottom of the page, its keys
+/// typing into the search box.
+fn keyboard_dock(cx: &Ctx, s: &State) -> Dock {
+    let (t, f, l) = (cx.t, cx.f, s.lang);
+    let mut c = Canvas::new(t.m.w, widgets::keyboard_height(t).round() as u32);
+    c.clear(files::page(t));
+    let enter = l.pick(FILES_SEARCH_ENTER);
+    let keys = widgets::keyboard(&mut c, t, f, l, 0.0, s.layer, s.key_held(), enter);
+    Dock { canvas: c, hits: keys.into_iter().map(|(rect, cap)| Hit { rect, action: Action::Type(cap) }).collect() }
+}
+
+/// The folder the file manager shows, laid out with the search box and the
+/// order button held over it.
+fn file_listing(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let bg = files::page(t);
+    let mut c = sheet(cx, t.m.h, bg);
+    let rows = match &s.files.entries {
+        Err(why) => {
+            files::note(&mut c, t, f, files::SEARCHED_ROWS_TOP_DP, l.pick(["无法读取该文件夹", "無法讀取這個資料夾", "This folder can't be read"]), Some(why));
+            None
+        }
+        Ok(entries) if entries.is_empty() => {
+            files::note(&mut c, t, f, files::SEARCHED_ROWS_TOP_DP, l.pick(["暂无文件", "沒有檔案", "No files"]), None);
+            None
+        }
+        Ok(entries) if s.files_query.trim().is_empty() => {
+            let shown = folder_rows(&s.files);
+            Some(files::rows(t, f, files::SEARCHED_ROWS_TOP_DP, &shown, Action::OpenEntry))
+        }
+        Ok(_) => match folder_rows(&s.files) {
+            found if found.is_empty() => {
+                let typed = s.files_query.trim();
+                let none = tr!(l, "没有名称含“{typed}”的条目", "沒有名稱含「{typed}」的項目", "Nothing here is named “{typed}”");
+                files::note(&mut c, t, f, files::SEARCHED_ROWS_TOP_DP, &none, None);
+                None
+            }
+            found => Some(files::rows(t, f, files::SEARCHED_ROWS_TOP_DP, &found, Action::OpenEntry)),
+        },
+    };
+    let root = l.pick(["根目录", "根目錄", "Root"]);
+    let hint = l.pick(FILES_SEARCH_HINT);
+    let pinned = Some(
+        files::head(t, f, &s.files_query, hint, sort_label(l, s.sort), root, &s.files.path)
+            .hits(Action::FilesSearch, Action::ClearFilesQuery, Action::CycleSort),
+    );
+    Frame { bg, rows, pinned, ..Frame::new(t, c, Vec::new(), l.pick(FILES), t.m.dp(files::STRIP_TOP_DP)) }
+}
+
+/// The entries a folder's rows show, in order, as the rows take them.
+fn folder_rows(folder: &Folder) -> Vec<&FileRow> {
+    folder.shown_entries()
+}
+
+const FILES_SEARCH_HINT: Text = ["搜索文件", "搜尋檔案", "Search files"];
+const FILES_SEARCH_ENTER: Text = ["完成", "完成", "Done"];
 
 /// What the entries of a folder are in the order of, as the bar of them
 /// names it. The order itself is `sort::sort`, which is where a `SortKey`
@@ -3584,18 +3658,21 @@ fn listing(
     let mut c = sheet(cx, t.m.h, bg);
     let rows = match (absent, &folder.entries) {
         (Some((note, why)), _) => {
-            files::note(&mut c, t, f, note, Some(why));
+            files::note(&mut c, t, f, files::ROWS_TOP_DP, note, Some(why));
             None
         }
         (None, Err(why)) => {
-            files::note(&mut c, t, f, cx.state.lang.pick(["无法读取该文件夹", "無法讀取這個資料夾", "This folder can't be read"]), Some(why));
+            files::note(&mut c, t, f, files::ROWS_TOP_DP, cx.state.lang.pick(["无法读取该文件夹", "無法讀取這個資料夾", "This folder can't be read"]), Some(why));
             None
         }
         (None, Ok(entries)) if entries.is_empty() => {
-            files::note(&mut c, t, f, empty, None);
+            files::note(&mut c, t, f, files::ROWS_TOP_DP, empty, None);
             None
         }
-        (None, Ok(entries)) => Some(files::rows(t, f, entries, action)),
+        (None, Ok(_)) => {
+            let shown: Vec<&FileRow> = folder.entries.as_ref().map(|e| e.iter().collect()).unwrap_or_default();
+            Some(files::rows(t, f, files::ROWS_TOP_DP, &shown, action))
+        }
     };
     let pinned = Some(files::strip(t, f, top, &folder.path));
     Frame { bg, rows, pinned, ..Frame::new(t, c, Vec::new(), title, t.m.dp(files::STRIP_TOP_DP)) }
@@ -3607,8 +3684,8 @@ pub fn row(screen: Screen, cx: &Ctx, i: usize, c: &mut Canvas) {
     match screen {
         Screen::Files | Screen::Choose(_) => {
             let folder = cx.state.folder(screen);
-            let entries = folder.entries.as_ref().expect("a folder listed draws its rows");
-            files::row(c, cx.t, cx.f, cx.state.lang, &entries[i], folder.listed, cx.state.time_zone);
+            let Some(e) = folder.entry(i) else { return };
+            files::row(c, cx.t, cx.f, cx.state.lang, e, folder.listed, cx.state.time_zone);
         }
         Screen::Installing => widgets::output_row(c, cx.t, cx.f, &cx.state.script_output, i),
         Screen::PartWork => {

@@ -1220,6 +1220,10 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     let locale = request.locale.as_deref().or(info.locale.as_deref());
     let named = locale.map(Lang::for_locale).transpose()?;
     app.take_settings(kept.settings(), named);
+    // Whether the update reaches for a mirror is settled before the first
+    // frame, so a file that says no is honoured without the switch being
+    // touched. Nothing here can fail the run: `set` writes a flag.
+    skyward_net::mirror::set(app.state.mirror);
     let mut keeper = Keeper::new(&kept);
     skyward_sys::kmsg(&format!(
         "the pages speak {:?}, {}, and the locale named is {}",
@@ -3113,6 +3117,10 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             (on, t) => unreachable!("the switch turned file transfer {on} while it was {}", t.is_some()),
                         }
                     }
+                    // A flag, and nothing it can fail: the next update check
+                    // and download reach GitHub itself first and a mirror only
+                    // when that does not answer.
+                    Effect::SetMirror(on) => skyward_net::mirror::set(on),
                 }
             }
         }

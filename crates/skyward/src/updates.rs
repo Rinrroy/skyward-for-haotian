@@ -152,6 +152,12 @@ impl Worker {
                         let a = http::agent(servers.clone());
                         *using.lock().expect("the agent is not held by a thread that panicked") = Some(a.clone());
                         let answer = github::ask(&a, &codename, skyward_info::VERSION).map_err(|e| unanswered(&e, github::LATEST, &probe, &servers));
+                        // Which one answered is worth the log, not the
+                        // feature: a mirror answers in GitHub's place, and the
+                        // digest it gave still gates what is downloaded.
+                        if let Ok(Newest { via: Some(via), .. }) = &answer {
+                            let _ = skyward_sys::kmsg(&format!("Skyward's newest release answered by {via}, a mirror of GitHub"));
+                        }
                         tell(Event::SkywardChecked(answer));
                     }
                     // GitHub's API hands the zip out at a short-lived address
