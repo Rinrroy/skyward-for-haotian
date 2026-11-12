@@ -111,8 +111,9 @@ SHA-256。开关在「设置 → 更新来源」，默认开着。
 - 挂载分区、修复和格式化文件系统
 - WLAN、MTP 文件传输、adb 与 fastbootd；连过一次的网络会被记住，也可以在列表
   里忘记它
-- 插件页，列出 `Skyward/plugins` 下的文件夹和它们 `plugin.json` 里写的内容——
-  这个版本只读只列，不执行任何东西
+- 插件页：插件是一个带 `plugin.json` 的文件夹；写明镜像的插件可以从它自己的
+  release 下载并运行，浏览器就是第一个。运行期间手机把屏幕交给它，它退出后回到
+  这些页面。见 [docs/plugins/webview.md](docs/plugins/webview.md)
 
 ### 没有系统时
 

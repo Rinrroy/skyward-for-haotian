@@ -125,8 +125,10 @@ this slot. There is no override.
 - Mount partitions, repair and format filesystems
 - WLAN, MTP file transfer, adb and fastbootd; a network joined once is
   remembered and can be forgotten from the list
-- A plugins page, listing the folders under `Skyward/plugins` and what their
-  `plugin.json` says — this release reads and lists, it runs nothing
+- A plugins page: a plugin is a folder with a `plugin.json`, and one that names an
+  image can be downloaded from its own release and run — the browser is the first
+  of those. The phone hands its display to it, and these pages come back when it
+  exits. See [docs/plugins/webview.md](docs/plugins/webview.md)
 
 ### Without a system
 
