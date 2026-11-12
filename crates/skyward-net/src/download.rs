@@ -146,6 +146,41 @@ fn resume_from(have: u64, total: u64) -> u64 {
     }
 }
 
+/// How many addresses a server may hand on before the last one is asked.
+const HOPS: usize = 5;
+
+/// The address `url` ends at, and how long what it sends is.
+///
+/// A release asset is not served where its name says: GitHub answers with the
+/// address of the machine that holds it, and that answer carries no length.
+/// Following it here, rather than trusting the client to, is what makes a
+/// download from a release work at all; the address followed to is also the
+/// one the bytes are asked from, so the two cannot disagree.
+fn locate(agent: &ureq::Agent, url: &str) -> Result<(String, u64)> {
+    let mut at = url.to_string();
+    for _ in 0..HOPS {
+        let head = agent.head(&at).call().context("ask the server about the package")?;
+        match head.status().as_u16() {
+            200 => {
+                let total = content_length(head.headers()).context("the server does not say how long the package is")?;
+                return Ok((at, total));
+            }
+            301 | 302 | 303 | 307 | 308 => {
+                let next = head.headers().get(ureq::http::header::LOCATION).and_then(|v| v.to_str().ok()).context("a server answered with no address to go to")?;
+                // Only an address is followed: one said relative would need a
+                // URL taken apart and put together again, which is more than
+                // a download is for.
+                if !next.starts_with("https://") {
+                    bail!("a server answered with an address that is not one: {next}");
+                }
+                at = next.to_string();
+            }
+            status => bail!(Refused(status)),
+        }
+    }
+    bail!("a server handed the download on more than {HOPS} times")
+}
+
 /// Download `url` to `path`, carrying on from what an earlier download
 /// left, and give it its name once it has the digest `sum`. A part as long
 /// as the package is only checked; a server that will not send from the
@@ -163,11 +198,13 @@ fn fetch_as<D: Digest>(agent: &ureq::Agent, url: &str, path: &Path, sum: &str, s
     let dir = path.parent().context("a package's path is in a folder")?;
     fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
     let head = agent.head(url).call().context("ask the server about the package")?;
-    match head.status().as_u16() {
-        200 => {}
-        status => bail!(Refused(status)),
-    }
-    let total = content_length(head.headers()).context("the server does not say how long the package is")?;
+    let (url, total) = match head.status().as_u16() {
+        200 => (url.to_string(), content_length(head.headers()).context("the server does not say how long the package is")?),
+        // Handed on to where the package is: the address followed to is what
+        // is asked for the bytes as well.
+        _ => locate(agent, url)?,
+    };
+    let url = url.as_str();
     let mut file = OpenOptions::new().create(true).read(true).append(true).open(&part).with_context(|| format!("open {}", part.display()))?;
     let held = file.metadata().with_context(|| format!("read {}", part.display()))?.len();
     let mut have = resume_from(held, total);
