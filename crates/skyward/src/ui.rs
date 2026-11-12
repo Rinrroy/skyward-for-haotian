@@ -2844,10 +2844,23 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     },
                     // Deleting an installed plugin's folder: the image and the
                     // manifest go together, so the page stops listing it.
-                    Effect::DeletePlugin(folder) => {
-                        let gone = std::fs::remove_dir_all(&folder).map_err(|e| format!("{e:#}"));
+                    Effect::DeletePlugin(image) => {
+                        // An installed plugin is a folder with an image in it,
+                        // and both go; an image dropped straight into the
+                        // plugins folder has no folder of its own, and taking
+                        // its parent for one would take every plugin there.
+                        let at = Path::new(&image);
+                        let alone = at.parent().is_some_and(|parent| parent == crate::plugins::folder() || parent == crate::plugins::store());
+                        let gone = if alone {
+                            std::fs::remove_file(at).map_err(|e| format!("{e:#}"))
+                        } else {
+                            match at.parent() {
+                                Some(dir) => std::fs::remove_dir_all(dir).map_err(|e| format!("{e:#}")),
+                                None => Err(format!("{image} has no folder")),
+                            }
+                        };
                         if let Err(why) = &gone {
-                            let _ = skyward_sys::kmsg(&format!("deleting {folder}: {why}"));
+                            let _ = skyward_sys::kmsg(&format!("deleting {image}: {why}"));
                         }
                         app.plugin_deleted(gone, now);
                         // Read again either way: a folder that would not go is

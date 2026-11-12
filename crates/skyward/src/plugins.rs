@@ -16,7 +16,7 @@
 //! be read is a row saying so, not an error that takes the page away, and
 //! the whole folder being absent is simply no plugins at all.
 
-use skyward_ui::app::{Payload, PLUGIN_FOLDER, PLUGIN_STORE, PluginList, PluginRow};
+use skyward_ui::app::{Payload, PLUGIN_FOLDER, PLUGIN_STORE, Plugin, PluginList, PluginRow};
 use skyward_ui::lang::Lang;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -56,13 +56,68 @@ pub fn data_open() -> bool {
     inside.dev() != root.dev()
 }
 
-/// The image a plugin carries, if it has one where it says it does.
-///
-/// The name is decided here and nowhere else: a payload is `payload.<format>`
-/// beside the manifest, written as `payload.<format>.part` while it
-/// downloads and renamed only after the digest matches.
+/// Where a download puts an image: `payload.<format>` beside the manifest,
+/// written as `payload.<format>.part` while it comes down and renamed only
+/// after the digest matches. This is the name this program gives a file.
 pub fn image(dir: &Path, payload: &Payload) -> PathBuf {
     dir.join(format!("payload.{}", payload.format))
+}
+
+/// The program an image starts when nothing says otherwise: the installer this
+/// project builds its own payloads with, which is what a hand-copied image of
+/// the browser holds too.
+pub const PROGRAM: &str = "/opt/skyward/start.sh";
+
+/// The image a plugin carries, wherever it is: the name a download gives it
+/// first, and otherwise any one file beside the manifest that is an image of
+/// that format — which is what a person who copied an image in from the system
+/// has, since the file keeps the name it was downloaded with.
+///
+/// A folder holding two images of the same format is not guessed at: the one
+/// a download would have written is taken, and otherwise the first by name, so
+/// that what runs does not change from one look at the page to the next.
+pub fn found_image(dir: &Path, payload: &Payload) -> Option<PathBuf> {
+    let written = image(dir, payload);
+    if written.is_file() {
+        return Some(written);
+    }
+    wanted(dir, &payload.format)
+}
+
+/// The first file in `dir` whose extension is `format`, by name.
+fn wanted(dir: &Path, format: &str) -> Option<PathBuf> {
+    let mut found: Vec<PathBuf> = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case(format)))
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+/// A plugin made from an image alone, with no manifest to read: what a person
+/// has after downloading the browser in the system and copying the file in.
+///
+/// The name is the file's own, the program is the one every payload of this
+/// project starts, and nothing is claimed about a version or an author, since
+/// nothing is known.
+fn imagined(name: &str, file: &Path, format: &str) -> Plugin {
+    Plugin {
+        title: Some(name.to_string()),
+        version: None,
+        author: None,
+        about: Some("an image with no plugin.json beside it".to_string()),
+        needs: Vec::new(),
+        payload: Some(Payload {
+            url: String::new(),
+            sha256: String::new(),
+            size: fs::metadata(file).map(|meta| meta.len()).unwrap_or(0),
+            format: format.to_string(),
+            program: PROGRAM.to_string(),
+        }),
+    }
 }
 
 /// The plugins in both places, by name, each with what its manifest says or
@@ -104,31 +159,75 @@ fn listed(dir: &Path, lang: Lang, rows: &mut Vec<PluginRow>) -> Result<(), Strin
             let _ = skyward_sys::kmsg(&format!("only the first {MOST} plugins are listed"));
             break;
         }
-        // Folders only, and no hidden ones: what a plugin is, is a folder
-        // someone put there, not the marks a filesystem leaves.
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with('.') && !rows.iter().any(|row| row.name == name) {
-                let at = entry.path();
-                let manifest = manifest(&at, lang);
-                // An image is only believed where the manifest says one is
-                // carried and the file it names is really there. The whole
-                // path is kept: the page draws its last part and the
-                // handover needs the whole of it.
-                let image = match &manifest {
-                    Ok(plugin) => plugin
-                        .payload
-                        .as_ref()
-                        .map(|payload| image(&at, payload))
-                        .filter(|file| file.is_file())
-                        .map(|file| file.to_string_lossy().into_owned()),
-                    Err(_) => None,
-                };
-                rows.push(PluginRow { manifest, name, image });
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // No hidden ones: a plugin is what someone put there, not the marks a
+        // filesystem leaves.
+        if name.starts_with('.') || rows.iter().any(|row| row.name == name) {
+            continue;
+        }
+        let at = entry.path();
+        if kind.is_dir() {
+            // A folder is a plugin when it says so, or when it holds one image
+            // and nothing else: an image is the whole of what a plugin needs
+            // to run, and a manifest is what it says about itself.
+            let read = manifest(&at, lang);
+            let (manifest, image) = match read {
+                Ok(plugin) => {
+                    // An image is only believed where the manifest says one is
+                    // carried and a file of that format is really there.
+                    let found = plugin.payload.as_ref().and_then(|payload| found_image(&at, payload));
+                    (Ok(plugin), found)
+                }
+                Err(why) => match lone(&at) {
+                    Some((file, format)) => (Ok(imagined(&name, &file, &format)), Some(file)),
+                    None => (Err(why), None),
+                },
+            };
+            // The whole path is kept: the page draws its last part and the
+            // handover needs the whole of it.
+            let image = image.map(|file| file.to_string_lossy().into_owned());
+            rows.push(PluginRow { manifest, name, image });
+        } else if kind.is_file() {
+            // An image dropped in the folder itself, with no folder around it:
+            // the shortest way to put a plugin on a phone is to copy the file
+            // in, so that is a plugin too.
+            match format_of(&at) {
+                Some(format) => rows.push(PluginRow { manifest: Ok(imagined(&name, &at, &format)), name, image: Some(at.to_string_lossy().into_owned()) }),
+                None => continue,
             }
         }
     }
     Ok(())
+}
+
+/// The one image in `dir`, and its format, where the folder holds exactly one
+/// image and no manifest: the shape a hand-copied plugin has.
+fn lone(dir: &Path) -> Option<(PathBuf, String)> {
+    let mut images: Vec<(PathBuf, String)> = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let path = entry.path();
+            let format = format_of(&path)?;
+            Some((path, format))
+        })
+        .collect();
+    images.sort();
+    match images.len() {
+        1 => images.pop(),
+        _ => None,
+    }
+}
+
+/// `path`'s format, where the extension is one an image may be mounted as.
+fn format_of(path: &Path) -> Option<String> {
+    let ext = path.extension()?.to_string_lossy().to_lowercase();
+    skyward_ui::plugin::FORMATS.iter().find(|format| **format == ext).map(|format| (*format).to_string())
 }
 
 /// What the plugin in `dir` says it is, or why there is nothing to read.
@@ -147,4 +246,118 @@ fn manifest(dir: &Path, lang: Lang) -> Result<skyward_ui::app::Plugin, String> {
     }
     let text = fs::read_to_string(&file).map_err(|e| format!("{unread}: {e}"))?;
     skyward_ui::plugin::manifest(&text).map_err(|why| format!("{}: {why}", lang.pick(["plugin.json 读不了", "plugin.json 讀不了", "plugin.json is not a manifest"])))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skyward_ui::lang::Lang;
+
+    /// A folder of plugins of its own, gone at the end of the test.
+    struct Tree(PathBuf);
+
+    impl Tree {
+        fn made(name: &str) -> Tree {
+            let root = std::env::temp_dir().join(format!("skyward-plugins-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("a folder of plugins");
+            Tree(root)
+        }
+
+        fn file(&self, path: &str) {
+            let full = self.0.join(path);
+            fs::create_dir_all(full.parent().expect("a file has a folder")).expect("a folder for a file");
+            fs::write(&full, b"image").expect("a file to list");
+        }
+
+        fn text(&self, path: &str, text: &str) {
+            let full = self.0.join(path);
+            fs::create_dir_all(full.parent().expect("a file has a folder")).expect("a folder for a file");
+            fs::write(&full, text).expect("a manifest to read");
+        }
+
+        fn listed(&self) -> Vec<PluginRow> {
+            let mut rows = Vec::new();
+            listed(&self.0, Lang::En, &mut rows).expect("a folder that reads");
+            rows
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const MANIFEST: &str = r#"{"title":"Browser","version":"1.0","payload":{"url":"https://example.invalid/w.erofs","sha256":"00","size":1,"format":"erofs","program":"/opt/skyward/start.sh"}}"#;
+
+    #[test]
+    fn an_image_named_as_a_download_names_it_is_the_one_a_plugin_carries() {
+        let tree = Tree::made("named");
+        tree.file("browser/payload.erofs");
+        tree.text("browser/plugin.json", MANIFEST);
+        let rows = tree.listed();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].image.as_ref().is_some_and(|image| image.ends_with("payload.erofs")));
+    }
+
+    #[test]
+    fn an_image_kept_under_the_name_it_was_downloaded_with_is_still_the_one() {
+        // What a person has after fetching the browser in the system: the
+        // release's own file name, no payload.erofs anywhere.
+        let tree = Tree::made("kept");
+        tree.file("browser/webview-1.1-arm64.erofs");
+        tree.text("browser/plugin.json", MANIFEST);
+        let rows = tree.listed();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].image.as_ref().is_some_and(|image| image.ends_with("webview-1.1-arm64.erofs")), "{:?}", rows[0].image);
+    }
+
+    #[test]
+    fn a_folder_holding_only_an_image_is_a_plugin_and_starts_where_every_payload_starts() {
+        let tree = Tree::made("lone");
+        tree.file("webview/browser.erofs");
+        let rows = tree.listed();
+        assert_eq!(rows.len(), 1, "a folder with one image and no manifest is a plugin");
+        let plugin = rows[0].manifest.as_ref().expect("a plugin made from the image");
+        assert_eq!(plugin.title.as_deref(), Some("webview"));
+        let payload = plugin.payload.as_ref().expect("an image to mount");
+        assert_eq!(payload.program, PROGRAM);
+        assert_eq!(payload.format, "erofs");
+        assert!(rows[0].image.is_some());
+    }
+
+    #[test]
+    fn an_image_dropped_in_the_folder_itself_is_a_plugin_too() {
+        // The shortest way to put one on a phone: copy the file in, with no
+        // folder around it.
+        let tree = Tree::made("dropped");
+        tree.file("webview-1.1-arm64.erofs");
+        let rows = tree.listed();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "webview-1.1-arm64.erofs");
+        assert!(rows[0].image.is_some(), "and it is what runs");
+        assert_eq!(rows[0].manifest.as_ref().map(|plugin| plugin.payload.as_ref().map(|p| p.format.clone())), Ok(Some("erofs".to_string())));
+    }
+
+    #[test]
+    fn a_file_that_is_not_an_image_is_not_a_plugin() {
+        let tree = Tree::made("other");
+        tree.file("notes.txt");
+        tree.file("browser/payload.erofs");
+        let rows = tree.listed();
+        assert_eq!(rows.len(), 1, "only the folder with an image in it: {:?}", rows.iter().map(|r| &r.name).collect::<Vec<_>>());
+        assert_eq!(rows[0].name, "browser");
+    }
+
+    #[test]
+    fn a_folder_with_two_images_and_no_manifest_is_not_guessed_at() {
+        let tree = Tree::made("two");
+        tree.file("browser/a.erofs");
+        tree.file("browser/b.erofs");
+        let rows = tree.listed();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].manifest.is_err(), "which of the two runs is not something to guess");
+        assert!(rows[0].image.is_none());
+    }
 }

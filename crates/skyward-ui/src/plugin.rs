@@ -41,7 +41,7 @@ const URL_LONGEST: usize = 2048;
 
 /// The ways an image may be mounted. The first is what a payload is built
 /// as; the rest are here because an image someone made by hand may be one.
-const FORMATS: [&str; 4] = ["squashfs", "erofs", "ext4", "img"];
+pub const FORMATS: [&str; 4] = ["squashfs", "erofs", "ext4", "img"];
 
 /// The manifest as it is written, before any of it is believed.
 #[derive(Deserialize)]

@@ -7822,20 +7822,22 @@ impl App {
             },
             Confirm::PowerOff => fx.push(Effect::Reboot(Target::PowerOff)),
             Confirm::DeletePlugin => {
-                // The folder the page listed, taken from the same list the row
+                // The image the page listed, taken from the same list the row
                 // was drawn from, so a swipe that outlived a refresh deletes
-                // nothing rather than the wrong thing.
-                let folder = self.state.plugin_deleting.take().and_then(|i| {
+                // nothing rather than the wrong thing. Where the image is what
+                // is deleted from is decided by whoever holds the disk: an
+                // installed plugin is a folder, and an image dropped in the
+                // folder itself is one file.
+                let image = self.state.plugin_deleting.take().and_then(|i| {
                     let list = self.state.plugins.as_ref()?.as_ref().ok()?;
                     let row = list.rows.get(i)?;
-                    let image = row.image.as_ref()?;
-                    Some(std::path::Path::new(image).parent()?.to_string_lossy().into_owned())
+                    row.image.clone()
                 });
-                match folder {
-                    Some(folder) => {
+                match image {
+                    Some(image) => {
                         self.state.confirm = 0.0;
                         self.refresh();
-                        fx.push(Effect::DeletePlugin(folder));
+                        fx.push(Effect::DeletePlugin(image));
                     }
                     None => {
                         self.state.confirm = 0.0;

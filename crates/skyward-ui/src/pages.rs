@@ -4735,10 +4735,15 @@ pub fn plugins(cx: &Ctx) -> Frame {
                 .collect()
         })
         .unwrap_or_default();
+    // Deleting one is asked for the way the downloaded system package is asked
+    // for: the row says what goes, the footnote says what that costs, and the
+    // swipe is the only way to say yes.
     if !installed.is_empty() {
-        y = widgets::section(&mut c, t, f, y, l.pick(["删除", "刪除", "Remove"]));
-        let rows: Vec<Row> = installed.iter().map(|(_, title)| Row::new(title.as_str()).icon(RED, Icon::Wipe).trail(Trail::None)).collect();
-        let list = widgets::list(&mut c, t, f, y, &rows);
+        // The labels outlive the rows that borrow them: a row's title is a
+        // slice of the text it was made from.
+        let labels: Vec<String> = installed.iter().map(|(_, title)| tr!(l, "删除 {title}", "刪除 {title}", "Delete {title}")).collect();
+        let rows: Vec<Row> = labels.iter().map(|label| Row::new(label.as_str()).tint(t.pal.danger).trail(Trail::None)).collect();
+        let list = widgets::list(&mut c, t, f, y + t.m.dp(28.0), &rows);
         let picks: Vec<Action> = installed.iter().map(|(i, _)| Action::AskDeletePlugin(*i)).collect();
         out.extend(hits(&list.rows, &picks));
         y = list.bottom;
@@ -4766,16 +4771,25 @@ pub fn plugins(cx: &Ctx) -> Frame {
     // anything runs it.
     y = widgets::section(&mut c, t, f, y, l.pick(["什么是插件", "什麼是外掛", "What a plugin is"]));
     let where_ = l.pick([
-        "插件是一个文件夹，放在内部存储的 Skyward/plugins 中，里面有一个 plugin.json 写明名字、版本和用途。",
-        "外掛是一個資料夾，放在內部儲存空間的 Skyward/plugins 中，裡面有一個 plugin.json 寫明名稱、版本和用途。",
-        "A plugin is a folder in Skyward/plugins on internal storage, holding a plugin.json that names it, its version and what it is for.",
+        "插件是一个文件夹，放在内部存储的 Skyward/plugins 中，里面有一个 plugin.json 写明名字、版本和用途，以及它带的镜像。",
+        "外掛是一個資料夾，放在內部儲存空間的 Skyward/plugins 中，裡面有一個 plugin.json 寫明名稱、版本和用途，以及它帶的鏡像。",
+        "A plugin is a folder in Skyward/plugins on internal storage, holding a plugin.json that names it, its version, what it is for and the image it carries.",
+    ]);
+    // How one that was fetched in the system gets here: the shortest way is
+    // the file itself, and a plugin that could only be installed by writing a
+    // manifest by hand would not be one most people could install.
+    let hand = l.pick([
+        "也可以在系统里把镜像下载好，直接放进内部存储的 Skyward/plugins：单个 erofs、squashfs 或 ext4 镜像，或者一个只放了镜像的文件夹，都会当作插件列出，用 /opt/skyward/start.sh 启动。",
+        "也可以在系統裡把鏡像下載好，直接放進內部儲存空間的 Skyward/plugins：單一 erofs、squashfs 或 ext4 鏡像，或一個只放了鏡像的資料夾，都會當作外掛列出，用 /opt/skyward/start.sh 啟動。",
+        "An image fetched in the system works too: put it in Skyward/plugins on internal storage — a single erofs, squashfs or ext4 image, or a folder holding one — and it is listed as a plugin and started with /opt/skyward/start.sh.",
     ]);
     let what = l.pick([
-        "带镜像的插件可以运行：点它就会把手机交给它，它退出后回到这里。只有 plugin.json 的插件目前只被列出。",
-        "帶鏡像的外掛可以執行：點它就會把手機交給它，它結束後回到這裡。只有 plugin.json 的外掛目前只被列出。",
-        "A plugin that carries an image can run: tapping it hands the phone over, and these pages come back when it exits. A plugin that is only a manifest is listed and nothing more.",
+        "带镜像的插件可以运行：点它就会把手机交给它，它退出后回到这里。只有 plugin.json 的插件目前只被列出。删除和系统安装包一样，先点再滑动确认。",
+        "帶鏡像的外掛可以執行：點它就會把手機交給它，它結束後回到這裡。只有 plugin.json 的外掛目前只被列出。刪除和系統安裝檔一樣，先點再滑動確認。",
+        "A plugin that carries an image can run: tapping it hands the phone over, and these pages come back when it exits. A plugin that is only a manifest is listed and nothing more. Deleting one is asked for the way a downloaded system package is: tap it, then swipe.",
     ]);
     y = widgets::footnote(&mut c, t, f, y, where_);
+    y = widgets::footnote(&mut c, t, f, y, hand);
     y = widgets::footnote(&mut c, t, f, y, what);
     // What can be done today, which is looking at the folder.
     let open = widgets::list(&mut c, t, f, y + t.m.card_gap, &[Row::new(l.pick(["在文件管理中打开插件目录", "在檔案管理中開啟外掛目錄", "Open the plugins folder in File manager"])).trail(Trail::None)]);

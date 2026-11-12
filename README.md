@@ -130,7 +130,9 @@ this slot. There is no override.
   release and run — the browser is the first of those. The phone hands its
   display to it, and these pages come back when it exits. The download takes the
   same mainland mirror as the system update, and is checked against its SHA-256
-  either way. See [docs/plugins/webview.md](docs/plugins/webview.md)
+  either way; an image fetched in the system and copied into `Skyward/plugins`
+  works without a manifest. Deleting one is asked for the way a downloaded
+  system package is. See [docs/plugins/webview.md](docs/plugins/webview.md)
 
 ### Without a system
 

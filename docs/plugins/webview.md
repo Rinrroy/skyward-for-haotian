@@ -172,6 +172,30 @@ carry a payload, and the manifest says where to get it:
   `payload.<format>.part` while it downloads and renamed only after the digest
   matches, exactly like a system package.
 
+### Putting one in by hand
+
+Fetching it in the system and copying it in is the shortest way to get a plugin
+on a phone, so it needs no manifest written by hand:
+
+- A **single image** dropped into `Skyward/plugins` on internal storage —
+  `webview-1.1-arm64.erofs` or any name — is a plugin. Its name is the file's,
+  and it is started with `/opt/skyward/start.sh`, the program every payload of
+  this project is built with.
+- A **folder holding one image and no `plugin.json`** is a plugin too, named
+  after the folder.
+- With a `plugin.json` beside it, the image may keep the name it was downloaded
+  with: the file named by the manifest is looked for first, then any one file
+  beside it whose extension is the format it names.
+- A folder with two images and no manifest is listed with an error rather than
+  guessed at: which of the two runs is not something to decide for someone.
+- Any other file is not a plugin and is not listed.
+
+This is the same list the page draws either way; what a hand-copied plugin
+cannot do is be deleted from the page under `/data` — it lives where it was put.
+Deleting an installed one is asked for exactly like a downloaded system package:
+the row says what goes, a footnote says what deleting costs, and a swipe is the
+only way to say yes.
+
 ## Where the image comes from
 
 The browser is not shipped in the recovery image: it is a plugin, fetched from
@@ -195,6 +219,9 @@ one small index and installs what it names.
 - A stopped download keeps its `.part`, so asking again goes on from where it
   stopped rather than from nothing.
 - Deleting an installed plugin removes its folder, image and manifest together.
+  An image that was copied straight into a plugins folder has no folder of its
+  own, and only that file is removed — taking its parent for a plugin folder
+  would take every plugin in it.
 
 ## The staged plan
 
