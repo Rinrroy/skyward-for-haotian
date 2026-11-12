@@ -327,12 +327,18 @@ pub fn home(cx: &Ctx) -> Frame {
         out.extend(hits(&first.rows, &opens));
         y = first.bottom + t.m.card_gap;
     }
+    // The two pages that hold what was put on the phone rather than what is
+    // done to it: the files on it, and the plugins that add to the recovery.
+    // They sit among the tools because that is what they are used as, and
+    // because the advanced page is one tap further away than they deserve.
     let tools = widgets::list(&mut c, t, f, y, &[
         Row::new(l.pick(["安装", "安裝", "Install"])).icon(GREEN, Icon::Install),
         Row::new(l.pick(["备份", "備份", "Backup"])).icon(BLUE, Icon::Backup),
         Row::new(l.pick(["恢复", "還原", "Restore"])).icon(PURPLE, Icon::Restore),
         Row::new(l.pick(["挂载", "掛載", "Mount"])).icon(SLATE, Icon::Mount),
         Row::new(l.pick(DECRYPT)).icon(BLUE, Icon::Lock).trail(Trail::Value(fmt::data(l, &cx.state.data))),
+        Row::new(l.pick(FILES)).icon(SLATE, Icon::Folder),
+        Row::new(l.pick(PLUGINS)).icon(SLATE, Icon::Layers),
     ]);
     out.extend(hits(&tools.rows, &[
         Action::Open(Screen::Install),
@@ -340,6 +346,8 @@ pub fn home(cx: &Ctx) -> Frame {
         Action::Open(Screen::Restore),
         Action::Open(Screen::Mount),
         Action::Open(Screen::Decrypt),
+        Action::Open(Screen::Files),
+        Action::Open(Screen::Plugins),
     ]));
     y = tools.bottom + t.m.card_gap;
     let target = l.pick(REBOOT_TARGETS[cx.state.reboot].0);
@@ -517,9 +525,9 @@ pub fn settings(cx: &Ctx) -> Frame {
 const MIRROR_SECTION: Text = ["更新来源", "更新來源", "Updates"];
 const MIRROR: Text = ["国内镜像", "中國大陸鏡像", "Mirror in the mainland"];
 const MIRROR_NOTE: Text = [
-    "先直接访问 GitHub，连不上时再试镜像。下载的安装包同样会校验 SHA-256。",
-    "先直接連線 GitHub，連不上時再試鏡像。下載的安裝檔同樣會校驗 SHA-256。",
-    "GitHub is asked first; a mirror is tried only when it does not answer. The package is checked against its SHA-256 either way.",
+    "先直接访问 GitHub，连不上时再试镜像。系统更新和插件下载都走这里，下载的文件同样会校验 SHA-256。",
+    "先直接連線 GitHub，連不上時再試鏡像。系統更新和外掛下載都走這裡，下載的檔案同樣會校驗 SHA-256。",
+    "GitHub is asked first; a mirror is tried only when it does not answer. Both the system update and the plugin download come this way, and the file is checked against its SHA-256 either way.",
 ];
 
 /// What the settings page says beside its Skyward update entry: an update

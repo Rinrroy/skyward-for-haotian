@@ -7,7 +7,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Proxies that fetch any address they are given and hand it out as the rest
 /// of their own, in the order they are tried: the first has answered most
 /// often, and each is tried only once the one before it has failed.
-const PROXIES: [&str; 3] = ["https://gh-proxy.com/", "https://ghfast.top/", "https://ghproxy.net/"];
+///
+/// The order is what answers from a phone network in the mainland, measured
+/// rather than assumed: the first two answered the published index and the
+/// 700 MB image with their real lengths, the last one answered nothing at all
+/// from here and is kept only as somewhere else to ask. Every one of them is
+/// tried, so a dead one costs a timeout and never the download — which is why
+/// the dead ones are last.
+const PROXIES: [&str; 3] = ["https://gh-proxy.com/", "https://ghproxy.net/", "https://ghfast.top/"];
 
 /// GitHub's API, as the addresses asked of it are written.
 const API: &str = "https://api.github.com/";
@@ -120,8 +127,8 @@ mod tests {
                 "https://api.github.com/repos/Rinrroy/skyward-for-haotian/releases/latest",
                 "https://api.kkgithub.com/repos/Rinrroy/skyward-for-haotian/releases/latest",
                 "https://gh-proxy.com/https://api.github.com/repos/Rinrroy/skyward-for-haotian/releases/latest",
-                "https://ghfast.top/https://api.github.com/repos/Rinrroy/skyward-for-haotian/releases/latest",
                 "https://ghproxy.net/https://api.github.com/repos/Rinrroy/skyward-for-haotian/releases/latest",
+                "https://ghfast.top/https://api.github.com/repos/Rinrroy/skyward-for-haotian/releases/latest",
             ],
             "GitHub itself, then a mirror of its API, then the proxies; the address unchanged inside each"
         );
@@ -148,7 +155,7 @@ mod tests {
     #[test]
     fn an_address_that_goes_through_a_mirror_already_is_not_wrapped_again() {
         let wrapped = format!("https://gh-proxy.com/{LATEST}");
-        assert_eq!(candidates_when(&wrapped, true), [wrapped.clone(), format!("https://ghfast.top/{wrapped}"), format!("https://ghproxy.net/{wrapped}")]);
+        assert_eq!(candidates_when(&wrapped, true), [wrapped.clone(), format!("https://ghproxy.net/{wrapped}"), format!("https://ghfast.top/{wrapped}")]);
     }
 
     #[test]

@@ -67,10 +67,10 @@ SHA-256. The switch is under Settings → Updates and is on by default.
 
 ![Manage the phone's files in Skyward](slides/en/out/07-files.png)
 
-The list sorts by name, modified time or file type, chosen from the bar under
-it. Folders stay first in all three, and every order is total — ties fall to the
-lowercased name and then the raw one — so no entry is left where the filesystem
-happened to return it.
+The list sorts by name, modified time or file type, and the file manager has its
+own way in on the home page beside install and backup. Folders stay first in all
+three, and every order is total — ties fall to the lowercased name and then the
+raw one — so no entry is left where the filesystem happened to return it.
 
 A search box above the list keeps only the names that contain what is typed,
 ignoring case; it is pinned under the bar, so scrolling cannot take it away, and
@@ -125,10 +125,12 @@ this slot. There is no override.
 - Mount partitions, repair and format filesystems
 - WLAN, MTP file transfer, adb and fastbootd; a network joined once is
   remembered and can be forgotten from the list
-- A plugins page: a plugin is a folder with a `plugin.json`, and one that names an
-  image can be downloaded from its own release and run — the browser is the first
-  of those. The phone hands its display to it, and these pages come back when it
-  exits. See [docs/plugins/webview.md](docs/plugins/webview.md)
+- A plugins page, with its own way in on the home page: a plugin is a folder with
+  a `plugin.json`, and one that names an image can be downloaded from its own
+  release and run — the browser is the first of those. The phone hands its
+  display to it, and these pages come back when it exits. The download takes the
+  same mainland mirror as the system update, and is checked against its SHA-256
+  either way. See [docs/plugins/webview.md](docs/plugins/webview.md)
 
 ### Without a system
 

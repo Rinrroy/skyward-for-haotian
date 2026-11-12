@@ -136,6 +136,7 @@ fn small(servers: &Servers, url: &str, most: u64) -> Result<String> {
                 if text.len() as u64 > most {
                     bail!("the answer is larger than {most} bytes");
                 }
+                let _ = skyward_sys::kmsg(&format!("the plugin list came from {candidate}"));
                 return Ok(text);
             }
             Err(e) => refused.push(format!("{candidate}: {e}")),
@@ -192,7 +193,7 @@ fn fetch(store: &Path, servers: &Servers, stop: &AtomicBool, tell: &mpsc::Sender
                 fs::write(&part, &offered.text).with_context(|| format!("write {}", part.display()))?;
                 fs::rename(&part, &manifest).with_context(|| format!("name {}", manifest.display()))?;
                 let size = fs::metadata(&image).map(|m| m.len()).unwrap_or(payload.size);
-                let _ = skyward_sys::kmsg(&format!("the browser is installed at {} ({size} bytes)", image.display()));
+                let _ = skyward_sys::kmsg(&format!("the browser is installed at {} ({size} bytes), sent by {candidate}", image.display()));
                 return Ok(Some((offered.name, size)));
             }
             Err(e) => {
