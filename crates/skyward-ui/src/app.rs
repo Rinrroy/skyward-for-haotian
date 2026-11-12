@@ -5945,7 +5945,13 @@ impl App {
             // folder it is in stays put: the entry stays picked for another
             // folder.
             Action::Paste => {
-                let clip = self.state.clip.clone().expect("only a picked entry is pasted");
+                // A paste from a frame drawn before the copy's page came
+                // down has nothing picked any more: say so rather than
+                // ending the run.
+                let Some(clip) = self.state.clip.clone() else {
+                    self.say(l.pick(["没有选中的条目", "沒有選取的項目", "Nothing is picked to paste"]), now);
+                    return Vec::new();
+                };
                 let (path, folder) = (std::path::Path::new(&clip.path), std::path::Path::new(&self.state.files.path));
                 let name = path.file_name().map_or_else(|| clip.path.clone(), |n| n.to_string_lossy().into_owned());
                 if folder.starts_with(path) {
@@ -5993,7 +5999,14 @@ impl App {
                 self.refresh();
             }
             Action::Resolve(choice) => {
-                let (clip, into, _) = self.state.clash.take().expect("a choice answers a clash");
+                // The clash's page is the only place a choice is offered,
+                // and a frame drawn before it went away can still ask: with
+                // no clash left there is nothing to answer, and saying so
+                // keeps the run going.
+                let Some((clip, into, _)) = self.state.clash.take() else {
+                    self.say(l.pick(["没有要处理的同名条目", "沒有要處理的同名項目", "There is no clash left to answer"]), now);
+                    return Vec::new();
+                };
                 self.leave(true);
                 self.stack.pop();
                 self.settle_page();
