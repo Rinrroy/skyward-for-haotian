@@ -495,6 +495,10 @@ impl Station {
         if self.running.is_some() {
             return;
         }
+        // What the phone keeps is told before the radio is tried: the list is
+        // the phone's and not the radio's, and a phone whose radio will not
+        // come up still has networks kept, which the page offers to forget.
+        (self.tell)(Report::Saved(self.saved.iter().map(Saved::shown).collect()));
         self.state.power = Power::Starting;
         (self.tell)(Report::Wlan(self.state.clone()));
         match self.start() {
@@ -615,6 +619,18 @@ impl Station {
     }
 
     fn joining(&mut self, told: &Told) {
+        // A network the supplicant joined by itself, out of the ones the
+        // phone keeps, is one no page asked for: without adopting it nothing
+        // would ask it for an address, and the phone would sit on a link
+        // that carries nothing while the page showed no network joined.
+        if self.state.joined.is_none() {
+            if let Some(joined) = self.adopt(told) {
+                let _ = skyward_sys::kmsg(&format!("{} is joined from what the phone keeps", joined.name));
+                self.state.joined = Some(joined);
+                self.ask_address();
+                return;
+            }
+        }
         let Some(j) = &mut self.state.joined else { return };
         match j.on(told) {
             Next::Show => {}
@@ -631,6 +647,33 @@ impl Station {
                 }
             }
         }
+    }
+
+    /// The network the supplicant joined by itself, where it did.
+    ///
+    /// This is what a phone that remembers networks does at a start: the
+    /// configuration it is given names them all, and the supplicant picks
+    /// one before anything is asked for. The name comes from the supplicant
+    /// rather than from the event, which names an access point and not a
+    /// network; `STATUS-NO_EVENTS` is the answer that says which network is
+    /// up, and the plain `STATUS` would have every other listener told again
+    /// what it already knows.
+    fn adopt(&mut self, told: &Told) -> Option<Joined> {
+        if *told != Told::Connected {
+            return None;
+        }
+        let status = self.running.as_ref()?.control.ask("STATUS-NO_EVENTS").ok()?;
+        let fields = supplicant::fields(&status);
+        let ssid = supplicant::unescape(fields.get("ssid")?).ok()?;
+        if ssid.is_empty() {
+            return None;
+        }
+        // How the network is protected is what the phone kept: one joined
+        // out of the record is one that was kept. A network that is not in
+        // the record was put there by something else, and is taken as a
+        // password network, which is what most of them are.
+        let security = self.saved.iter().find(|k| k.ssid == ssid).map_or(Security::Psk, |k| k.security);
+        Some(Joined { name: String::from_utf8_lossy(&ssid).into_owned(), ssid, security, stage: Stage::Joining })
     }
 
     /// Ask the network for an address, on a thread of its own.

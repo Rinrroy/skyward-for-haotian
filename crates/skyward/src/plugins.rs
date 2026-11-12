@@ -43,7 +43,14 @@ pub fn store() -> PathBuf {
 /// mounted means; nothing here needs to know what is mounted there, only
 /// that something is.
 pub fn data_open() -> bool {
-    let (Ok(inside), Ok(root)) = (fs::metadata(PLUGIN_STORE), fs::metadata("/")) else {
+    // The folder this installs into is made by the first download, so its
+    // being absent says nothing about the partition: what is looked at is
+    // `/data` itself, which is a different filesystem from `/` exactly when
+    // something is mounted there, and something is mounted there when it is
+    // open. Looking at the folder instead made a phone whose data was open
+    // and whose plugins folder was not made yet say the data was shut, and
+    // the download refuse to start.
+    let (Ok(inside), Ok(root)) = (fs::metadata("/data"), fs::metadata("/")) else {
         return false;
     };
     inside.dev() != root.dev()

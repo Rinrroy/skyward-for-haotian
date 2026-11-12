@@ -4660,9 +4660,9 @@ pub fn plugins(cx: &Ctx) -> Frame {
     match &s.plugin_job {
         None => {
             let sub = l.pick([
-                "约 465 MB，下载后可以在这里打开，也可以用它登录需要网页认证的 Wi-Fi。",
-                "約 465 MB，下載後可以在這裡開啟，也可以用它登入需要網頁驗證的 Wi-Fi。",
-                "About 465 MB. Once it is here it opens from this page, and it can sign in to Wi-Fi that asks on a web page.",
+                "约 700 MB，下载后可以在这里打开，也可以用它登录需要网页认证的 Wi-Fi。",
+                "約 700 MB，下載後可以在這裡開啟，也可以用它登入需要網頁驗證的 Wi-Fi。",
+                "About 700 MB. Once it is here it opens from this page, and it can sign in to Wi-Fi that asks on a web page.",
             ]);
             let row = Row::new(l.pick(["下载浏览器", "下載瀏覽器", "Download the browser"])).icon(BLUE, Icon::Install).subtitle(sub).trail(Trail::None);
             let list = widgets::list(&mut c, t, f, y, &[row]);
