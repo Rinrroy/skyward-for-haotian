@@ -147,7 +147,9 @@ fn asked() -> Vec<(String, Option<String>)> {
 /// the device it names is what gets detached when the browser is done.
 fn attach(image: &Path) -> Result<String> {
     let out = Command::new("/system/bin/losetup")
-        .args(["-f", "--show"])
+        // Read-only: the image is never written, and a payload kept on a
+        // read-only or nearly-full partition must still attach.
+        .args(["-r", "-f", "--show"])
         .arg(image)
         .stdin(Stdio::null())
         .output()
@@ -170,6 +172,32 @@ fn detach(device: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+/// What filesystem an image holds, read from the image itself.
+///
+/// The mount of an image needs its filesystem named: `mount(2)` with no type
+/// is only allowed for a bind mount, and answers `EINVAL` for anything else —
+/// which is exactly what happened when a browser image was mounted with no
+/// type at all. The name cannot be trusted either (a payload copied in by hand
+/// carries whatever name its downloader gave it), so the magic is what decides.
+fn kind_of(image: &Path) -> Option<&'static str> {
+    // Far enough in for the erofs and ext4 magics, which sit past the first
+    // block; a squashfs magic is at the very front.
+    const HEAD: usize = 1082;
+    let mut head = [0u8; HEAD];
+    let mut file = fs::File::open(image).ok()?;
+    std::io::Read::read_exact(&mut file, &mut head).ok()?;
+    if head[0..4] == *b"hsqs" {
+        return Some("squashfs");
+    }
+    if head[1024..1028] == [0xE2, 0xE1, 0xF5, 0xE0] {
+        return Some("erofs");
+    }
+    if head[1080..1082] == [0x53, 0xEF] {
+        return Some("ext4");
+    }
+    None
 }
 
 /// SELinux's current mode, as the file the kernel keeps it in says it.
@@ -196,11 +224,14 @@ impl Lay {
         let device = attach(image)?;
         lay.device = Some(device.clone());
         let root = lay.root.clone();
-        lay.onto(Some(Path::new(&device)), &root, libc::MS_RDONLY, None)?;
+        // Named from the image's own magic: a mount with no filesystem named
+        // is answered with EINVAL, and the name is not a thing to guess at.
+        let kind = kind_of(image).with_context(|| format!("{} is not an image this can mount", image.display()))?;
+        lay.onto(Some(Path::new(&device)), &root, Some(kind), libc::MS_RDONLY, None)?;
         for (inside, outside) in BOUND {
             let at = lay.root.join(inside);
             fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
-            lay.onto(Some(Path::new(outside)), &at, libc::MS_BIND | libc::MS_REC, None)?;
+            lay.onto(Some(Path::new(outside)), &at, None, libc::MS_BIND | libc::MS_REC, None)?;
         }
         // /tmp and /run are the image's own empty folders; a browser needs
         // both writable, and neither should be on the image.
@@ -208,7 +239,7 @@ impl Lay {
             let at = lay.root.join(name);
             fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
             let data = format!("mode={mode}");
-            lay.onto(None, &at, libc::MS_NOSUID | libc::MS_NODEV, Some(("tmpfs", &data)))?;
+            lay.onto(None, &at, Some("tmpfs"), libc::MS_NOSUID | libc::MS_NODEV, Some(&data))?;
         }
         lay.resolver()?;
         lay.data()?;
@@ -218,11 +249,10 @@ impl Lay {
     }
 
     /// Mount onto a folder inside the image, recording it so it comes off.
-    fn onto(&mut self, source: Option<&Path>, at: &Path, flags: libc::c_ulong, tmpfs: Option<(&str, &str)>) -> Result<()> {
-        let (kind, data) = match tmpfs {
-            Some((kind, data)) => (Some(kind), Some(data)),
-            None => (None, None),
-        };
+    ///
+    /// `kind` is the filesystem's name, which the kernel insists on for
+    /// anything that is not a bind mount or a remount.
+    fn onto(&mut self, source: Option<&Path>, at: &Path, kind: Option<&str>, flags: libc::c_ulong, data: Option<&str>) -> Result<()> {
         mount(source, at, kind, flags, data)?;
         self.mounted.push(at.to_path_buf());
         Ok(())
@@ -245,7 +275,7 @@ impl Lay {
         // leaves the image's own resolver setting alone, and the fallback in
         // it (if any) is what the browser gets.
         if at.exists() {
-            self.onto(Some(&file), &at, libc::MS_BIND, None)?;
+            self.onto(Some(&file), &at, None, libc::MS_BIND, None)?;
         } else {
             let _ = skyward_sys::kmsg("the browser image has no /etc/resolv.conf to bind the phone's name servers over");
         }
@@ -262,7 +292,7 @@ impl Lay {
         }
         let home = Path::new("/data/skyward/browser");
         fs::create_dir_all(home).with_context(|| format!("make {}", home.display()))?;
-        self.onto(Some(Path::new("/data")), &at, libc::MS_BIND | libc::MS_REC, None)
+        self.onto(Some(Path::new("/data")), &at, None, libc::MS_BIND | libc::MS_REC, None)
     }
 
     /// Run the payload's own program inside the chroot and wait for it.
@@ -374,5 +404,36 @@ mod tests {
         // The property is read from the phone; off it, the fallback stands.
         let url = start_url();
         assert!(url.starts_with("https://"), "{url}");
+    }
+
+    #[test]
+    fn an_image_is_told_apart_by_what_it_holds_and_not_by_its_name() {
+        let dir = std::env::temp_dir().join(format!("skyward-browser-kinds-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("a folder to keep test images in");
+
+        let mut erofs = vec![0u8; 1082];
+        erofs[1024..1028].copy_from_slice(&[0xE2, 0xE1, 0xF5, 0xE0]);
+        let mut ext4 = vec![0u8; 1082];
+        ext4[1080..1082].copy_from_slice(&[0x53, 0xEF]);
+        let mut squash = vec![0u8; 1082];
+        squash[0..4].copy_from_slice(b"hsqs");
+
+        for (name, bytes, kind) in [
+            ("payload.erofs", erofs, Some("erofs")),
+            ("an-image-named-erofs.img", ext4, Some("ext4")),
+            ("whatever", squash, Some("squashfs")),
+            ("empty", vec![0u8; 1082], None),
+        ] {
+            let at = dir.join(name);
+            fs::write(&at, &bytes).expect("write a test image");
+            assert_eq!(kind_of(&at), kind, "{name}");
+        }
+        // A file too short to hold a superblock is not an image either.
+        let short = dir.join("short");
+        fs::write(&short, b"hsq").expect("write a short file");
+        assert_eq!(kind_of(&short), None);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
