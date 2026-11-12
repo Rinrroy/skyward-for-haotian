@@ -11,6 +11,8 @@ mod art;
 #[cfg(target_os = "android")]
 mod backup;
 #[cfg(target_os = "android")]
+mod browser;
+#[cfg(target_os = "android")]
 mod decrypt;
 #[cfg(target_os = "android")]
 mod filework;

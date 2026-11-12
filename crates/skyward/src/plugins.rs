@@ -105,14 +105,16 @@ fn listed(dir: &Path, lang: Lang, rows: &mut Vec<PluginRow>) -> Result<(), Strin
                 let at = entry.path();
                 let manifest = manifest(&at, lang);
                 // An image is only believed where the manifest says one is
-                // carried and the file it names is really there.
+                // carried and the file it names is really there. The whole
+                // path is kept: the page draws its last part and the
+                // handover needs the whole of it.
                 let image = match &manifest {
                     Ok(plugin) => plugin
                         .payload
                         .as_ref()
                         .map(|payload| image(&at, payload))
                         .filter(|file| file.is_file())
-                        .and_then(|file| file.file_name().map(|n| n.to_string_lossy().into_owned())),
+                        .map(|file| file.to_string_lossy().into_owned()),
                     Err(_) => None,
                 };
                 rows.push(PluginRow { manifest, name, image });

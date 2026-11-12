@@ -2764,6 +2764,46 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     // it cannot be allowed to end the run: a folder that
                     // cannot be read is a row saying so, and the page stays.
                     Effect::ReadPlugins => app.set_plugins(crate::plugins::read(app.state.lang)),
+                    // The phone changes hands: the display is the plugin's
+                    // while it runs, so the card is let go before the payload
+                    // is laid out and taken back when it is done. Every way
+                    // the payload can fail is a sentence on the plugins page;
+                    // only a display that cannot be taken back ends the run,
+                    // because there is nothing left to show it on.
+                    Effect::OpenBrowser { image, program } => {
+                        drop(surface);
+                        let outcome = crate::browser::open(Path::new(&image), &program);
+                        surface = KmsSurface::open("/dev/dri/card0", cfg.display.fastest_refresh)?;
+                        let said = match outcome {
+                            Ok(end) => match end.code {
+                                Some(0) => app.state.lang.pick([
+                                    "浏览器已关闭。",
+                                    "瀏覽器已關閉。",
+                                    "The browser is closed.",
+                                ]).to_string(),
+                                Some(code) => skyward_ui::tr!(
+                                    app.state.lang,
+                                    "浏览器以 {code} 退出。",
+                                    "瀏覽器以 {code} 結束。",
+                                    "The browser exited with {code}."
+                                ),
+                                None => app.state.lang.pick([
+                                    "浏览器被中断了。",
+                                    "瀏覽器被中斷了。",
+                                    "The browser was interrupted.",
+                                ]).to_string(),
+                            },
+                            Err(e) => {
+                                let _ = skyward_sys::kmsg(&format!("the browser did not start: {e:#}"));
+                                format!("{}: {e:#}", app.state.lang.pick([
+                                    "浏览器没有启动",
+                                    "瀏覽器沒有啟動",
+                                    "The browser did not start",
+                                ]))
+                            }
+                        };
+                        app.report(&said, now);
+                    },
                     Effect::RememberPassword(code) => match code {
                         Some(credential) => match crate::remembered::save(&credential) {
                             Ok(()) => app.state.remembered = Some(credential),

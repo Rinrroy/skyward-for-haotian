@@ -4625,8 +4625,12 @@ pub fn plugins(cx: &Ctx) -> Frame {
                         match &r.image {
                             // An image beside the manifest is what makes a
                             // plugin one this program installed rather than
-                            // a folder someone dropped in.
-                            Some(image) => tr!(l, "{version} · {image}", "{version} · {image}", "{version} · {image}"),
+                            // a folder someone dropped in, and it is what
+                            // makes it something that can be run.
+                            Some(image) => {
+                                let name = std::path::Path::new(image).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| image.clone());
+                                tr!(l, "{version} · {name}", "{version} · {name}", "{version} · {name}")
+                            }
                             None => version,
                         }
                     }
@@ -4635,7 +4639,14 @@ pub fn plugins(cx: &Ctx) -> Frame {
                 .collect();
             let list: Vec<Row> = titles.iter().zip(&subs).map(|(t, s)| Row::new(t).icon(PURPLE, Icon::More).subtitle(s).trail(Trail::None)).collect();
             let drawn = widgets::list(&mut c, t, f, y, &list);
-            let opens: Vec<Action> = (0..rows.len()).map(Action::OpenPlugin).collect();
+            // A plugin that carries an image is one that can run, so tapping
+            // it hands the phone over; one that is only a manifest is
+            // selected, which is all there is to do with it.
+            let opens: Vec<Action> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, row)| if row.image.is_some() { Action::OpenBrowser } else { Action::OpenPlugin(i) })
+                .collect();
             out.extend(hits(&drawn.rows, &opens));
             y = drawn.bottom;
         }
@@ -4649,9 +4660,9 @@ pub fn plugins(cx: &Ctx) -> Frame {
         "A plugin is a folder in Skyward/plugins on internal storage, holding a plugin.json that names it, its version and what it is for.",
     ]);
     let what = l.pick([
-        "本版本只读取并列出插件，还不会运行它们。这是一个为之后的插件功能留出的位置。",
-        "本版本只讀取並列出外掛，還不會執行它們。這是一個為之後的外掛功能留出的位置。",
-        "This release only reads and lists plugins; it does not run them yet. It is the place the plugin feature will grow into.",
+        "带镜像的插件可以运行：点它就会把手机交给它，它退出后回到这里。只有 plugin.json 的插件目前只被列出。",
+        "帶鏡像的外掛可以執行：點它就會把手機交給它，它結束後回到這裡。只有 plugin.json 的外掛目前只被列出。",
+        "A plugin that carries an image can run: tapping it hands the phone over, and these pages come back when it exits. A plugin that is only a manifest is listed and nothing more.",
     ]);
     y = widgets::footnote(&mut c, t, f, y, where_);
     y = widgets::footnote(&mut c, t, f, y, what);

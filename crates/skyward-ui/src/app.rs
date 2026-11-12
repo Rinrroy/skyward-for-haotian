@@ -1323,6 +1323,9 @@ pub enum Action {
     AskDeleteDownload,
     /// Open the plugin at this place in the list of those found.
     OpenPlugin(usize),
+    /// Hand the phone to the installed plugin that carries a runnable image,
+    /// so its program runs in the place of these pages until it exits.
+    OpenBrowser,
     /// Open the folder the plugins are kept in, in the file manager.
     OpenPluginFolder,
     Open(Screen),
@@ -2588,6 +2591,9 @@ pub enum Effect {
     /// Read the plugins kept on the phone, telling what is found with
     /// [`App::set_plugins`].
     ReadPlugins,
+    /// Run the plugin at `image` by starting `program` inside it. The pages
+    /// are gone until it exits: the display is the plugin's while it runs.
+    OpenBrowser { image: String, program: String },
     /// Forget the network named `name`, with what was kept of it, telling
     /// how it went with [`App::wlan_forgotten`].
     ForgetWlan(String),
@@ -6618,6 +6624,30 @@ impl App {
             Action::OpenPlugin(i) => {
                 self.state.plugin_chosen = i;
                 self.refresh();
+            }
+            // A plugin with an image is one that can run, and the one it is
+            // today is the browser. Which image and which program come from
+            // the manifest that was read when the page was drawn, so a plugin
+            // whose image is missing is a sentence rather than a start.
+            Action::OpenBrowser => {
+                let runnable = self.state.plugins.as_ref().and_then(|found| found.as_ref().ok()).and_then(|list| {
+                    list.rows.iter().find_map(|row| {
+                        let plugin = row.manifest.as_ref().ok()?;
+                        let payload = plugin.payload.as_ref()?;
+                        Some((row.image.clone()?, payload.program.clone()))
+                    })
+                });
+                match runnable {
+                    Some((image, program)) => return vec![Effect::OpenBrowser { image, program }],
+                    None => {
+                        let said = self.state.lang.pick([
+                            "没有可以运行的插件。解密 data 并在插件页下载浏览器后，这里会出现它的入口。",
+                            "沒有可以執行的外掛。解密 data 並在外掛頁下載瀏覽器後，這裡會出現它的入口。",
+                            "There is no plugin to run. Once the data partition is decrypted and the browser is downloaded on the plugins page, its way in appears here.",
+                        ]);
+                        self.say(said, now);
+                    }
+                }
             }
             Action::OpenPluginFolder => return vec![Effect::ReadDir(PLUGIN_FOLDER.to_string())],
         }
