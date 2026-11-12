@@ -146,11 +146,11 @@ carry a payload, and the manifest says where to get it:
   "version": "1.0",
   "about": "在恢复里浏览网页",
   "payload": {
-    "url": "https://…/webview-1.0-arm64.squashfs",
+    "url": "https://…/webview-1.1-arm64.erofs",
     "sha256": "…64 hex…",
-    "size": 734003200,
-    "format": "squashfs",
-    "program": "/usr/bin/chromium"
+    "size": 717701120,
+    "format": "erofs",
+    "program": "/opt/skyward/start.sh"
   }
 }
 ```
@@ -159,6 +159,11 @@ carry a payload, and the manifest says where to get it:
   more than zero, `format` is one of `squashfs`, `erofs`, `ext4`, `img`, and
   `program` is the absolute path inside the payload to run. Anything else is a
   manifest error the page shows, not a plugin it offers to install.
+- What we ship is **erofs**, not squashfs, and for one reason: the recovery
+  mounts the phone's own system partitions as erofs, so the kernel in the
+  ramdisk is certain to read it. squashfs depends on `CONFIG_SQUASHFS`, which
+  Android does not always turn on, and a payload that cannot be mounted is a
+  browser that cannot start.
 - Installed plugins live in **`/data/skyward/plugins/<name>/`** — `/data`
   because that is where a gigabyte belongs, and because it survives a reboot so
   the plugin is there at the next start. It also means the plugins page can only
@@ -215,8 +220,9 @@ one.
 3. Are `/dev/input/event*` readable from the `recovery` domain, and does the
    touchscreen report through evdev with usable axes?
 4. How much RAM is free while Skyward is up? (Chromium wants ~400 MB idle.)
-5. Does the kernel allow `mount -t squashfs` / loop devices from the recovery?
-   (`losetup` is already used for images, so probably yes.)
+5. Does the kernel mount our image at all, and do loop devices work from the
+   recovery? (`losetup` is already used for images, so probably yes; erofs is
+   chosen so the filesystem side of this is not a gamble.)
 6. Is `/dev/snd` present and does a plain ALSA open work?
 
 ## Risks
