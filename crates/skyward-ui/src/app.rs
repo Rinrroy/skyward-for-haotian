@@ -5937,7 +5937,7 @@ impl App {
                 return vec![Effect::Dismiss];
             }
             Action::PickEntry(op) => {
-                let path = self.entry_path();
+                let Some(path) = self.entry_path() else { return self.no_entry(now) };
                 self.state.clip = Some(Clip { op, path });
                 return self.back(now);
             }
@@ -5961,14 +5961,20 @@ impl App {
                 self.refresh();
             }
             Action::RenameEntry => {
-                self.state.new_name = self.state.file.as_ref().expect("the file page shows an entry").name.clone();
+                let Some(name) = self.state.file.as_ref().map(|f| f.name.clone()) else { return self.no_entry(now) };
+                self.state.new_name = name;
                 self.state.layer = Layer::Letters;
                 self.open(Screen::Rename);
             }
-            Action::EditEntry => return vec![Effect::OpenText(self.entry_path())],
+            Action::EditEntry => return match self.entry_path() {
+                Some(path) => vec![Effect::OpenText(path)],
+                None => self.no_entry(now),
+            },
             Action::InstallEntry => {
-                let size = self.state.file.as_ref().expect("the file page shows an entry").size;
-                return self.install_opened(self.entry_path(), size, now);
+                let (Some(size), Some(path)) = (self.state.file.as_ref().map(|f| f.size), self.entry_path()) else {
+                    return self.no_entry(now);
+                };
+                return self.install_opened(path, size, now);
             }
             Action::SaveText => {
                 let ed = self.state.editor.as_ref().expect("the editor page shows a file");
@@ -5976,8 +5982,10 @@ impl App {
             }
             Action::OpenPermissions => self.open(Screen::Permissions),
             Action::ModeBit(bit) => {
-                let mode = self.state.file.as_ref().expect("the permissions page shows an entry").mode;
-                return vec![Effect::SetMode { path: self.entry_path(), mode: (mode ^ bit) & 0o7777 }];
+                let (Some(mode), Some(path)) = (self.state.file.as_ref().map(|f| (f.mode ^ bit) & 0o7777), self.entry_path()) else {
+                    return self.no_entry(now);
+                };
+                return vec![Effect::SetMode { path, mode }];
             }
             Action::AskDelete => {
                 self.state.asking_delete = true;
@@ -6483,10 +6491,24 @@ impl App {
         }
     }
 
-    /// Where the entry the file page shows is.
-    fn entry_path(&self) -> String {
-        let entry = self.state.file.as_ref().expect("the file page shows an entry");
-        self.state.files.inside(&entry.name)
+    /// Where the entry the file page shows is, or `None` when no page is
+    /// describing one any more.
+    ///
+    /// The entry a page describes is taken away the moment work on it
+    /// starts, so a second touch that arrived from a frame drawn before
+    /// that finds nothing here. Saying so leaves the phone where it is;
+    /// ending the run over it would take the phone back to the home page
+    /// with the work it just began still going.
+    fn entry_path(&self) -> Option<String> {
+        let entry = self.state.file.as_ref()?;
+        Some(self.state.files.inside(&entry.name))
+    }
+
+    /// What a page whose entry has gone says, instead of acting on nothing.
+    fn no_entry(&mut self, now: u64) -> Vec<Effect> {
+        let said = self.state.lang.pick(["没有可操作的条目", "沒有可操作的項目", "There is no entry left to act on"]);
+        self.say(said, now);
+        Vec::new()
     }
 
     /// Install the file of `size` bytes at `path` in `place`, its page
@@ -6672,15 +6694,17 @@ impl App {
                 // the user's words; an unchanged one leaves the page.
                 Screen::Rename => {
                     let name = self.state.new_name.clone();
-                    let current = &self.state.file.as_ref().expect("the file page shows an entry").name;
+                    let (Some(current), Some(path)) = (self.state.file.as_ref().map(|f| f.name.clone()), self.entry_path()) else {
+                        return self.no_entry(now);
+                    };
                     let taken = self.state.files.entries.as_ref().is_ok_and(|entries| entries.iter().any(|e| e.name == name));
                     match name.as_str() {
                         "" => self.say(l.pick(["请输入名称", "請輸入名稱", "Enter a name"]), now),
                         "." | ".." => self.say(l.pick(["名称不能为\".\"或\"..\"", "名稱不能是「.」或「..」", "A name can't be “.” or “..”"]), now),
                         _ if name.contains('/') => self.say(l.pick(["名称不能包含\"/\"", "名稱不能包含「/」", "A name can't hold “/”"]), now),
-                        _ if name == *current => return self.back(now),
+                        _ if name == current => return self.back(now),
                         _ if taken => self.say_taken(now),
-                        _ => return vec![Effect::Rename { path: self.entry_path(), name }],
+                        _ => return vec![Effect::Rename { path, name }],
                     }
                 }
                 // A password the network's protection cannot take is turned
@@ -7320,7 +7344,14 @@ impl App {
                     fx.push(Effect::Merge);
                 }
             }
-            Confirm::DeleteEntry => fx.push(Effect::Delete(self.entry_path())),
+            Confirm::DeleteEntry => match self.entry_path() {
+                Some(path) => fx.push(Effect::Delete(path)),
+                // The entry this page described is gone, or the work on it
+                // has already started and taken it away: say so rather than
+                // ending the run, which would take the phone to the home
+                // page while the delete it just began is still going.
+                None => return self.no_entry(now),
+            },
             // The partition has to be open; whether its users have unlocked
             // their own files makes no difference.
             Confirm::Avb => {
@@ -12214,6 +12245,35 @@ mod tests {
         assert_eq!(app.screen(), Screen::FileJob, "how it ended stays to be read");
         app.key(Key::Back, 1000);
         assert_eq!(app.screen(), Screen::Files, "back past the entry's page, which was for an entry being deleted");
+    }
+
+    /// A delete that has begun takes the entry its page described away with
+    /// it. Everything that page could still ask for from a frame drawn
+    /// before that has no entry to act on, and must say so: the run's own
+    /// `Err` and panic both restart the recovery, which starts at the home
+    /// page — a phone that goes home in the middle of deleting a file is
+    /// what that looks like to whoever is holding it.
+    #[test]
+    fn what_asks_for_an_entry_a_started_delete_took_away_says_so_and_stays() {
+        let (f, i) = (fonts(), info());
+        let mut app = in_sdcard(&f, &i);
+        hold_entry(&mut app, &f, &i, 1);
+        tap(&mut app, &f, &i, Action::AskDelete);
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::DeleteEntry), vec![Effect::Delete("/sdcard/a.zip".into())]);
+        app.file_job_started(FileTask::Delete { path: "/sdcard/a.zip".into() });
+        // The page that described the entry is gone with it.
+        assert_eq!(app.state.file, None, "the work takes the entry it describes");
+        for (action, at) in [
+            (Action::EditEntry, 1000),
+            (Action::InstallEntry, 1001),
+            (Action::RenameEntry, 1002),
+            (Action::PickEntry(FileOp::Copy), 1003),
+            (Action::ModeBit(0o100), 1004),
+            (Action::Confirm(Confirm::DeleteEntry), 1005),
+        ] {
+            assert!(app.act(action, at).is_empty(), "{action:?} asks for an entry that is gone");
+            assert_eq!(app.screen(), Screen::FileJob, "{action:?} leaves the work's page up");
+        }
     }
 
     #[test]

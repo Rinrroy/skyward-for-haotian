@@ -2769,7 +2769,16 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     // A name taken where an entry goes is the user's to
                     // decide on before anything is written.
                     Effect::Paste { op, path, into, clash } => {
-                        ensure!(worker.is_none(), "work on files is under way already");
+                        if worker.is_some() {
+                            // A second paste asked for while the first is
+                            // still going comes from a frame drawn before
+                            // the work began. Dropping it leaves the run
+                            // going, where ending it would take the phone
+                            // back to the home page mid-copy.
+                            let _ = skyward_sys::kmsg("work on files is under way already; the paste asked for is dropped");
+                            app.report(app.state.lang.pick(["文件操作还在进行", "檔案操作還在進行", "Work on files is already under way"]), now);
+                            continue;
+                        }
                         let clash = match clash {
                             Some(choice) => clash_rule(choice),
                             None => match skyward_files::clashes(&[PathBuf::from(&path)], Path::new(&into)) {
@@ -2801,15 +2810,33 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         app.file_job_started(shown);
                     }
                     Effect::Delete(path) => {
-                        ensure!(worker.is_none(), "work on files is under way already");
+                        if worker.is_some() {
+                            // As with a paste: a delete asked for twice is
+                            // dropped, never allowed to end the run.
+                            let _ = skyward_sys::kmsg("work on files is under way already; the delete asked for is dropped");
+                            app.report(app.state.lang.pick(["文件操作还在进行", "檔案操作還在進行", "Work on files is already under way"]), now);
+                            continue;
+                        }
                         worker = Some(filework::Worker::start(filework::Task::Delete { path: PathBuf::from(&path) })?);
                         app.file_job_started(FileTask::Delete { path });
                     }
-                    Effect::StopJob => worker.as_ref().context("there is no work on files to stop")?.stop(),
+                    // Stopping what is not running is a tap from a frame
+                    // drawn before the work ended, not a reason to end the
+                    // run.
+                    Effect::StopJob => match &worker {
+                        Some(w) => w.stop(),
+                        None => {
+                            let _ = skyward_sys::kmsg("no work on files to stop; the request is dropped");
+                        }
+                    },
                     // Rules kept on a partition that is not mounted are the
                     // page's to report, with what to do first.
                     Effect::Relabel => {
-                        ensure!(relabeler.is_none(), "relabeling is under way already");
+                        if relabeler.is_some() {
+                            let _ = skyward_sys::kmsg("relabeling is under way already; the request is dropped");
+                            app.report(app.state.lang.pick(["文件操作还在进行", "檔案操作還在進行", "Work on files is already under way"]), now);
+                            continue;
+                        }
                         let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
                         match relabel::rule_files(slot) {
                             Ok(rules) => {
@@ -2822,7 +2849,12 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             },
                         }
                     }
-                    Effect::StopRelabel => relabeler.as_ref().context("there is no relabeling to stop")?.stop(),
+                    Effect::StopRelabel => match &relabeler {
+                        Some(r) => r.stop(),
+                        None => {
+                            let _ = skyward_sys::kmsg("no relabeling to stop; the request is dropped");
+                        }
+                    },
                     // Partitions that cannot be read are the page's to say.
                     Effect::ReadFilesystems => app.set_filesystems(read_filesystems().map_err(|e| format!("{e:#}"))),
                     // The data partition made afresh as another filesystem
