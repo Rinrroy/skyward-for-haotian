@@ -54,6 +54,11 @@ A download can be paused and continued, and a package already downloaded can be
 deleted. A pause is only a stop: what was fetched stays as the `.part` it is,
 and continuing asks the server for the rest of it from that file's real length.
 
+The check and the download both go to GitHub first; a mirror in the mainland
+(`gh-proxy`, `ghfast`, `ghproxy`, `api.kkgithub.com`) is tried only when GitHub
+does not answer, and whatever a mirror sends still has to match the release's
+SHA-256. The switch is under Settings → Updates and is on by default.
+
 ### Backup and restore
 
 ![Back up the system, apps and IMEI](slides/en/out/06-backup.png)
@@ -66,6 +71,12 @@ The list sorts by name, modified time or file type, chosen from the bar under
 it. Folders stay first in all three, and every order is total — ties fall to the
 lowercased name and then the raw one — so no entry is left where the filesystem
 happened to return it.
+
+A search box above the list keeps only the names that contain what is typed,
+ignoring case; it is pinned under the bar, so scrolling cannot take it away, and
+the keyboard it brings up sits at the bottom of the same page. The order is one
+button beside the box that turns on each tap — name, time, type — rather than
+three buttons that are all there at once.
 
 ### Terminal
 

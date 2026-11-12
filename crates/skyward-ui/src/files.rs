@@ -489,35 +489,45 @@ pub struct Head {
 impl Head {
     /// The strip as a page takes it, with the box, its clear button and the
     /// order button answering to `field`, `clear` and `order`.
+    ///
+    /// The clear button is offered before the box, because it is drawn
+    /// inside the box's right end: the first hit that holds a finger is the
+    /// one that answers, and a cross that cannot be pressed because the
+    /// field was registered first is a cross that does nothing.
     pub fn hits(mut self, field: Action, clear: Action, order: Action) -> Pinned {
-        self.pinned.hits.push(Hit { rect: self.field, action: field });
         if let Some(rect) = self.clear {
             self.pinned.hits.push(Hit { rect, action: clear });
         }
+        self.pinned.hits.push(Hit { rect: self.field, action: field });
         self.pinned.hits.push(Hit { rect: self.order, action: order });
         self.pinned
     }
 }
 
-/// The strip the file manager holds still over its list: `query` typed so
-/// far or `hint` while there is none, the order it is in in `order`, over
-/// the path to `folder` under `top`.
+/// The strip the file manager holds still over its list: the path to
+/// `folder` under `top`, and under it the box holding `query` typed so far
+/// (or `hint` while there is none) with the order it is in, `order`, on its
+/// right.
 pub fn head(t: &Theme, f: &Fonts, query: &str, hint: &str, order: &str, top: &str, folder: &str) -> Head {
     let m = &t.m;
     let path = strip(t, f, top, folder);
     let down = m.dp(HEAD_DP).round() as i32;
     let mut c = Canvas::new(m.w, path.canvas.h + down as u32);
     c.clear(palette(t).page);
-    let cy = down as f32 / 2.0;
+    // The path stays where it has always been, directly under the bar, so a
+    // folder's name does not move when the box arrives beneath it.
+    c.put(&path.canvas, 0);
+    let cy = path.canvas.h as f32 + down as f32 / 2.0;
     let order = widgets::order_button(&mut c, t, f, m.w as f32 - m.margin, cy, order);
     let field = Rect::new(m.margin, cy - m.search_h / 2.0, order.x - m.dp(10.0) - m.margin, m.search_h);
     let clear = widgets::search_box(&mut c, t, f, field, query, hint);
-    c.put(&path.canvas, down);
-    let mut hits = path.hits;
-    for hit in &mut hits {
-        hit.rect.y += down as f32;
-    }
-    Head { pinned: Pinned { canvas: c, top: path.top, hits }, field, clear, order }
+    // The box's own hit stops at the cross, so the two never answer for the
+    // same finger.
+    let field = match clear {
+        Some(disc) => Rect { w: disc.x - m.dp(6.0) - field.x, ..field },
+        None => field,
+    };
+    Head { pinned: Pinned { canvas: c, top: path.top, hits: path.hits }, field, clear, order }
 }
 
 /// What the page says in place of the list, `top` dp down the page (where
