@@ -29,6 +29,7 @@ use anyhow::{bail, Context, Result};
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -37,6 +38,14 @@ use std::time::{Duration, Instant};
 /// Where the image is laid out while it runs. On rootfs, which the recovery
 /// owns, so the mounts go away with the process that made them.
 const WORK: &str = "/skyward/run/browser";
+
+/// A script in the browser's own folder that starts it instead of the image's
+/// own program, when there is one and it can be run.
+///
+/// This is how a payload is put right without rebuilding it: the image is
+/// read-only, but the data partition is not, and the same path means the same
+/// file inside the chroot because `/data` is bound in at `/data`.
+const OVERRIDE: &str = "/data/skyward/browser/start.sh";
 
 /// The image's own folder inside the chroot, and the folders that are bound
 /// or mounted over it.
@@ -419,14 +428,32 @@ fn last_words(text: &str, most: usize) -> String {
     tail.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Which program starts the browser: the script in its own folder when there
+/// is one that can be run, otherwise what the plugin says.
+fn starter(program: &str) -> String {
+    let at = Path::new(OVERRIDE);
+    match at.metadata() {
+        Ok(found) if found.is_file() && found.permissions().mode() & 0o111 != 0 => {
+            let _ = skyward_sys::kmsg(&format!("the browser is started by {OVERRIDE}, not by the image's own program"));
+            OVERRIDE.to_string()
+        }
+        Ok(_) => {
+            let _ = skyward_sys::kmsg(&format!("{OVERRIDE} is not a program that can be run; the image's own program starts the browser"));
+            program.to_string()
+        }
+        Err(_) => program.to_string(),
+    }
+}
+
 /// Hand the phone to the browser at `image`, running `program` inside it.
 ///
 /// The caller must have released the display: the browser's compositor takes
 /// the DRM card as its own master, and a recovery that still holds it would
 /// leave the panel black.
 pub fn open(image: &Path, program: &str) -> Result<Ended> {
+    let program = starter(program);
     let lay = Lay::of(image).with_context(|| format!("lay out {}", image.display()))?;
-    lay.run(program)
+    lay.run(&program)
 }
 
 #[cfg(test)]
