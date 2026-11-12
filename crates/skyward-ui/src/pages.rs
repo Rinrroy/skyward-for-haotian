@@ -4588,10 +4588,28 @@ pub fn plugins(cx: &Ctx) -> Frame {
     match &s.plugins {
         None => y = widgets::footnote(&mut c, t, f, y, l.pick(["正在读取插件目录", "正在讀取外掛目錄", "Reading the plugins folder"])),
         Some(Err(why)) => y = widgets::footnote(&mut c, t, f, y, &tr!(l, "无法读取插件目录：{why}", "無法讀取外掛目錄：{why}", "The plugins folder can't be read: {why}")),
-        Some(Ok(rows)) if rows.is_empty() => {
+        Some(Ok(list)) if list.rows.is_empty() && !list.data_open => {
+            // Installed plugins live under the data partition, so an empty
+            // list on a phone that has not decrypted it says nothing about
+            // what is installed. Saying that is the difference between
+            // "there are none" and "I cannot see them yet".
+            y = widgets::footnote(
+                &mut c,
+                t,
+                f,
+                y,
+                l.pick([
+                    "已安装的插件放在 data 分区里，解密 data 之后才能看到。",
+                    "已安裝的外掛放在 data 分區裡，解密 data 之後才能看到。",
+                    "Installed plugins are kept in the data partition, so they show up once it is decrypted.",
+                ]),
+            )
+        }
+        Some(Ok(list)) if list.rows.is_empty() => {
             y = widgets::footnote(&mut c, t, f, y, l.pick(["还没有安装任何插件。", "還沒有安裝任何外掛。", "No plugins are installed yet."]))
         }
-        Some(Ok(rows)) => {
+        Some(Ok(list)) => {
+            let rows = &list.rows;
             let titles: Vec<String> = rows
                 .iter()
                 .map(|r| match &r.manifest {
@@ -4602,7 +4620,16 @@ pub fn plugins(cx: &Ctx) -> Frame {
             let subs: Vec<String> = rows
                 .iter()
                 .map(|r| match &r.manifest {
-                    Ok(p) => p.version.as_ref().map_or_else(|| l.pick(["已安装", "已安裝", "Installed"]).to_string(), |v| tr!(l, "版本 {v}", "版本 {v}", "Version {v}")),
+                    Ok(p) => {
+                        let version = p.version.as_ref().map_or_else(|| l.pick(["已安装", "已安裝", "Installed"]).to_string(), |v| tr!(l, "版本 {v}", "版本 {v}", "Version {v}"));
+                        match &r.image {
+                            // An image beside the manifest is what makes a
+                            // plugin one this program installed rather than
+                            // a folder someone dropped in.
+                            Some(image) => tr!(l, "{version} · {image}", "{version} · {image}", "{version} · {image}"),
+                            None => version,
+                        }
+                    }
                     Err(why) => why.clone(),
                 })
                 .collect();

@@ -251,6 +251,14 @@ pub const DOWNLOADS: &str = "downloaded_rom";
 /// phone and what the recovery keeps are found in one place.
 pub const PLUGIN_FOLDER: &str = "Skyward/plugins";
 
+/// Where an installed plugin is kept: under the data partition, because a
+/// plugin that carries an image is a gigabyte and because it has to be there
+/// at the next start rather than only while a card is in.
+///
+/// The price is that the plugins page sees nothing until the data partition
+/// is decrypted, which is what it says on the page.
+pub const PLUGIN_STORE: &str = "/data/skyward/plugins";
+
 /// Where the USB drive plugged in is shown.
 pub const USB_DRIVE: &str = "/mnt/usb";
 
@@ -2009,7 +2017,7 @@ pub struct State {
     pub saved: Vec<SavedNetwork>,
     /// The plugins kept on the phone, as the runtime last read them; none
     /// until it has.
-    pub plugins: Option<Result<Vec<PluginRow>, String>>,
+    pub plugins: Option<Result<PluginList, String>>,
     /// The plugin the page was opened on, by its place in the list.
     pub plugin_chosen: usize,
 }
@@ -2048,6 +2056,23 @@ pub struct PluginRow {
     /// either, so a folder a person dropped in is never silently passed
     /// over.
     pub manifest: Result<Plugin, String>,
+    /// The image the plugin carries, by file name, where it has been
+    /// installed: what tells an installed plugin from a manifest someone
+    /// dropped in.
+    pub image: Option<String>,
+}
+
+/// The plugins the recovery found, and whether the place installed ones are
+/// kept could be looked at at all.
+///
+/// The second half is not a detail: installed plugins live under `/data`,
+/// which is not mounted until it is decrypted, so an empty list on a phone
+/// that has a plugin installed is a different thing from an empty list on a
+/// phone that has none — and the page has to be able to say which it is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PluginList {
+    pub rows: Vec<PluginRow>,
+    pub data_open: bool,
 }
 
 /// What a plugin's manifest says it is.
@@ -2067,6 +2092,33 @@ pub struct Plugin {
     /// What it says it needs of the recovery, by name: what a later release
     /// refuses to run it without.
     pub needs: Vec<String>,
+    /// The image it carries, where it is more than a manifest.
+    pub payload: Option<Payload>,
+}
+
+/// What a plugin carries when it is more than a manifest: one image holding a
+/// whole program, and where to get it.
+///
+/// The manifest is written by whoever makes the plugin, not by this program,
+/// so every field is checked before it is believed — see
+/// [`crate::plugin::manifest`]. A payload is executed, which is why the
+/// checks here are stricter than the ones on a plugin's own name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Payload {
+    /// Where the image comes from. `https` only: an image that is executed,
+    /// fetched over anything else, can be replaced in flight by whoever is
+    /// on the way.
+    pub url: String,
+    /// The digest the image must have, checked before it is given a name,
+    /// exactly like a system package.
+    pub sha256: String,
+    /// How many bytes to expect, so a download can be refused before it
+    /// fills the phone rather than after.
+    pub size: u64,
+    /// How the image is mounted: `squashfs`, `erofs`, `ext4` or `img`.
+    pub format: String,
+    /// The program to run inside it, by absolute path.
+    pub program: String,
 }
 
 impl Default for State {
@@ -3734,7 +3786,7 @@ impl App {
 
     /// The plugins found in the folder the recovery reads them from, or why
     /// it could not be read.
-    pub fn set_plugins(&mut self, plugins: Result<Vec<PluginRow>, String>) {
+    pub fn set_plugins(&mut self, plugins: Result<PluginList, String>) {
         self.state.plugins = Some(plugins);
         self.refresh();
     }

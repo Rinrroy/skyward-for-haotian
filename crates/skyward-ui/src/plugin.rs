@@ -11,7 +11,7 @@
 //! to a length a page can draw, and a key of the wrong type is an error
 //! rather than a silently missing field.
 
-use crate::app::Plugin;
+use crate::app::{Payload, Plugin};
 use serde::Deserialize;
 
 /// The file a plugin folder is read from.
@@ -28,6 +28,20 @@ const LONGEST: usize = 120;
 
 /// How many things a plugin may say it needs.
 const NEEDS_MOST: usize = 16;
+
+/// The most an image may say it is. A payload is downloaded into the data
+/// partition, so a manifest claiming more than the phone could ever hold is
+/// a manifest that is wrong, and saying so now is better than filling the
+/// phone to find out.
+const SIZE_MOST: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The longest a download address may be. A URL is a string from a file
+/// anyone may write, and a page is not the place to draw a kilobyte of it.
+const URL_LONGEST: usize = 2048;
+
+/// The ways an image may be mounted. The first is what a payload is built
+/// as; the rest are here because an image someone made by hand may be one.
+const FORMATS: [&str; 4] = ["squashfs", "erofs", "ext4", "img"];
 
 /// The manifest as it is written, before any of it is believed.
 #[derive(Deserialize)]
@@ -47,6 +61,54 @@ struct Written {
     /// What it needs of the recovery, by name.
     #[serde(default)]
     needs: Vec<String>,
+    /// The image it carries, where it is more than a manifest.
+    #[serde(default)]
+    payload: Option<WrittenPayload>,
+}
+
+/// A manifest's `payload` as it is written, before any of it is believed.
+#[derive(Deserialize)]
+struct WrittenPayload {
+    url: String,
+    sha256: String,
+    size: u64,
+    #[serde(default)]
+    format: Option<String>,
+    program: String,
+}
+
+/// Read a payload out of a manifest, or say what is wrong with it.
+///
+/// Every one of these is a refusal rather than a correction: a plugin whose
+/// image cannot be fetched, checked or found again is not a plugin that
+/// should be offered to anyone.
+fn payload(written: WrittenPayload) -> Result<Payload, String> {
+    let url = written.url.trim();
+    if url.len() > URL_LONGEST {
+        return Err(format!("payload.url: longer than {URL_LONGEST} characters"));
+    }
+    if !url.starts_with("https://") {
+        return Err("payload.url: an image is fetched over https, and this address is not".into());
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("payload.url: an address has no spaces in it".into());
+    }
+    let sha256 = written.sha256.trim().to_lowercase();
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("payload.sha256: a digest is 64 hexadecimal characters".into());
+    }
+    if written.size == 0 || written.size > SIZE_MOST {
+        return Err(format!("payload.size: {} is not a size an image can be", written.size));
+    }
+    let format = written.format.as_deref().unwrap_or("squashfs").trim().to_lowercase();
+    if !FORMATS.contains(&format.as_str()) {
+        return Err(format!("payload.format: {format:?} is not one of {FORMATS:?}"));
+    }
+    let program = written.program.trim();
+    if !program.starts_with('/') || program.split('/').any(|part| part == "..") {
+        return Err(format!("payload.program: {program:?} is not a path inside the image"));
+    }
+    Ok(Payload { url: url.to_string(), sha256, size: written.size, format, program: program.to_string() })
 }
 
 /// Read a manifest's text. What it says, or why it cannot be read as one.
@@ -59,12 +121,14 @@ pub fn manifest(text: &str) -> Result<Plugin, String> {
     }
     let written: Written = serde_json::from_str(text).map_err(|e| format!("plugin.json: {e}"))?;
     let needs = written.needs.iter().filter_map(|need| kept(need)).take(NEEDS_MOST).collect();
+    let payload = written.payload.map(payload).transpose()?;
     Ok(Plugin {
         title: written.title.as_deref().and_then(kept).or_else(|| written.name.as_deref().and_then(kept)),
         version: written.version.as_deref().and_then(kept),
         author: written.author.as_deref().and_then(kept),
         about: written.about.as_deref().and_then(kept),
         needs,
+        payload,
     })
 }
 
@@ -124,5 +188,88 @@ mod tests {
         assert_eq!(plugin.about.as_deref().map(|a| a.chars().count()), Some(LONGEST));
         let needs = format!(r#"{{"needs":{}}}"#, serde_json::to_string(&vec!["a"; 50]).expect("json"));
         assert_eq!(manifest(&needs).expect("a plugin").needs.len(), NEEDS_MOST);
+    }
+
+    /// A manifest with the given payload fields, all of them good unless the
+    /// test says otherwise.
+    fn with_payload(fields: &str) -> String {
+        format!(r#"{{"title":"浏览器","payload":{{{fields}}}}}"#)
+    }
+
+    const DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    #[test]
+    fn a_payload_says_where_the_image_is_and_what_runs_in_it() {
+        let text = with_payload(&format!(
+            r#""url":"https://example.invalid/webview.squashfs","sha256":"{DIGEST}","size":734003200,"format":"squashfs","program":"/usr/bin/chromium""#
+        ));
+        let plugin = manifest(&text).expect("a plugin with an image");
+        let payload = plugin.payload.expect("the image it carries");
+        assert_eq!(payload.url, "https://example.invalid/webview.squashfs");
+        assert_eq!(payload.sha256, DIGEST);
+        assert_eq!(payload.size, 734003200);
+        assert_eq!(payload.format, "squashfs");
+        assert_eq!(payload.program, "/usr/bin/chromium");
+    }
+
+    #[test]
+    fn a_manifest_without_a_payload_carries_none() {
+        assert_eq!(manifest(r#"{"title":"主题包"}"#).expect("a plugin").payload, None);
+    }
+
+    #[test]
+    fn a_payload_the_phone_could_not_fetch_or_check_is_refused() {
+        // Plain http: an image that is executed is not fetched where anyone
+        // on the way could rewrite it.
+        let plain = with_payload(&format!(
+            r#""url":"http://example.invalid/a.img","sha256":"{DIGEST}","size":1,"program":"/a""#
+        ));
+        assert!(manifest(&plain).is_err(), "http is not https");
+        // An address with a space in it is two words, not one address.
+        let spaced = with_payload(&format!(
+            r#""url":"https://example.invalid/a b.img","sha256":"{DIGEST}","size":1,"program":"/a""#
+        ));
+        assert!(manifest(&spaced).is_err(), "an address has no spaces");
+        // A digest that is not a digest cannot be checked against anything.
+        for digest in ["", "abc", &"z".repeat(64)] {
+            let text = with_payload(&format!(
+                r#""url":"https://example.invalid/a.img","sha256":"{digest}","size":1,"program":"/a""#
+            ));
+            assert!(manifest(&text).is_err(), "{digest:?} is not a digest");
+        }
+        // Nothing to download, or more than the phone could hold.
+        for size in [0, SIZE_MOST + 1] {
+            let text = with_payload(&format!(
+                r#""url":"https://example.invalid/a.img","sha256":"{DIGEST}","size":{size},"program":"/a""#
+            ));
+            assert!(manifest(&text).is_err(), "{size} is not a size an image can be");
+        }
+        // A format nothing mounts.
+        let odd = with_payload(&format!(
+            r#""url":"https://example.invalid/a.img","sha256":"{DIGEST}","size":1,"format":"zip","program":"/a""#
+        ));
+        assert!(manifest(&odd).is_err(), "zip is not mounted");
+        // A program that is not a path inside the image.
+        for program in ["chromium", "/../../etc/passwd", "/usr/../../bin/sh", ""] {
+            let text = with_payload(&format!(
+                r#""url":"https://example.invalid/a.img","sha256":"{DIGEST}","size":1,"program":"{program}""#
+            ));
+            assert!(manifest(&text).is_err(), "{program:?} is not a path inside the image");
+        }
+        // A payload that leaves out what it needs is an error, not a plugin
+        // that quietly carries nothing.
+        let missing = with_payload(r#""url":"https://example.invalid/a.img","size":1,"program":"/a""#);
+        assert!(manifest(&missing).is_err(), "a payload without a digest");
+    }
+
+    #[test]
+    fn a_digest_is_read_in_either_case_and_a_format_defaults_to_the_one_we_build() {
+        let upper = with_payload(&format!(
+            r#""url":"https://example.invalid/a.img","sha256":"{}","size":1,"program":"/a""#,
+            DIGEST.to_uppercase()
+        ));
+        let payload = manifest(&upper).expect("a plugin").payload.expect("an image");
+        assert_eq!(payload.sha256, DIGEST, "the digest is compared in one case");
+        assert_eq!(payload.format, "squashfs", "the format we build is the one assumed");
     }
 }
