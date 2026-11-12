@@ -6221,6 +6221,12 @@ impl App {
                     FileKind::Folder { .. } | FileKind::Link { folder: true, .. } => {
                         let scroll = self.top().1;
                         self.state.files.leave(scroll);
+                        // Opening a folder ends the search: the box asked a
+                        // question, and this is the answer being walked into.
+                        // Leaving the text there would keep the page showing
+                        // the results of a search nobody is in any more.
+                        self.state.files_query.clear();
+                        self.state.files_search = false;
                         self.clear_found();
                         return vec![Effect::ReadDir(found.folder)];
                     }
