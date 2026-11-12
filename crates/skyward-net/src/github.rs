@@ -283,16 +283,16 @@ mod tests {
                 located.to_string(),
                 link.to_string(),
                 format!("https://gh-proxy.com/{located}"),
-                format!("https://ghfast.top/{located}"),
                 format!("https://ghproxy.net/{located}"),
+                format!("https://ghfast.top/{located}"),
                 format!("https://gh-proxy.com/{link}"),
-                format!("https://ghfast.top/{link}"),
                 format!("https://ghproxy.net/{link}"),
+                format!("https://ghfast.top/{link}"),
             ]
         );
         assert_eq!(
             build.sources(None),
-            [link.to_string(), format!("https://gh-proxy.com/{link}"), format!("https://ghfast.top/{link}"), format!("https://ghproxy.net/{link}")],
+            [link.to_string(), format!("https://gh-proxy.com/{link}"), format!("https://ghproxy.net/{link}"), format!("https://ghfast.top/{link}")],
             "where GitHub's API gave no address"
         );
     }
