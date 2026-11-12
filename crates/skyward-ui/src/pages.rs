@@ -1,7 +1,7 @@
 use crate::app::{
     Action, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop, Field, FileKind,
     FileOp, FileRow, FileTask, Fold, Folder, Found, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
-    SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, SortKey, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink,
+    SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, PluginEnd, PluginStage, Slider, SortKey, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink,
     Wipe, ADDABLE, BACKUP_PARTS, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES,
     USB_DRIVE_UNREADABLE, USB_DRIVE_WANTED, WIPES, installs, starting,
 };
@@ -146,6 +146,7 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
         Confirm::VbmetaRestore => (["滑动以写回备份", "滑動以寫回備份", "Slide to write the copy back"], true),
         Confirm::ForgetNetwork => (["滑动以忘记网络", "滑動以忘記網路", "Slide to forget the network"], true),
         Confirm::DeleteDownload => (["滑动以删除安装包", "滑動以刪除安裝檔", "Slide to delete the package"], true),
+        Confirm::DeletePlugin => (["滑动以删除插件", "滑動以刪除外掛", "Slide to delete the plugin"], true),
         Confirm::PowerOff => (["滑动以关机", "滑動以關機", "Slide to power off"], false),
     };
     (s.lang.pick(label), danger)
@@ -4651,6 +4652,108 @@ pub fn plugins(cx: &Ctx) -> Frame {
             y = drawn.bottom;
         }
     }
+    // The browser is published as a plugin, and this is the page it lands on,
+    // so this is where it is fetched from. It is hundreds of megabytes, so
+    // the download says how far it has come and can be stopped and gone on
+    // with rather than started over.
+    y = widgets::section(&mut c, t, f, y, l.pick(["下载", "下載", "Download"]));
+    match &s.plugin_job {
+        None => {
+            let sub = l.pick([
+                "约 465 MB，下载后可以在这里打开，也可以用它登录需要网页认证的 Wi-Fi。",
+                "約 465 MB，下載後可以在這裡開啟，也可以用它登入需要網頁驗證的 Wi-Fi。",
+                "About 465 MB. Once it is here it opens from this page, and it can sign in to Wi-Fi that asks on a web page.",
+            ]);
+            let row = Row::new(l.pick(["下载浏览器", "下載瀏覽器", "Download the browser"])).icon(BLUE, Icon::Install).subtitle(sub).trail(Trail::None);
+            let list = widgets::list(&mut c, t, f, y, &[row]);
+            out.extend(hits(&list.rows, &[Action::DownloadPlugin]));
+            y = list.bottom;
+        }
+        Some(job) => {
+            match (&job.stage, &job.outcome) {
+                (_, Some(end)) => {
+                    let (title, detail) = plugin_end(l, end);
+                    y = widgets::footnote(&mut c, t, f, y, &title);
+                    if let Some(detail) = detail {
+                        y = widgets::footnote(&mut c, t, f, y, &detail);
+                    }
+                    // Asking again goes on from what came of the last try: the
+                    // part kept is not thrown away by a stop.
+                    let again = match end {
+                        PluginEnd::Installed { .. } => l.pick(["再下载一次", "再下載一次", "Download it again"]),
+                        _ => l.pick(["重新下载", "重新下載", "Try the download again"]),
+                    };
+                    let list = widgets::list(&mut c, t, f, y + t.m.card_gap, &[Row::new(again).trail(Trail::None)]);
+                    out.extend(hits(&list.rows, &[Action::DownloadPlugin]));
+                    y = list.bottom;
+                }
+                (stage, None) => {
+                    let (heading, detail, done) = match stage {
+                        Some(PluginStage::Download(p)) => downloaded(l, *p, job.rate),
+                        _ => (l.pick(ASKING_PLUGINS), String::new(), None),
+                    };
+                    y = widgets::progress_card(&mut c, t, f, y, heading, &detail, done);
+                    let stop = Row::new(l.pick(if job.stopping { STOPPING } else { STOP })).trail(Trail::None);
+                    let list = widgets::list(&mut c, t, f, y + t.m.card_gap, &[stop]);
+                    if !job.stopping {
+                        out.extend(hits(&list.rows, &[Action::StopPluginDownload]));
+                    }
+                    y = list.bottom;
+                }
+            }
+            if job.outcome.is_some() {
+                // Nothing more to say about the job itself.
+            }
+        }
+    }
+    // Deleting one is a gigabyte that has to come down again, so it is asked
+    // for in a list of its own and then swiped.
+    let installed: Vec<(usize, String)> = s
+        .plugins
+        .as_ref()
+        .and_then(|found| found.as_ref().ok())
+        .map(|list| {
+            list.rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.image.is_some())
+                .map(|(i, row)| {
+                    let title = match &row.manifest {
+                        Ok(p) => p.title.clone().unwrap_or_else(|| row.name.clone()),
+                        Err(_) => row.name.clone(),
+                    };
+                    (i, title)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !installed.is_empty() {
+        y = widgets::section(&mut c, t, f, y, l.pick(["删除", "刪除", "Remove"]));
+        let rows: Vec<Row> = installed.iter().map(|(_, title)| Row::new(title.as_str()).icon(RED, Icon::Wipe).trail(Trail::None)).collect();
+        let list = widgets::list(&mut c, t, f, y, &rows);
+        let picks: Vec<Action> = installed.iter().map(|(i, _)| Action::AskDeletePlugin(*i)).collect();
+        out.extend(hits(&list.rows, &picks));
+        y = list.bottom;
+    }
+    if let Some(i) = s.plugin_deleting {
+        let name = installed.iter().find(|(at, _)| *at == i).map(|(_, title)| title.clone()).unwrap_or_default();
+        let name = name.as_str();
+        y = widgets::footnote(
+            &mut c,
+            t,
+            f,
+            y,
+            &tr!(
+                l,
+                "将删除 {name}：它的镜像和 plugin.json 都会从 data 分区里删掉，要用时需要重新下载。",
+                "將刪除 {name}：它的鏡像和 plugin.json 都會從 data 分區裡刪掉，要用時需要重新下載。",
+                "{name} will be deleted: its image and its plugin.json both go from the data partition, and it has to be downloaded again to be used."
+            ),
+        );
+        let (label, danger) = confirm_label(Confirm::DeletePlugin, s);
+        let track = widgets::confirm(&mut c, t, f, y + t.m.card_gap, label, danger, s.confirm);
+        out.push(Hit { rect: track, action: Action::Confirm(Confirm::DeletePlugin) });
+    }
     // What a plugin is, so that one can be made against this page before
     // anything runs it.
     y = widgets::section(&mut c, t, f, y, l.pick(["什么是插件", "什麼是外掛", "What a plugin is"]));
@@ -4674,6 +4777,33 @@ pub fn plugins(cx: &Ctx) -> Frame {
 }
 
 const PLUGINS: Text = ["插件", "外掛", "Plugins"];
+
+/// While the published list is being read and nothing is coming down yet.
+const ASKING_PLUGINS: Text = ["正在读取插件列表", "正在讀取外掛列表", "Reading the plugin list"];
+
+/// How installing the browser ended, as a sentence to draw, and what to add
+/// to it when there is more to say.
+fn plugin_end(l: Lang, end: &PluginEnd) -> (String, Option<String>) {
+    match end {
+        PluginEnd::Installed { size, .. } => {
+            let size = fmt::file_size(*size);
+            (
+                tr!(
+                    l,
+                    "浏览器已安装（{size}）。点上面的条目即可打开。",
+                    "瀏覽器已安裝（{size}）。點上面的項目即可開啟。",
+                    "The browser is installed ({size}). Tap it above to open it."
+                ),
+                Some(l.pick(["浏览器打开后可以登录需要网页认证的 Wi-Fi：认证页就在它里面。", "瀏覽器開啟後可以登入需要網頁驗證的 Wi-Fi：驗證頁就在它裡面。", "Once it is open it can sign in to Wi-Fi that asks on a web page: the page that asks is shown in it."]).to_string()),
+            )
+        }
+        PluginEnd::Stopped => (
+            l.pick(["下载已停止。已经下载的部分保留着，再点一次会接着下。", "下載已停止。已經下載的部分保留著，再點一次會接著下。", "The download is stopped. What came of it is kept, so asking again goes on from there."]).to_string(),
+            None,
+        ),
+        PluginEnd::Failed(why) => (tr!(l, "没有安装成功：{why}", "沒有安裝成功：{why}", "It was not installed: {why}"), None),
+    }
+}
 
 /// The slot's vbmeta image: what it is, the copies kept of it, making one,
 /// and putting one back. A copy older than the phone's rollback index is

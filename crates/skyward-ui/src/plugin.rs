@@ -120,6 +120,66 @@ pub fn manifest(text: &str) -> Result<Plugin, String> {
         return Err("plugin.json: a manifest is a JSON object, and this is not one".into());
     }
     let written: Written = serde_json::from_str(text).map_err(|e| format!("plugin.json: {e}"))?;
+    plugin_of(written)
+}
+
+/// One entry of the published index as it is written: a manifest with the
+/// folder name added to it.
+#[derive(Deserialize)]
+struct WrittenIndex {
+    #[serde(default)]
+    plugins: Vec<serde_json::Value>,
+}
+
+/// How many plugins the index may offer. A page draws them all, and an index
+/// that names more than this is not an index this program needs.
+pub const INDEX_MOST: usize = 32;
+
+/// One plugin to install: the folder it goes in and what it says it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offered {
+    /// The folder name under the plugin store, as the index wrote it.
+    pub name: String,
+    pub plugin: Plugin,
+    /// The entry's own text, written as the installed `plugin.json` so the
+    /// plugin is read the same way after the next start as it was now.
+    pub text: String,
+}
+
+/// Read the published index. Each entry is held to the same rules as a
+/// manifest on the phone, because it comes from the same place: someone
+/// else's file, fetched over the network.
+///
+/// An entry is a manifest with one more key, `name`, which is the folder it
+/// is installed into. Each entry is read by [`manifest`] on its own text, so
+/// there is one parser and not two.
+pub fn index(text: &str) -> Result<Vec<Offered>, String> {
+    if !text.trim_start().starts_with('{') {
+        return Err("the plugin index is a JSON object, and this is not one".into());
+    }
+    let written: WrittenIndex = serde_json::from_str(text).map_err(|e| format!("the plugin index: {e}"))?;
+    let mut offered = Vec::new();
+    for value in written.plugins.iter().take(INDEX_MOST) {
+        let name = value.get("name").and_then(|n| n.as_str()).and_then(kept).ok_or("an index entry has no name")?;
+        // A folder name is one path part: `..` would install outside the
+        // store, and a slash would install into a folder that is not one.
+        if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+            return Err(format!("{name:?} is not a folder name"));
+        }
+        let text = value.to_string();
+        let plugin = manifest(&text)?;
+        if plugin.payload.is_none() {
+            // A plugin to download that carries no image is a plugin this
+            // page could install and then have nothing to run.
+            return Err(format!("{name}: the index offers it without an image"));
+        }
+        offered.push(Offered { name, plugin, text });
+    }
+    Ok(offered)
+}
+
+/// A manifest as the pages and the runtime hold it.
+fn plugin_of(written: Written) -> Result<Plugin, String> {
     let needs = written.needs.iter().filter_map(|need| kept(need)).take(NEEDS_MOST).collect();
     let payload = written.payload.map(payload).transpose()?;
     Ok(Plugin {
@@ -272,4 +332,28 @@ mod tests {
         assert_eq!(payload.sha256, DIGEST, "the digest is compared in one case");
         assert_eq!(payload.format, "squashfs", "the format we build is the one assumed");
     }
+
+    #[test]
+    fn an_index_offers_plugins_by_folder_name_and_refuses_what_it_could_not_install() {
+        let text = format!(
+            r#"{{"version":1,"plugins":[{{"name":"webview","title":"浏览器","version":"1.0","payload":{{"url":"https://example.invalid/w.squashfs","sha256":"{DIGEST}","size":734003200,"format":"squashfs","program":"/opt/skyward/start.sh"}}}}]}}"#
+        );
+        let offered = index(&text).expect("an index");
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].name, "webview");
+        assert_eq!(offered[0].plugin.title.as_deref(), Some("浏览器"));
+        // The text kept is the entry's own, and it is a manifest this program
+        // reads back to the same thing.
+        assert_eq!(manifest(&offered[0].text).expect("the entry's own text"), offered[0].plugin);
+        // A name that is not one folder, and an entry with nothing to run.
+        for name in ["../etc", "a/b", "..", "."] {
+            let bad = format!(r#"{{"plugins":[{{"name":"{name}","payload":{{"url":"https://example.invalid/a","sha256":"{DIGEST}","size":1,"program":"/a"}}}}]}}"#);
+            assert!(index(&bad).is_err(), "{name:?} is not a folder name");
+        }
+        let bare = r#"{"plugins":[{"name":"webview","title":"浏览器"}]}"#;
+        assert!(index(bare).is_err(), "an entry with no image is not one to install");
+        assert!(index("[]").is_err(), "an index is an object");
+        assert_eq!(index(r#"{"plugins":[]}"#).expect("an empty index").len(), 0);
+    }
 }
+

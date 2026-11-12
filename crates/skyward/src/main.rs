@@ -27,6 +27,8 @@ mod merge;
 #[cfg(target_os = "android")]
 mod partwork;
 #[cfg(target_os = "android")]
+mod pluginjob;
+#[cfg(target_os = "android")]
 mod plugins;
 #[cfg(target_os = "android")]
 mod pty;

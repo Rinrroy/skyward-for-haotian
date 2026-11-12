@@ -167,6 +167,30 @@ carry a payload, and the manifest says where to get it:
   `payload.<format>.part` while it downloads and renamed only after the digest
   matches, exactly like a system package.
 
+## Where the image comes from
+
+The browser is not shipped in the recovery image: it is a plugin, fetched from
+its own repository's release assets when the phone is asked to. The page reads
+one small index and installs what it names.
+
+- The index is
+  `https://github.com/Rinrroy/skyward-plugins/releases/latest/download/plugins.json`.
+  It is read the same way the recovery's own update is: the direct address
+  first, and the mainland mirror only when GitHub does not answer.
+- `crates/skyward-ui/src/plugin.rs`'s `index()` parses it through the same
+  `manifest()` a folder on the phone goes through, so an entry is held to the
+  same rules — an `https://` url, a 64-hex digest, a size in range, a format it
+  can mount, an absolute program path — plus one more: the entry's `name` must
+  be a single folder name, because it becomes the folder it is installed in.
+- `crates/skyward/src/pluginjob.rs` does the work on its own thread: it reads
+  the index, takes the first entry, downloads into
+  `/data/skyward/plugins/<name>/payload.<format>` with the digest checked, and
+  writes `plugin.json` **last** — so a download that was stopped half way is
+  not a plugin the page lists.
+- A stopped download keeps its `.part`, so asking again goes on from where it
+  stopped rather than from nothing.
+- Deleting an installed plugin removes its folder, image and manifest together.
+
 ## The staged plan
 
 | stage | what it lands | how it is known to work |

@@ -135,6 +135,10 @@ pub struct Worker {
     stashed: Mutex<Stashed>,
     /// Readable while the screen has something to be told.
     wake: OwnedFd,
+    /// Where the DNS servers the joined network gave are kept. Held here too,
+    /// so that whoever looks a name up can reach them while the thread owns
+    /// its own copy.
+    servers: Servers,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -167,6 +171,7 @@ impl Worker {
         let (wake, rung) = pipe()?;
         let poke = Arc::new(poke);
         let back = Back { inbox: inbox_tx.clone(), poke: poke.clone() };
+        let kept = servers.clone();
         let thread = thread::Builder::new()
             .name("wlan".into())
             .spawn(move || {
@@ -191,7 +196,14 @@ impl Worker {
                 s.run(&inbox, &poked);
             })
             .context("start the WLAN thread")?;
-        Ok(Worker { inbox: inbox_tx, poke, told, stashed: Mutex::new(Stashed::default()), wake, thread: Some(thread) })
+        Ok(Worker { inbox: inbox_tx, poke, told, stashed: Mutex::new(Stashed::default()), wake, servers: kept, thread: Some(thread) })
+    }
+
+    /// The DNS servers the joined network gave, as they stand now. Empty
+    /// while nothing is joined: a name cannot be looked up then, which is
+    /// what the caller says rather than something to fail on.
+    pub fn servers(&self) -> Servers {
+        self.servers.clone()
     }
 
     pub fn send(&self, c: Command) {

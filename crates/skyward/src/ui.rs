@@ -28,7 +28,7 @@ use skyward_sys::control::{Control, Request};
 use skyward_sys::Power;
 use skyward_files::Ownership;
 use skyward_block::usb::{self, Drive};
-use skyward_net::download::{self, Failure};
+use skyward_net::download::{self, Failure, Progress};
 use skyward_net::http::Servers;
 use skyward_net::release::{Installed, Release, Unanswered};
 use skyward_net::wlan::{Power as WlanPower, Stage as Joining};
@@ -39,7 +39,7 @@ use skyward_ui::aod::{Shown, Want};
 use skyward_ui::app::{
     App, Asked, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop, FileKind, FileOp,
     FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop, Place,
-    RenameRefused, Screen, Shot, SkywardEnd, SkywardStage, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION, DOWNLOADS,
+    RenameRefused, Screen, Shot, SkywardEnd, SkywardStage, PluginEnd, PluginStage, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION, DOWNLOADS,
     INSTALL_UNFINISHED, USB_DRIVE,
 };
 use skyward_ui::settings::Keeper;
@@ -1577,6 +1577,10 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // Asking the update server, and downloading the full package.
     let mut checker: Option<updates::Worker> = None;
     let mut downloader: Option<updates::Worker> = None;
+    // Installing the browser plugin from the published list. It has no wake
+    // pipe: what it says is read every time round the loop, which is at most
+    // a second apart while it runs.
+    let mut plugin_job: Option<crate::pluginjob::Worker> = None;
     // Asking GitHub for Skyward's newest release, and updating to it.
     let mut skyward_checker: Option<updates::Worker> = None;
     let mut skyward_updater: Option<updates::Worker> = None;
@@ -1822,6 +1826,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             || downloader.is_some()
             || skyward_checker.is_some()
             || skyward_updater.is_some()
+            || plugin_job.is_some()
             || systems_busy;
         let joining = app.state.wlan.as_ref().and_then(|w| w.joined.as_ref()).is_some_and(|j| matches!(j.stage, Joining::Joining | Joining::Addressing));
         let running = match &shell {
@@ -2332,6 +2337,30 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         if fetched {
             downloader = None;
         }
+        // The browser plugin coming down. Nothing here can end the run: a
+        // download that fails is a sentence on the page.
+        let mut came_in = false;
+        if let Some(job) = &plugin_job {
+            for ev in job.events() {
+                match ev {
+                    crate::pluginjob::Event::Asking => app.plugin_progress(PluginStage::Asking, 0),
+                    crate::pluginjob::Event::Coming { done, total, rate } => app.plugin_progress(PluginStage::Download(Progress::Downloading { done, total }), rate),
+                    crate::pluginjob::Event::Ended(end) => {
+                        let end = match end {
+                            crate::pluginjob::Ended::Installed { name, size } => PluginEnd::Installed { name, size },
+                            crate::pluginjob::Ended::Stopped => PluginEnd::Stopped,
+                            crate::pluginjob::Ended::Failed(why) => PluginEnd::Failed(why),
+                        };
+                        let _ = skyward_sys::kmsg(&format!("installing the browser plugin ended: {end:?}"));
+                        app.plugin_ended(end, now);
+                        came_in = true;
+                    }
+                }
+            }
+        }
+        if came_in {
+            plugin_job = None;
+        }
         let mut asked = false;
         if let Some(c) = &skyward_checker {
             for ev in c.events() {
@@ -2764,6 +2793,33 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     // it cannot be allowed to end the run: a folder that
                     // cannot be read is a row saying so, and the page stays.
                     Effect::ReadPlugins => app.set_plugins(crate::plugins::read(app.state.lang)),
+                    // Fetching the browser plugin. It is one thread that
+                    // writes into the store and tells the page how it goes; a
+                    // network that will not answer is a sentence there, never
+                    // an error here.
+                    Effect::DownloadPlugin => {
+                        if plugin_job.is_none() {
+                            let servers = crate::pluginjob::servers(&wlan);
+                            plugin_job = Some(crate::pluginjob::Worker::start(crate::pluginjob::store(), servers, app.state.lang));
+                        } else {
+                            let _ = skyward_sys::kmsg("a plugin download is under way already; the request is dropped");
+                        }
+                    }
+                    Effect::StopPluginDownload => match &plugin_job {
+                        Some(job) => job.stop(),
+                        None => {
+                            let _ = skyward_sys::kmsg("there is no plugin download to stop");
+                        }
+                    },
+                    // Deleting an installed plugin's folder: the image and the
+                    // manifest go together, so the page stops listing it.
+                    Effect::DeletePlugin(folder) => {
+                        let gone = std::fs::remove_dir_all(&folder).map_err(|e| format!("{e:#}"));
+                        if let Err(why) = &gone {
+                            let _ = skyward_sys::kmsg(&format!("deleting {folder}: {why}"));
+                        }
+                        app.plugin_deleted(gone, now);
+                    }
                     // The phone changes hands: the display is the plugin's
                     // while it runs, so the card is let go before the payload
                     // is laid out and taken back when it is done. Every way
@@ -3247,3 +3303,5 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         }
     }
 }
+
+

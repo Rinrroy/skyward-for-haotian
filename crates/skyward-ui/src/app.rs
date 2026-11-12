@@ -246,6 +246,37 @@ pub enum SkywardEnd {
 /// storage: the folder the stock updater keeps them in.
 pub const DOWNLOADS: &str = "downloaded_rom";
 
+/// Installing a plugin from the published list, as its page shows it: what
+/// there is to install, the image coming, and how it ended.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PluginJob {
+    /// None until the list has been read.
+    pub stage: Option<PluginStage>,
+    /// Bytes a second, while the image comes.
+    pub rate: u64,
+    pub outcome: Option<PluginEnd>,
+    /// Stopping the download was asked for and is under way.
+    pub stopping: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginStage {
+    /// Asking what there is to download.
+    Asking,
+    /// The image coming: bytes so far, of all.
+    Download(Progress),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PluginEnd {
+    /// It is installed in this folder, with this many bytes.
+    Installed { name: String, size: u64 },
+    /// The download was stopped. Nothing was installed.
+    Stopped,
+    /// Nothing was installed, and this is why.
+    Failed(String),
+}
+
 /// Where a plugin's folder is looked for, from the top of internal storage:
 /// beside the backups the recovery writes, so that what a person puts on the
 /// phone and what the recovery keeps are found in one place.
@@ -977,6 +1008,8 @@ pub enum Confirm {
     ForgetNetwork,
     /// Delete the full package downloaded from internal storage.
     DeleteDownload,
+    /// Delete the installed plugin the page chose: its folder and its image.
+    DeletePlugin,
     /// Turn the phone off.
     PowerOff,
 }
@@ -1328,6 +1361,14 @@ pub enum Action {
     OpenBrowser,
     /// Open the folder the plugins are kept in, in the file manager.
     OpenPluginFolder,
+    /// Fetch the published plugin list and install the browser from it.
+    DownloadPlugin,
+    /// Stop fetching it. What came of it is kept, so asking again goes on
+    /// from there rather than from nothing.
+    StopPluginDownload,
+    /// Delete the installed plugin at this place in the list. A swipe then
+    /// confirms it, because it is a gigabyte that has to come down again.
+    AskDeletePlugin(usize),
     Open(Screen),
     /// Leave the decrypt page for the page it was opened from; the page
     /// the recovery started on, for the home page without keeping it
@@ -2023,6 +2064,10 @@ pub struct State {
     pub plugins: Option<Result<PluginList, String>>,
     /// The plugin the page was opened on, by its place in the list.
     pub plugin_chosen: usize,
+    /// Installing the browser, or how that last ended.
+    pub plugin_job: Option<PluginJob>,
+    /// The installed plugin a swipe would delete, by its place in the list.
+    pub plugin_deleting: Option<usize>,
 }
 
 /// A copy of the slot's vbmeta image kept somewhere that outlives a start,
@@ -2239,6 +2284,8 @@ impl Default for State {
             saved: Vec::new(),
             plugins: None,
             plugin_chosen: 0,
+            plugin_job: None,
+            plugin_deleting: None,
         }
     }
 }
@@ -2597,6 +2644,16 @@ pub enum Effect {
     /// Forget the network named `name`, with what was kept of it, telling
     /// how it went with [`App::wlan_forgotten`].
     ForgetWlan(String),
+    /// Fetch the published plugin list and install the browser from it,
+    /// telling how far it has come with [`App::plugin_progress`] and how it
+    /// ended with [`App::plugin_ended`].
+    DownloadPlugin,
+    /// Stop that download. It ends through [`App::plugin_ended`] as any
+    /// other does.
+    StopPluginDownload,
+    /// Delete the plugin folder at `folder`, telling how it went with
+    /// [`App::plugin_deleted`].
+    DeletePlugin(String),
 }
 
 enum Drag {
@@ -4327,9 +4384,51 @@ impl App {
         self.refresh();
     }
 
+    /// How far installing the browser has come, and how fast the image comes
+    /// down, in bytes a second.
+    pub fn plugin_progress(&mut self, stage: PluginStage, rate: u64) {
+        let Some(job) = self.state.plugin_job.as_mut().filter(|job| job.outcome.is_none()) else { return };
+        job.stage = Some(stage);
+        job.rate = rate;
+        if self.screen() == Screen::Plugins {
+            self.refresh();
+        }
+    }
+
+    /// Installing the browser has ended: the page says how, lit for the user
+    /// to read. What was installed is read again, so the list shows it.
+    pub fn plugin_ended(&mut self, end: PluginEnd, now: u64) {
+        let Some(job) = self.state.plugin_job.as_mut() else { return };
+        job.stopping = false;
+        job.outcome = Some(end.clone());
+        self.wake(now);
+        self.refresh();
+        if matches!(end, PluginEnd::Installed { .. }) {
+            self.state.plugins = None;
+        }
+    }
+
+    /// Deleting an installed plugin went this way: the list is read again
+    /// either way, because a folder that would not go is one the page should
+    /// still show.
+    pub fn plugin_deleted(&mut self, outcome: Result<(), String>, now: u64) {
+        let l = self.state.lang;
+        match outcome {
+            Ok(()) => {
+                self.state.plugins = None;
+                self.refresh();
+                self.say(l.pick(["插件已删除", "外掛已刪除", "The plugin is deleted"]), now);
+            }
+            Err(why) => {
+                self.state.plugins = None;
+                self.refresh();
+                self.report(&tr!(l, "删除插件失败：{why}", "刪除外掛失敗：{why}", "Couldn't delete the plugin: {why}"), now);
+            }
+        }
+    }
+
     /// Open the password page for `network`, empty.
-    fn ask_password(&mut self, network: Network) {
-        self.state.joining = Some(network);
+    fn ask_password(&mut self, network: Network) {        self.state.joining = Some(network);
         self.state.password.clear();
         self.state.show_password = false;
         self.state.layer = Layer::Letters;
@@ -6650,6 +6749,45 @@ impl App {
                 }
             }
             Action::OpenPluginFolder => return vec![Effect::ReadDir(PLUGIN_FOLDER.to_string())],
+            // Installing the browser is a download of hundreds of megabytes,
+            // so it is asked for here and done where the network is, and the
+            // page draws what that thread tells it.
+            Action::DownloadPlugin => {
+                if self.state.plugin_job.as_ref().is_some_and(|job| job.outcome.is_none()) {
+                    let said = self.state.lang.pick(["浏览器正在下载", "瀏覽器正在下載", "The browser is already coming"]);
+                    self.say(said, now);
+                } else if !self.state.plugins.as_ref().is_some_and(|found| found.as_ref().is_ok_and(|list| list.data_open)) {
+                    // Nothing would be installable: the plugins live under the
+                    // data partition, so it has to be open before one can go
+                    // there. Saying so is better than a download that ends in
+                    // a refusal.
+                    let said = self.state.lang.pick([
+                        "请先在「解密」中打开 data 分区：插件要装在 data 里。",
+                        "請先在「解密」中開啟 data 分割區：外掛要裝在 data 裡。",
+                        "Open the data partition in Decrypt first: plugins are installed in it.",
+                    ]);
+                    self.say(said, now);
+                } else {
+                    self.state.plugin_job = Some(PluginJob::default());
+                    self.refresh();
+                    return vec![Effect::DownloadPlugin];
+                }
+            }
+            Action::StopPluginDownload => {
+                if let Some(job) = self.state.plugin_job.as_mut().filter(|job| job.outcome.is_none()) {
+                    job.stopping = true;
+                    self.refresh();
+                    return vec![Effect::StopPluginDownload];
+                }
+            }
+            Action::AskDeletePlugin(i) => {
+                let installed = self.state.plugins.as_ref().and_then(|found| found.as_ref().ok()).and_then(|list| list.rows.get(i)).is_some_and(|row| row.image.is_some());
+                if installed {
+                    self.state.plugin_deleting = Some(i);
+                    self.state.confirm = 0.0;
+                    self.refresh();
+                }
+            }
         }
         Vec::new()
     }
@@ -7693,6 +7831,29 @@ impl App {
                 _ => self.say(l.pick(["没有可删除的安装包", "沒有可刪除的安裝檔", "There is no package to delete"]), now),
             },
             Confirm::PowerOff => fx.push(Effect::Reboot(Target::PowerOff)),
+            Confirm::DeletePlugin => {
+                // The folder the page listed, taken from the same list the row
+                // was drawn from, so a swipe that outlived a refresh deletes
+                // nothing rather than the wrong thing.
+                let folder = self.state.plugin_deleting.take().and_then(|i| {
+                    let list = self.state.plugins.as_ref()?.as_ref().ok()?;
+                    let row = list.rows.get(i)?;
+                    let image = row.image.as_ref()?;
+                    Some(std::path::Path::new(image).parent()?.to_string_lossy().into_owned())
+                });
+                match folder {
+                    Some(folder) => {
+                        self.state.confirm = 0.0;
+                        self.refresh();
+                        fx.push(Effect::DeletePlugin(folder));
+                    }
+                    None => {
+                        self.state.confirm = 0.0;
+                        self.refresh();
+                        self.say(l.pick(["没有可删除的插件", "沒有可刪除的外掛", "There is no plugin to delete"]), now);
+                    }
+                }
+            }
         }
         fx
     }
