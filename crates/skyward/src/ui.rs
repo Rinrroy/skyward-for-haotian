@@ -322,13 +322,40 @@ fn asked(request: &bcb::Request) -> Asked {
     }
 }
 
+/// A folder named the way the pages name some of them — from the top of
+/// internal storage rather than from the root — as one path from the root.
+/// A folder whose listing is asked for by a name is a folder the pages only
+/// know relatively: the plugins page opens `Skyward/plugins`, which is under
+/// internal storage, and reading it from the process's own place instead is
+/// how that came back as "No such file or directory".
+fn from_root(folder: &str) -> String {
+    let path = Path::new(folder);
+    if path.is_absolute() {
+        folder.to_string()
+    } else {
+        Path::new(skyward_crypto::data::SDCARD).join(path).to_string_lossy().into_owned()
+    }
+}
+
 /// Read a folder for the file manager, as it is now. A folder of a user
 /// whose own files are still closed says so in place of its entries: the
 /// names in it cannot be read until that user's credential is given.
 fn list(app: &mut App, folder: String, closed: &[Closed]) -> Result<()> {
+    let folder = from_root(&folder);
     let mut files = match closed_to_user(closed, Path::new(&folder)) {
         Some((_, why)) => Err(why),
-        None => read_folder(Path::new(&folder)).map_err(|e| format!("{e:#}")),
+        // A folder that is not there is usually a folder under the data
+        // partition opened before it was decrypted, or one that has never
+        // been made; the path alone does not say which, so the page says
+        // what to do about it.
+        None => read_folder(Path::new(&folder)).map_err(|e| match e.downcast_ref::<std::io::Error>() {
+            Some(io) if io.kind() == std::io::ErrorKind::NotFound => app.state.lang.pick([
+                "这个文件夹不存在。它在 data 里的话，先在「解密」里打开 data 再进来。",
+                "這個資料夾不存在。它在 data 裡的話，先在「解密」裡開啟 data 再進來。",
+                "This folder is not there. If it is inside data, open data on the decrypt page first.",
+            ]).to_string(),
+            _ => format!("{e:#}"),
+        }),
     };
     // The order is the file page's own switch, applied in the one place an
     // order is decided: `sort` is the only function that orders a listing, so
@@ -2881,7 +2908,18 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             }
                         }
                     },
-                    Effect::ReadDir(folder) => list(&mut app, folder, &closed)?,
+                    Effect::ReadDir(folder) => {
+                        // The plugins page's way into the folder a plugin is
+                        // put in: a folder nobody has made yet is made, so the
+                        // way in shows an empty folder to drop one into
+                        // rather than saying there is nothing there.
+                        if folder == skyward_ui::app::PLUGIN_FOLDER {
+                            if let Err(e) = std::fs::create_dir_all(crate::plugins::folder()) {
+                                let _ = skyward_sys::kmsg(&format!("the plugins folder is not made: {e}"));
+                            }
+                        }
+                        list(&mut app, folder, &closed)?
+                    }
                     // The box's answer is bounded work done here rather than
                     // on a thread of its own: it stops at a couple of
                     // thousand folders, so the page waits a moment and the
