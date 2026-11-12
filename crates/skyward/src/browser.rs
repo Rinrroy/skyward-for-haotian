@@ -303,9 +303,29 @@ impl Lay {
             .env("HOME", "/data/skyward/browser")
             .env("XDG_RUNTIME_DIR", "/run/skyward")
             .env("SKYWARD_START_URL", start_url())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdin(Stdio::null());
+        // What the payload says is what says why it would not start, so it is
+        // kept in a file rather than thrown away. Nothing about this may stop
+        // the browser from running: a log that cannot be written is a line in
+        // the kernel log and nothing more.
+        let log = log_path();
+        if let Some(parent) = log.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        match fs::File::create(&log) {
+            Ok(file) => match file.try_clone() {
+                Ok(errors) => {
+                    cmd.stdout(Stdio::from(file)).stderr(Stdio::from(errors));
+                }
+                Err(e) => {
+                    let _ = skyward_sys::kmsg(&format!("the browser's log is one stream only: {e}"));
+                    cmd.stdout(Stdio::from(file));
+                }
+            },
+            Err(e) => {
+                let _ = skyward_sys::kmsg(&format!("the browser's log cannot be written at {}: {e}", log.display()));
+            }
+        }
         // chroot, then start in the new root: the program's own PT_INTERP is
         // what the kernel then loads, which is the whole point of a chroot
         // here — no bionic linker namespace is involved.
@@ -334,6 +354,17 @@ impl Lay {
             }
             std::thread::sleep(Duration::from_millis(200));
         };
+        // A browser that ended at once is a browser that failed; what it said
+        // before it did is the only way to know why from the kernel log.
+        if !matches!(code, Some(0) | None) {
+            if let Ok(text) = fs::read_to_string(&log) {
+                let _ = skyward_sys::kmsg(&format!(
+                    "the browser ended with {code:?}; {} ends: {}",
+                    log.display(),
+                    last_words(&text, 600)
+                ));
+            }
+        }
         Ok(Ended { code, ran: started.elapsed() })
     }
 }
@@ -361,6 +392,31 @@ impl Drop for Lay {
 /// a page that starts it somewhere else says so.
 fn start_url() -> String {
     skyward_sys::prop("skyward.browser.url").unwrap_or_else(|| "https://cn.bing.com".to_string())
+}
+
+/// Where the payload's own output is kept. The data partition when it is open,
+/// because that is where a person can look at it afterwards from the system
+/// that shares it; the rootfs otherwise, where it lasts until the next start.
+fn log_path() -> PathBuf {
+    let open = skyward_block::mount::is_mount_point(Path::new("/data")).unwrap_or(false);
+    if open {
+        Path::new("/data/skyward/browser/logs").join("start.log")
+    } else {
+        Path::new("/tmp").join("skyward-browser.log")
+    }
+}
+
+/// The end of what the browser said, on one line, for the kernel log.
+fn last_words(text: &str, most: usize) -> String {
+    let trimmed = text.trim_end();
+    let start = trimmed.len().saturating_sub(most);
+    let tail = match trimmed.get(start..) {
+        Some(tail) => tail,
+        // A boundary inside a character: begin after it instead of losing the
+        // whole line.
+        None => trimmed.char_indices().map(|(at, _)| at).find(|at| *at >= start).map_or("", |at| &trimmed[at..]),
+    };
+    tail.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Hand the phone to the browser at `image`, running `program` inside it.
@@ -404,6 +460,18 @@ mod tests {
         // The property is read from the phone; off it, the fallback stands.
         let url = start_url();
         assert!(url.starts_with("https://"), "{url}");
+    }
+
+    #[test]
+    fn the_end_of_what_the_browser_said_fits_on_one_line() {
+        assert_eq!(last_words("first\nsecond\n", 600), "first second");
+        assert_eq!(last_words("a\nb\nc", 3), "b c");
+        assert_eq!(last_words("", 10), "");
+        // A cut that lands inside a character loses only that character.
+        let chinese = "浏览器起不来";
+        let cut = last_words(chinese, 13);
+        assert!(chinese.ends_with(&cut), "{cut}");
+        assert!(cut.chars().all(|c| chinese.contains(c)), "{cut}");
     }
 
     #[test]
