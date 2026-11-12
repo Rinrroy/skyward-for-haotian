@@ -11181,17 +11181,15 @@ mod tests {
         // its own corner, and the screen adds the strip's height back. What
         // it asks for is a walk of the folders below this one, since a name
         // three folders down is what a search of one folder cannot find.
-        assert_eq!(
-            tap_at(&mut app, &f, &i, Action::Type(Cap::Char('b')), 1010),
-            vec![Effect::FindFiles { root: "/sdcard".into(), query: "b".into(), gen: 1, sort: SortKey::Name }]
-        );
+        let asked = tap_at(&mut app, &f, &i, Action::Type(Cap::Char('b')), 1010);
+        assert_eq!(asked, vec![Effect::FindFiles { root: "/sdcard".into(), query: "b".into(), gen: app.state.find_gen, sort: SortKey::Name }]);
         assert_eq!(app.state.files_query, "b");
         assert!(app.state.finding, "the page says it is looking");
         assert_eq!(app.state.files.shown_entries().len(), 3, "the folder's own list stays whole behind the box");
         assert_eq!(app.frame(&f, &i).rows.as_ref().map(|r| r.count()), None, "nothing is listed until the answer comes");
 
         // The answer is the list: a row per entry found, wherever it is.
-        app.found_files(1, Ok(vec![Found { folder: "/sdcard/DCIM/Camera".into(), entry: entry("beach.jpg", FileKind::File) }]));
+        app.found_files(app.state.find_gen, Ok(vec![Found { folder: "/sdcard/DCIM/Camera".into(), entry: entry("beach.jpg", FileKind::File) }]));
         assert!(!app.state.finding);
         assert_eq!(app.frame(&f, &i).rows.as_ref().map(|r| r.count()), Some(1), "the entry found below the folder is the list");
 
@@ -11199,9 +11197,9 @@ mod tests {
         // name. With the box holding something it looks again in the new
         // order rather than leaving the rows in the old one.
         assert_eq!(app.state.sort, SortKey::Name);
-        for (n, expected) in [SortKey::Modified, SortKey::Kind, SortKey::Name].into_iter().enumerate() {
+        for expected in [SortKey::Modified, SortKey::Kind, SortKey::Name] {
             let asked = tap_at(&mut app, &f, &i, Action::CycleSort, 1015);
-            assert_eq!(asked, vec![Effect::FindFiles { root: "/sdcard".into(), query: "b".into(), gen: 2 + n as u64, sort: expected }], "the tree is walked again in the new order");
+            assert_eq!(asked, vec![Effect::FindFiles { root: "/sdcard".into(), query: "b".into(), gen: app.state.find_gen, sort: expected }], "the tree is walked again in the new order");
             assert_eq!(app.state.sort, expected);
         }
 
@@ -11230,7 +11228,7 @@ mod tests {
         tap(&mut app, &f, &i, Action::FilesSearch);
         tap_at(&mut app, &f, &i, Action::Type(Cap::Char('b')), 1000);
         app.found_files(
-            1,
+            app.state.find_gen,
             Ok(vec![
                 Found { folder: "/sdcard/DCIM/Camera".into(), entry: entry("beach.jpg", FileKind::File) },
                 Found { folder: "/sdcard/DCIM/Camera".into(), entry: entry("backup", folder(3)) },
@@ -11261,13 +11259,15 @@ mod tests {
         app.set_files("/sdcard".into(), Ok(vec![entry("alpha.txt", FileKind::File)]), LISTED);
         tap(&mut app, &f, &i, Action::FilesSearch);
         tap_at(&mut app, &f, &i, Action::Type(Cap::Char('a')), 1000);
+        let for_a = app.state.find_gen;
         tap_at(&mut app, &f, &i, Action::Type(Cap::Char('l')), 1001);
+        let for_al = app.state.find_gen;
 
         // The answer to "a" arrives while the box says "al": its rows are
         // not the rows of the text in the box, so they are not shown.
-        app.found_files(1, Ok(vec![Found { folder: "/sdcard".into(), entry: entry("alpha.txt", FileKind::File) }]));
+        app.found_files(for_a, Ok(vec![Found { folder: "/sdcard".into(), entry: entry("alpha.txt", FileKind::File) }]));
         assert!(app.state.found.is_none(), "an answer to a query typed over is not the list");
-        app.found_files(2, Ok(vec![Found { folder: "/sdcard/x".into(), entry: entry("alfa.txt", FileKind::File) }]));
+        app.found_files(for_al, Ok(vec![Found { folder: "/sdcard/x".into(), entry: entry("alfa.txt", FileKind::File) }]));
         assert!(app.state.found.is_some(), "the answer to what the box says now is");
     }
 
