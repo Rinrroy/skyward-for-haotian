@@ -1,9 +1,9 @@
 use crate::app::{
     Action, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop, Field, FileKind,
-    FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
-    SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink, Wipe, ADDABLE,
-    BACKUP_PARTS, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES, USB_DRIVE_UNREADABLE,
-    USB_DRIVE_WANTED, WIPES, installs, starting,
+    FileOp, FileRow, FileTask, Fold, Folder, Found, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
+    SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, SortKey, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink,
+    Wipe, ADDABLE, BACKUP_PARTS, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES,
+    USB_DRIVE_UNREADABLE, USB_DRIVE_WANTED, WIPES, installs, starting,
 };
 use crate::canvas::Canvas;
 use crate::color::Rgba;
@@ -110,6 +110,9 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::WlanPassword => wlan_password(cx),
         Screen::WlanNetwork => wlan_network(cx),
         Screen::WlanAdd => wlan_add(cx),
+        Screen::PowerOff => power_off(cx),
+        Screen::Plugins => plugins(cx),
+        Screen::Vbmeta => vbmeta(cx),
     }
 }
 
@@ -139,6 +142,11 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
         Confirm::SwitchSystem => (["滑动以切换并重启", "滑動以切換並重新啟動", "Slide to switch and reboot"], false),
         Confirm::RemoveSystem => (["滑动以删除", "滑動以刪除", "Slide to remove"], true),
         Confirm::InstallSystem => (INSTALL, false),
+        Confirm::AvbDisable => (["滑动以关闭校验", "滑動以關閉驗證", "Slide to turn the check off"], true),
+        Confirm::VbmetaRestore => (["滑动以写回备份", "滑動以寫回備份", "Slide to write the copy back"], true),
+        Confirm::ForgetNetwork => (["滑动以忘记网络", "滑動以忘記網路", "Slide to forget the network"], true),
+        Confirm::DeleteDownload => (["滑动以删除安装包", "滑動以刪除安裝檔", "Slide to delete the package"], true),
+        Confirm::PowerOff => (["滑动以关机", "滑動以關機", "Slide to power off"], false),
     };
     (s.lang.pick(label), danger)
 }
@@ -334,17 +342,24 @@ pub fn home(cx: &Ctx) -> Frame {
     ]));
     y = tools.bottom + t.m.card_gap;
     let target = l.pick(REBOOT_TARGETS[cx.state.reboot].0);
+    // Turning the phone off sits beside restarting it: the two ways of
+    // leaving the recovery, one of which brings it back by itself. A phone
+    // is put off from its own page, which says what that means, rather than
+    // by a swipe on the restart page that only names it as one destination
+    // among six.
     let system = widgets::list(&mut c, t, f, y, &[
         Row::new(l.pick(["清除数据", "清除資料", "Wipe data"])).icon(RED, Icon::Wipe),
         Row::new(l.pick(ADVANCED)).icon(SLATE, Icon::More),
         Row::new(l.pick(SETTINGS)).icon(SLATE, Icon::Gear),
         Row::new(l.pick(REBOOT)).icon(ORANGE, Icon::Power).trail(Trail::Value(target)),
+        Row::new(l.pick(POWER_OFF)).icon(SLATE, Icon::Power),
     ]);
     out.extend(hits(&system.rows, &[
         Action::Open(Screen::Wipe),
         Action::Open(Screen::Advanced),
         Action::Open(Screen::Settings),
         Action::Open(Screen::Reboot),
+        Action::Open(Screen::PowerOff),
     ]));
     // However little it holds, the page scrolls far enough to fold its bar
     // away.
@@ -465,8 +480,11 @@ pub fn settings(cx: &Ctx) -> Frame {
         y = widgets::footnote(&mut c, t, f, rows.bottom, note);
     }
     y = widgets::section(&mut c, t, f, y, l.pick(["调试", "偵錯", "Debugging"]));
-    let debug = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(TERMINAL)).icon(SLATE, Icon::Terminal)]);
-    out.extend(hits(&debug.rows, &[Action::Open(Screen::Terminal)]));
+    let debug = widgets::list(&mut c, t, f, y, &[
+        Row::new(l.pick(TERMINAL)).icon(SLATE, Icon::Terminal),
+        Row::new(l.pick(PLUGINS)).icon(PURPLE, Icon::More),
+    ]);
+    out.extend(hits(&debug.rows, &[Action::Open(Screen::Terminal), Action::Open(Screen::Plugins)]));
     y = widgets::section(&mut c, t, f, debug.bottom, l.pick(["关于", "關於", "About"]));
     let mut rows = vec![Row::new(l.pick(ABOUT)).trail(Trail::Value(VERSION))];
     let mut opens = vec![Action::Open(Screen::About)];
@@ -480,8 +498,28 @@ pub fn settings(cx: &Ctx) -> Frame {
     }
     let about = widgets::list(&mut c, t, f, y, &rows);
     out.extend(hits(&about.rows, &opens));
+    // A phone on the mainland cannot reach either host the update comes
+    // from, so the mirror is offered beside the entry it serves. It is tried
+    // only when GitHub does not answer, so leaving it on costs nothing
+    // anywhere else.
+    if s.offers(Screen::SkywardUpdate) {
+        y = widgets::section(&mut c, t, f, about.bottom, l.pick(MIRROR_SECTION));
+        let mirror = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(MIRROR)).switch(s.mirror)]);
+        out.extend(hits(&mirror.rows, &[Action::Toggle(Switch::Mirror)]));
+        let note = l.pick(MIRROR_NOTE);
+        let bottom = widgets::footnote(&mut c, t, f, mirror.bottom, note);
+        return Frame::new(t, fit(c, t, bottom), out, l.pick(SETTINGS), top);
+    }
     Frame::new(t, fit(c, t, about.bottom), out, l.pick(SETTINGS), top)
 }
+
+const MIRROR_SECTION: Text = ["更新来源", "更新來源", "Updates"];
+const MIRROR: Text = ["国内镜像", "中國大陸鏡像", "Mirror in the mainland"];
+const MIRROR_NOTE: Text = [
+    "先直接访问 GitHub，连不上时再试镜像。下载的安装包同样会校验 SHA-256。",
+    "先直接連線 GitHub，連不上時再試鏡像。下載的安裝檔同樣會校驗 SHA-256。",
+    "GitHub is asked first; a mirror is tried only when it does not answer. The package is checked against its SHA-256 either way.",
+];
 
 /// What the settings page says beside its Skyward update entry: an update
 /// under way, or a newer release found.
@@ -2386,6 +2424,15 @@ pub fn advanced(cx: &Ctx) -> Frame {
 const RELABEL: Text = ["修复 SELinux 上下文", "修復 SELinux 上下文", "Fix SELinux contexts"];
 
 /// The two AVB checks, what each does, and the switch that turns it off.
+///
+/// **Turning a check off is two acts and turning one on is one.** A switch that
+/// could be turned off by a stray slide is what this page was, and what it did
+/// was make a phone whose bootloader is unlocked start a system nothing
+/// checked: the owner asked for that to take more than one touch. So turning
+/// one off asks for this page's own second step — `Action::AvbConfirmOpen` —
+/// which draws what it costs and offers the only swipe that writes
+/// (`Confirm::AvbDisable`). Turning one on keeps the single swipe, since it can
+/// only make the phone check more.
 pub fn avb(cx: &Ctx) -> Frame {
     use skyward_install::commands::avbctl::Check;
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
@@ -2404,6 +2451,39 @@ pub fn avb(cx: &Ctx) -> Frame {
             None
         }
     };
+    // The second confirmation stands in the page's place: what turning a check
+    // off means, which check it is, and the one swipe that writes it. Back
+    // leaves it without changing anything, and so does Cancel.
+    if let (true, Some((_, check, _))) = (s.avb_confirming, &s.avb_pending) {
+        let name = match check {
+            Check::Verification => l.pick(["启动验证", "啟動驗證", "Boot verification"]),
+            Check::Verity => "dm-verity",
+        };
+        let heading = tr!(l, "关闭 {name}？", "關閉 {name}？", "Turn off {name}?");
+        y = widgets::section_first(&mut c, t, f, y, &heading);
+        let consequence = l.pick([
+            "关闭后，这台手机的引导器不再校验将要启动的系统。引导器已解锁时，任何未经手机自身密钥签名的系统都会照常启动——这是安装第三方系统的必要一步，也是这台手机从此不再能确认自己启动的是什么。",
+            "關閉後，這台手機的引導器不再驗證即將啟動的系統。引導器已解鎖時，任何未經手機自身金鑰簽署的系統都會照常啟動——這是安裝第三方系統的必要一步，也是這台手機從此不再能確認自己啟動的是什麼。",
+            "With this off, the phone's bootloader no longer checks the system it is about to start. On a phone whose bootloader is unlocked, any system at all will start, whether or not it was signed with this phone's own keys. It is what installing a third-party system needs, and it is also this phone no longer being able to tell what it is starting.",
+        ]);
+        y = widgets::paragraph(&mut c, t, f, y, consequence);
+        let writing = l.pick([
+            "只写入当前槽位 vbmeta 的 4 个标志字节，写入前原镜像会备份，写入后会读回校验。重启后生效。",
+            "只寫入目前槽位 vbmeta 的 4 個旗標位元組，寫入前原映像檔會備份，寫入後會讀回驗證。重新啟動後生效。",
+            "Only the 4 flag bytes of this slot's vbmeta are written; the image as it was is kept first, and what was written is read back. It takes effect from the next start.",
+        ]);
+        y = widgets::footnote(&mut c, t, f, y, writing);
+        let (label, danger) = confirm_label(Confirm::AvbDisable, cx.state);
+        let track = widgets::confirm(&mut c, t, f, y + t.m.dp(28.0), label, danger, s.confirm);
+        out.push(Hit { rect: track, action: Action::Confirm(Confirm::AvbDisable) });
+        y = track.y + track.h;
+        let back = widgets::button(&mut c, t, f, y + t.m.dp(12.0), l.pick(["返回", "返回", "Go back"]));
+        out.push(Hit { rect: back, action: Action::CancelAvb });
+        y = back.y + back.h;
+        // Nothing of the page underneath is drawn or reachable: the only
+        // writes on offer here are this swipe and leaving.
+        return Frame::new(t, fit(c, t, y), out, l.pick(AVB), top);
+    }
     if let Some(state) = state {
         let target = if state.suffix.is_empty() { "vbmeta".to_string() } else { format!("vbmeta{}", state.suffix) };
         y = widgets::info_card(&mut c, t, f, y, &[
@@ -2440,11 +2520,17 @@ pub fn avb(cx: &Ctx) -> Frame {
         out.extend(hits(&list.rows, &[Action::AvbToggle(Check::Verification), Action::AvbToggle(Check::Verity)]));
         y = list.bottom;
         let explain = l.pick([
-            "关闭后，安装了非官方系统的手机才能正常启动。改动只写入当前槽位的 vbmeta，重启后生效；写入前原镜像会备份到 /tmp。",
-            "停用後，安裝了非官方系統的手機才能正常啟動。變更只寫入目前槽位的 vbmeta，重新啟動後生效；寫入前原映像檔會備份到 /tmp。",
-            "Turning these off is what lets a phone start a system that was not signed with its own keys. Only this slot's vbmeta is written, from the next start; the image as it was is kept in /tmp.",
+            "关闭后，安装了非官方系统的手机才能正常启动。改动只写入当前槽位的 vbmeta，重启后生效；写入前原镜像会备份到 /tmp，并可在「vbmeta 备份」中留一份长期副本。",
+            "停用後，安裝了非官方系統的手機才能正常啟動。變更只寫入目前槽位的 vbmeta，重新啟動後生效；寫入前原映像檔會備份到 /tmp，並可在「vbmeta 備份」中留一份長期副本。",
+            "Turning these off is what lets a phone start a system that was not signed with its own keys. Only this slot's vbmeta is written, from the next start; the image as it was is kept in /tmp, and a lasting copy can be kept under vbmeta copies.",
         ]);
         y = widgets::footnote(&mut c, t, f, y, explain);
+        // Before anything here is changed, the way to keep a copy of what the
+        // slot holds now: a write to vbmeta is the one act on this page the
+        // owner cannot undo from the phone unless a copy was kept first.
+        let keep = widgets::list(&mut c, t, f, y + t.m.card_gap, &[Row::new(l.pick(["vbmeta 备份与写回", "vbmeta 備份與寫回", "vbmeta copies and writing one back"])).trail(Trail::None)]);
+        out.extend(hits(&keep.rows, &[Action::Open(Screen::Vbmeta)]));
+        y = keep.bottom;
         if let Some((_, check, want)) = &s.avb_pending {
             let name = match check {
                 Check::Verification => l.pick(["启动验证", "啟動驗證", "Boot verification"]),
@@ -2455,10 +2541,22 @@ pub fn avb(cx: &Ctx) -> Frame {
                 false => tr!(l, "将开启 {name}", "將啟用 {name}", "Turn on {name}"),
             };
             y = widgets::footnote(&mut c, t, f, y, &said);
-            let (label, danger) = confirm_label(Confirm::Avb, cx.state);
-            let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
-            out.push(Hit { rect: track, action: Action::Confirm(Confirm::Avb) });
-            y = track.y + track.h;
+            // Turning a check OFF is the direction that can leave a phone
+            // unable to start, so it never writes from here: this asks for the
+            // second confirmation, which says what that means on its own page
+            // and has its own swipe. Turning one ON keeps the single swipe,
+            // since it can only make the phone check more.
+            if *want {
+                let ask = l.pick(["继续关闭…", "繼續關閉…", "Continue turning it off…"]);
+                let next = widgets::list(&mut c, t, f, y + t.m.card_gap, &[Row::new(ask).trail(Trail::None)]);
+                out.extend(hits(&next.rows, &[Action::AvbConfirmOpen]));
+                y = next.bottom;
+            } else {
+                let (label, danger) = confirm_label(Confirm::Avb, cx.state);
+                let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
+                out.push(Hit { rect: track, action: Action::Confirm(Confirm::Avb) });
+                y = track.y + track.h;
+            }
             let cancel = widgets::button(&mut c, t, f, y + t.m.dp(12.0), l.pick(["取消", "取消", "Cancel"]));
             out.push(Hit { rect: cancel, action: Action::CancelAvb });
             y = cancel.y + cancel.h;
@@ -2856,6 +2954,15 @@ const CHECKING: Text = ["正在检查更新", "正在檢查更新", "Checking fo
 const CHECK_FOR_UPDATES: Text = ["检查更新", "檢查更新", "Check for updates"];
 const DOWNLOADING: Text = ["正在下载", "正在下載", "Downloading"];
 const CHECKING_PART: Text = ["正在校验已下载的部分", "正在驗證已下載的部分", "Verifying what was downloaded"];
+const PAUSED: Text = ["已暂停下载", "已暫停下載", "Download paused"];
+const PAUSING: Text = ["正在暂停", "正在暫停", "Pausing"];
+const PAUSE: Text = ["暂停", "暫停", "Pause"];
+// What an earlier download left that the server's package no longer fits:
+// going on starts it again rather than adding to it.
+const STARTS_AGAIN: Text = ["先前下载的部分与当前安装包不符，将继续时会重新下载", "先前下載的部分與目前安裝檔不符，將繼續時會重新下載", "What was downloaded before doesn't match this package, so continuing downloads it again"];
+const CONTINUE_DOWNLOAD: Text = ["继续下载", "繼續下載", "Resume download"];
+const INSTALLED_PACKAGE: Text = ["已下载到内部存储", "已下載到內部儲存空間", "Downloaded to internal storage"];
+const DELETE_PACKAGE: Text = ["删除安装包", "刪除安裝檔", "Delete the package"];
 
 /// Asking the update server for the newest system, then its full package:
 /// downloading it, how far that has come, and installing it once it is
@@ -2892,32 +2999,64 @@ fn online(c: &mut Canvas, cx: &Ctx, y: f32, out: &mut Vec<Hit>) -> f32 {
     let package = tr!(l, "完整更新包 {size}", "完整更新檔 {size}", "Full OTA package {size}");
     let mut y = widgets::list(c, t, f, y, &[Row::new(&title).icon(GREEN, Icon::Layers).subtitle(&package).trail(Trail::None)]).bottom;
     match (&s.download, s.have) {
+        // Downloading: what has come, how fast, and the pause that keeps
+        // what came of it. Nothing here says the download failed — a paused
+        // one has not.
         (Some(job), _) if job.outcome.is_none() => {
             let (heading, detail, share) = match job.progress {
                 None => (l.pick(GETTING_READY), String::new(), None),
                 Some(p) => downloaded(l, p, job.rate),
             };
             y = widgets::progress_card(c, t, f, y + t.m.card_gap, heading, &detail, share);
-            let label = l.pick(if job.stopping { ["正在暂停", "正在暫停", "Pausing"] } else { ["暂停", "暫停", "Pause"] });
-            let stop = widgets::list(c, t, f, y + t.m.card_gap, &[Row::new(label).trail(Trail::None)]);
+            let pause = widgets::list(c, t, f, y + t.m.card_gap, &[Row::new(l.pick(if job.stopping { PAUSING } else { PAUSE })).trail(Trail::None)]);
             if !job.stopping {
-                out.extend(hits(&stop.rows, &[Action::StopDownload]));
+                out.extend(hits(&pause.rows, &[Action::PauseDownload]));
             }
-            y = stop.bottom;
+            y = pause.bottom;
         }
-        (_, Have::Whole(_)) => {
-            let row = Row::new(l.pick(["安装", "安裝", "Install"])).subtitle(l.pick(["已下载到内部存储", "已下載到內部儲存空間", "Downloaded to internal storage"]));
+        // Paused: what it kept is still there, and going on from it costs
+        // only the rest.
+        (Some(job), Have::Part(kept)) if matches!(job.outcome, Some(DownloadEnd::Stopped)) => {
+            let (detail, share) = kept_detail(l, release.length, kept);
+            y = widgets::progress_card(c, t, f, y + t.m.card_gap, l.pick(PAUSED), &detail, share);
+            let resume = widgets::list(c, t, f, y + t.m.card_gap, &[Row::new(l.pick(CONTINUE_DOWNLOAD)).subtitle(&detail)]);
+            out.extend(hits(&resume.rows, &[Action::Download]));
+            y = resume.bottom;
+        }
+        // Whole: installing it, and deleting it from internal storage once
+        // nothing is downloading or installing.
+        (_, Have::Whole(size)) => {
+            let row = Row::new(l.pick(["安装", "安裝", "Install"])).subtitle(l.pick(INSTALLED_PACKAGE));
             let install = widgets::list(c, t, f, y + t.m.card_gap, &[row]);
             out.extend(hits(&install.rows, &[Action::InstallDownloaded]));
-            y = install.bottom;
+            let mut bottom = install.bottom;
+            // A package cannot be deleted while an install reads it, and a
+            // download under way does not leave one to delete.
+            let busy = !matches!(s.install, Install::Idle | Install::Finished { .. }) || s.download.as_ref().is_some_and(|j| j.outcome.is_none());
+            if !busy {
+                let size = fmt::file_size(size);
+                let forget = tr!(l, "删除后，下次安装需重新下载 {size}", "刪除後，下次安裝需重新下載 {size}", "Deleting it means downloading {size} again to install");
+                let delete = widgets::list(c, t, f, bottom + t.m.dp(28.0), &[Row::new(l.pick(DELETE_PACKAGE)).tint(t.pal.danger).trail(Trail::None)]);
+                out.extend(hits(&delete.rows, &[Action::AskDeleteDownload]));
+                bottom = delete.bottom;
+                if s.asking_delete {
+                    let ask = l.pick(["删除该安装包？删除后需重新下载。", "刪除這個安裝檔？刪除後需重新下載。", "Delete this package? It would have to be downloaded again."]);
+                    let y = widgets::footnote(c, t, f, delete.bottom, ask);
+                    let (label, danger) = confirm_label(Confirm::DeleteDownload, s);
+                    let track = widgets::confirm(c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
+                    out.push(Hit { rect: track, action: Action::Confirm(Confirm::DeleteDownload) });
+                    bottom = widgets::footnote(c, t, f, track.y + track.h, &forget);
+                }
+            }
+            y = bottom;
         }
         (job, have) => {
-            match job.as_ref().and_then(|j| j.outcome.as_ref()) {
-                Some(DownloadEnd::Failed(why)) => y = widgets::footnote(c, t, f, y, &fmt::download_failure(l, why)),
-                Some(DownloadEnd::Stopped) => y = widgets::footnote(c, t, f, y, l.pick(["已暂停下载。", "已暫停下載。", "Download paused."])),
-                _ => {}
+            // A failed download says why; a paused one never reaches here
+            // with bytes kept, since its own arm above shows the card.
+            if let Some(DownloadEnd::Failed(why)) = job.as_ref().and_then(|j| j.outcome.as_ref()) {
+                y = widgets::footnote(c, t, f, y, &fmt::download_failure(l, why));
             }
-            let title = l.pick(if matches!(have, Have::Part(_)) { ["继续下载", "繼續下載", "Resume download"] } else { ["下载", "下載", "Download"] });
+            let title = l.pick(if matches!(have, Have::Part(_)) { CONTINUE_DOWNLOAD } else { ["下载", "下載", "Download"] });
             let had = match have {
                 Have::Part(done) => {
                     let done = fmt::file_size(done);
@@ -2970,6 +3109,24 @@ fn downloaded(l: Lang, progress: Progress, rate: u64) -> (&'static str, String, 
             format!("{} / {} · {}/s", fmt::file_size(done), fmt::file_size(total), fmt::file_size(rate)),
             Some(share(done, total)),
         ),
+    }
+}
+
+/// What a paused download kept of the package, and what is left to fetch:
+/// the bytes kept, and what the rest comes to where the package's length is
+/// known. A part longer than the package the server offers now is of another
+/// package, and is let go when the download starts again, so nothing of it
+/// is said to be kept.
+fn kept_detail(l: Lang, length: Option<u64>, kept: u64) -> (String, Option<f32>) {
+    let kept_size = fmt::file_size(kept);
+    match length.filter(|&total| total > 0) {
+        Some(total) if kept > total => (l.pick(STARTS_AGAIN).to_string(), None),
+        Some(total) => {
+            let rest = fmt::file_size(total.saturating_sub(kept));
+            let detail = tr!(l, "已保留 {kept_size}，还需 {rest}", "已保留 {kept_size}，還需 {rest}", "{kept_size} kept, {rest} to go");
+            (detail, Some(share(kept, total)))
+        }
+        None => (tr!(l, "已保留 {kept_size}", "已保留 {kept_size}", "{kept_size} kept"), None),
     }
 }
 
@@ -3128,8 +3285,14 @@ pub fn wlan(cx: &Ctx) -> Frame {
     let mut out = Vec::new();
     let top = t.m.content_top;
     let on = !matches!(w.power, Power::Off | Power::Failed(_));
-    let switch = widgets::list(&mut c, t, f, top, &[Row::new(l.pick(WLAN)).switch(on)]);
-    out.extend(hits(&switch.rows, &[Action::Toggle(Switch::Wlan)]));
+    let switch = widgets::list(
+        &mut c,
+        t,
+        f,
+        top,
+        &[Row::new(l.pick(WLAN)).switch(on), Row::new(l.pick(REMEMBER_WLAN)).switch(s.remember_wlan)],
+    );
+    out.extend(hits(&switch.rows, &[Action::Toggle(Switch::Wlan), Action::Toggle(Switch::RememberWlan)]));
     let mut y = switch.bottom;
     match &w.power {
         Power::Off => {
@@ -3204,10 +3367,41 @@ pub fn wlan(cx: &Ctx) -> Frame {
                 out.push(Hit { rect: widgets::round_button(t, *rect), action: Action::NetworkDetails(*k) });
             }
             y = list.bottom;
+            // What the phone keeps is not what the scan found: a network
+            // kept is one it has joined, so it is listed apart, with no
+            // signal to show and a button that forgets it.
+            if !s.saved.is_empty() {
+                let y2 = widgets::section(&mut c, t, f, y, l.pick(SAVED_NETWORKS));
+                let kept: Vec<Row> =
+                    s.saved.iter().map(|n| Row::new(&n.name).subtitle(fmt::security(l, n.security)).trail(Trail::Network { locked: locked(n.security) })).collect();
+                let kept_list = widgets::list(&mut c, t, f, y2, &kept);
+                for (rect, i) in kept_list.rows.iter().zip(0..s.saved.len()) {
+                    out.push(Hit { rect: widgets::round_button(t, *rect), action: Action::ForgetSaved(i) });
+                }
+                y = kept_list.bottom;
+            }
+            // The swipe that asks whether it is meant stands under the list,
+            // never over it, so nothing but the swipe itself can forget.
+            if let Some(name) = &s.forget_pending {
+                let what = tr!(
+                    l,
+                    "忘记「{name}」？手机将不再自动连接它，密码也不再保留。",
+                    "忘記「{name}」？手機將不再自動連線它，密碼也不再保留。",
+                    "Forget “{name}”? The phone will no longer join it by itself, and its password won't be kept."
+                );
+                let note = widgets::footnote(&mut c, t, f, y, &what);
+                let (label, danger) = confirm_label(Confirm::ForgetNetwork, s);
+                let track = widgets::confirm(&mut c, t, f, note + t.m.dp(24.0), label, danger, s.confirm);
+                out.push(Hit { rect: track, action: Action::Confirm(Confirm::ForgetNetwork) });
+                y = track.y + track.h;
+            }
         }
     }
     Frame::new(t, fit(c, t, y), out, l.pick(WLAN), top)
 }
+
+const SAVED_NETWORKS: Text = ["已保存的网络", "已儲存的網路", "Saved networks"];
+const REMEMBER_WLAN: Text = ["记住网络", "記住網路", "Remember networks"];
 
 const ADD_NETWORK: Text = ["添加网络", "新增網路", "Add network"];
 const SHOW_PASSWORD: Text = ["显示密码", "顯示密碼", "Show password"];
@@ -3329,22 +3523,117 @@ pub fn wlan_network(cx: &Ctx) -> Frame {
     Frame::new(t, fit(c, t, forget.bottom), out, title, top)
 }
 
-/// The file manager, every entry of the folder shown, folders first.
+/// The file manager, every entry of the folder shown that its search box
+/// finds, folders first. The box and the button that changes the order are
+/// held over the list, and the keyboard stands at the bottom while it is
+/// open.
 pub fn files(cx: &Ctx) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
     // An entry picked to copy or move goes to the folder shown, from the
-    // bar held at the bottom.
-    let dock = s.clip.as_ref().map(|clip| {
-        let go = l.pick(match clip.op {
-            FileOp::Copy => ["复制到此处", "複製到這裡", "Copy here"],
-            FileOp::Move => ["移动到此处", "移動到這裡", "Move here"],
-        });
-        let (canvas, rects) = widgets::dock_bar(t, f, files::page(t), &[l.pick(CANCEL), go]);
-        Dock { canvas, hits: hits(&rects, &[Action::Unpick, Action::Paste]) }
-    });
+    // bar held at the bottom; the keyboard, while it is up, holds that
+    // place; with neither, nothing is held there.
+    let dock = match (&s.clip, s.files_search) {
+        (Some(clip), false) => {
+            let go = l.pick(match clip.op {
+                FileOp::Copy => ["复制到此处", "複製到這裡", "Copy here"],
+                FileOp::Move => ["移动到此处", "移動到這裡", "Move here"],
+            });
+            let (canvas, rects) = widgets::dock_bar(t, f, files::page(t), &[l.pick(CANCEL), go]);
+            Some(Dock { canvas, hits: hits(&rects, &[Action::Unpick, Action::Paste]) })
+        }
+        (_, true) => Some(keyboard_dock(cx, s)),
+        _ => None,
+    };
     let button = Some((widgets::Glyph::Terminal, Action::TerminalHere));
+    Frame { dock, button, ..file_listing(cx) }
+}
+
+/// The file manager's keyboard, held at the bottom of the page, its keys
+/// typing into the search box.
+fn keyboard_dock(cx: &Ctx, s: &State) -> Dock {
+    let (t, f, l) = (cx.t, cx.f, s.lang);
+    let mut c = Canvas::new(t.m.w, widgets::keyboard_height(t).round() as u32);
+    c.clear(files::page(t));
+    let enter = l.pick(FILES_SEARCH_ENTER);
+    let keys = widgets::keyboard(&mut c, t, f, l, 0.0, s.layer, s.key_held(), enter);
+    Dock { canvas: c, hits: keys.into_iter().map(|(rect, cap)| Hit { rect, action: Action::Type(cap) }).collect() }
+}
+
+/// The folder the file manager shows, laid out with the search box and the
+/// order button held over it.
+fn file_listing(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let bg = files::page(t);
+    let mut c = sheet(cx, t.m.h, bg);
+    let rows = match &s.files.entries {
+        Err(why) => {
+            files::note(&mut c, t, f, files::SEARCHED_ROWS_TOP_DP, l.pick(["无法读取该文件夹", "無法讀取這個資料夾", "This folder can't be read"]), Some(why));
+            None
+        }
+        Ok(_) if !s.files_query.trim().is_empty() => search_rows(cx, &mut c),
+        Ok(entries) if entries.is_empty() => {
+            files::note(&mut c, t, f, files::SEARCHED_ROWS_TOP_DP, l.pick(["暂无文件", "沒有檔案", "No files"]), None);
+            None
+        }
+        Ok(_) => {
+            let shown = folder_rows(&s.files);
+            Some(files::rows(t, f, files::SEARCHED_ROWS_TOP_DP, &shown, Action::OpenEntry))
+        }
+    };
     let root = l.pick(["根目录", "根目錄", "Root"]);
-    Frame { dock, button, ..listing(cx, &s.files, root, None, l.pick(["暂无文件", "沒有檔案", "No files"]), Action::OpenEntry, l.pick(FILES)) }
+    let hint = l.pick(FILES_SEARCH_HINT);
+    let pinned = Some(
+        files::head(t, f, &s.files_query, hint, sort_label(l, s.sort), root, &s.files.path)
+            .hits(Action::FilesSearch, Action::ClearFilesQuery, Action::CycleSort),
+    );
+    Frame { bg, rows, pinned, ..Frame::new(t, c, Vec::new(), l.pick(FILES), t.m.dp(files::STRIP_TOP_DP)) }
+}
+
+/// The entries a folder's rows show, in order, as the rows take them.
+fn folder_rows(folder: &Folder) -> Vec<&FileRow> {
+    folder.shown_entries()
+}
+
+/// The rows of what the search box found in the folders below this one, or
+/// in place of them why there is nothing to show yet: the search still
+/// looking, or that it could not look at all.
+fn search_rows(cx: &Ctx, c: &mut Canvas) -> Option<Rows> {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let typed = s.files_query.trim();
+    let top = files::SEARCHED_ROWS_TOP_DP;
+    match &s.found {
+        None => {
+            files::note(c, t, f, top, l.pick(["正在搜索…", "正在搜尋…", "Searching…"]), None);
+            None
+        }
+        Some(Err(why)) => {
+            files::note(c, t, f, top, l.pick(["无法搜索该文件夹", "無法搜尋這個資料夾", "This folder can't be searched"]), Some(why));
+            None
+        }
+        Some(Ok(found)) if found.is_empty() => {
+            let none = tr!(l, "没有名称含“{typed}”的条目，子文件夹也搜过了", "沒有名稱含「{typed}」的項目，子資料夾也搜過了", "Nothing below here is named “{typed}”, subfolders included");
+            files::note(c, t, f, top, &none, None);
+            None
+        }
+        Some(Ok(found)) => {
+            let shown: Vec<&Found> = found.iter().collect();
+            Some(files::found_rows(t, f, top, &shown, Action::OpenFound))
+        }
+    }
+}
+
+const FILES_SEARCH_HINT: Text = ["搜索文件", "搜尋檔案", "Search files"];
+const FILES_SEARCH_ENTER: Text = ["完成", "完成", "Done"];
+
+/// What the entries of a folder are in the order of, as the bar of them
+/// names it. The order itself is `sort::sort`, which is where a `SortKey`
+/// is turned into an order.
+fn sort_label(l: Lang, key: SortKey) -> &'static str {
+    l.pick(match key {
+        SortKey::Name => ["名称", "名稱", "Name"],
+        SortKey::Modified => ["时间", "時間", "Time"],
+        SortKey::Kind => ["类型", "類型", "Type"],
+    })
 }
 
 const CANCEL: Text = ["取消", "取消", "Cancel"];
@@ -3389,18 +3678,21 @@ fn listing(
     let mut c = sheet(cx, t.m.h, bg);
     let rows = match (absent, &folder.entries) {
         (Some((note, why)), _) => {
-            files::note(&mut c, t, f, note, Some(why));
+            files::note(&mut c, t, f, files::ROWS_TOP_DP, note, Some(why));
             None
         }
         (None, Err(why)) => {
-            files::note(&mut c, t, f, cx.state.lang.pick(["无法读取该文件夹", "無法讀取這個資料夾", "This folder can't be read"]), Some(why));
+            files::note(&mut c, t, f, files::ROWS_TOP_DP, cx.state.lang.pick(["无法读取该文件夹", "無法讀取這個資料夾", "This folder can't be read"]), Some(why));
             None
         }
         (None, Ok(entries)) if entries.is_empty() => {
-            files::note(&mut c, t, f, empty, None);
+            files::note(&mut c, t, f, files::ROWS_TOP_DP, empty, None);
             None
         }
-        (None, Ok(entries)) => Some(files::rows(t, f, entries, action)),
+        (None, Ok(_)) => {
+            let shown: Vec<&FileRow> = folder.entries.as_ref().map(|e| e.iter().collect()).unwrap_or_default();
+            Some(files::rows(t, f, files::ROWS_TOP_DP, &shown, action))
+        }
     };
     let pinned = Some(files::strip(t, f, top, &folder.path));
     Frame { bg, rows, pinned, ..Frame::new(t, c, Vec::new(), title, t.m.dp(files::STRIP_TOP_DP)) }
@@ -3410,10 +3702,17 @@ fn listing(
 /// drawn as the row comes into view.
 pub fn row(screen: Screen, cx: &Ctx, i: usize, c: &mut Canvas) {
     match screen {
+        // What the search box found comes from anywhere below the folder on
+        // the page, so its rows are not the folder's rows.
+        Screen::Files if !cx.state.files_query.trim().is_empty() => {
+            let Some(list) = cx.state.found.as_ref().and_then(|f| f.as_ref().ok()) else { return };
+            let Some(found) = list.get(i) else { return };
+            files::found_row(c, cx.t, cx.f, cx.state.lang, found, &cx.state.files.path, cx.state.files.listed, cx.state.time_zone);
+        }
         Screen::Files | Screen::Choose(_) => {
             let folder = cx.state.folder(screen);
-            let entries = folder.entries.as_ref().expect("a folder listed draws its rows");
-            files::row(c, cx.t, cx.f, cx.state.lang, &entries[i], folder.listed, cx.state.time_zone);
+            let Some(e) = folder.entry(i) else { return };
+            files::row(c, cx.t, cx.f, cx.state.lang, e, folder.listed, cx.state.time_zone);
         }
         Screen::Installing => widgets::output_row(c, cx.t, cx.f, &cx.state.script_output, i),
         Screen::PartWork => {
@@ -4237,6 +4536,256 @@ pub fn unhandled(cx: &Ctx) -> Frame {
     afterwards(&mut c, t, f, l, y, true, &mut out);
     Frame { back: false, ..Frame::new(t, c, out, l.pick(["无法处理该请求", "無法處理這項要求", "Can't handle the request"]), top) }
 }
+
+/// Turning the phone off: what it means, and the swipe that does it. Its
+/// own page rather than one line of the reboot page's list, because a phone
+/// put off is not coming back until someone presses the key again, and
+/// because what happens to work under way deserves saying.
+pub fn power_off(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let mut c = long_page(cx);
+    let mut out = Vec::new();
+    let top = t.m.content_top;
+    let x = t.m.w as f32 / 2.0;
+    let sign_cy = t.m.dp(120.0);
+    c.fill_circle(x, sign_cy, t.m.dp(30.0), t.pal.card);
+    icons::glyph(&mut c, Icon::Power, x, sign_cy, t.m.dp(40.0), t.pal.accent);
+    c.text_center(&f.heading, l.pick(POWER_OFF), x, sign_cy + t.m.dp(64.0), t.m.dp(24.0), t.pal.text);
+    c.text_center(
+        &f.body,
+        l.pick(["手机将完全关闭，按电源键可再次开机。", "手機將完全關閉，按電源鍵可再次開機。", "The phone turns off completely. Press the power key to turn it on again."]),
+        x,
+        sign_cy + t.m.dp(96.0),
+        t.m.sub_px,
+        t.pal.subtitle,
+    );
+    let mut y = sign_cy + t.m.dp(150.0);
+    // Work that would be cut short is named before the swipe, rather than
+    // discovered afterwards.
+    let running = l.pick([
+        "正在进行的安装、备份或写入会被中断，并可能留下未完成的分区。",
+        "正在進行的安裝、備份或寫入會被中斷，並可能留下未完成的分割區。",
+        "An install, backup or write under way is cut off, and may leave a partition half-written.",
+    ]);
+    y = widgets::footnote(&mut c, t, f, y, running);
+    let (label, danger) = confirm_label(Confirm::PowerOff, s);
+    let track = widgets::confirm(&mut c, t, f, y + t.m.dp(28.0), label, danger, s.confirm);
+    out.push(Hit { rect: track, action: Action::Confirm(Confirm::PowerOff) });
+    Frame::new(t, fit(c, t, track.y + track.h), out, l.pick(POWER_OFF), top)
+}
+
+const POWER_OFF: Text = ["关机", "關機", "Power off"];
+
+/// The plugins kept on the phone: where they go, what one has to be, and
+/// what was found. Nothing runs a plugin yet, and the page says so rather
+/// than showing switches for something that would do nothing.
+pub fn plugins(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let mut c = long_page(cx);
+    let mut out = Vec::new();
+    let top = t.m.content_top;
+    let mut y = widgets::section_first(&mut c, t, f, top, l.pick(["已安装的插件", "已安裝的外掛", "Plugins installed"]));
+    match &s.plugins {
+        None => y = widgets::footnote(&mut c, t, f, y, l.pick(["正在读取插件目录", "正在讀取外掛目錄", "Reading the plugins folder"])),
+        Some(Err(why)) => y = widgets::footnote(&mut c, t, f, y, &tr!(l, "无法读取插件目录：{why}", "無法讀取外掛目錄：{why}", "The plugins folder can't be read: {why}")),
+        Some(Ok(rows)) if rows.is_empty() => {
+            y = widgets::footnote(&mut c, t, f, y, l.pick(["还没有安装任何插件。", "還沒有安裝任何外掛。", "No plugins are installed yet."]))
+        }
+        Some(Ok(rows)) => {
+            let titles: Vec<String> = rows
+                .iter()
+                .map(|r| match &r.manifest {
+                    Ok(p) => p.title.clone().unwrap_or_else(|| r.name.clone()),
+                    Err(_) => r.name.clone(),
+                })
+                .collect();
+            let subs: Vec<String> = rows
+                .iter()
+                .map(|r| match &r.manifest {
+                    Ok(p) => p.version.as_ref().map_or_else(|| l.pick(["已安装", "已安裝", "Installed"]).to_string(), |v| tr!(l, "版本 {v}", "版本 {v}", "Version {v}")),
+                    Err(why) => why.clone(),
+                })
+                .collect();
+            let list: Vec<Row> = titles.iter().zip(&subs).map(|(t, s)| Row::new(t).icon(PURPLE, Icon::More).subtitle(s).trail(Trail::None)).collect();
+            let drawn = widgets::list(&mut c, t, f, y, &list);
+            let opens: Vec<Action> = (0..rows.len()).map(Action::OpenPlugin).collect();
+            out.extend(hits(&drawn.rows, &opens));
+            y = drawn.bottom;
+        }
+    }
+    // What a plugin is, so that one can be made against this page before
+    // anything runs it.
+    y = widgets::section(&mut c, t, f, y, l.pick(["什么是插件", "什麼是外掛", "What a plugin is"]));
+    let where_ = l.pick([
+        "插件是一个文件夹，放在内部存储的 Skyward/plugins 中，里面有一个 plugin.json 写明名字、版本和用途。",
+        "外掛是一個資料夾，放在內部儲存空間的 Skyward/plugins 中，裡面有一個 plugin.json 寫明名稱、版本和用途。",
+        "A plugin is a folder in Skyward/plugins on internal storage, holding a plugin.json that names it, its version and what it is for.",
+    ]);
+    let what = l.pick([
+        "本版本只读取并列出插件，还不会运行它们。这是一个为之后的插件功能留出的位置。",
+        "本版本只讀取並列出外掛，還不會執行它們。這是一個為之後的外掛功能留出的位置。",
+        "This release only reads and lists plugins; it does not run them yet. It is the place the plugin feature will grow into.",
+    ]);
+    y = widgets::footnote(&mut c, t, f, y, where_);
+    y = widgets::footnote(&mut c, t, f, y, what);
+    // What can be done today, which is looking at the folder.
+    let open = widgets::list(&mut c, t, f, y + t.m.card_gap, &[Row::new(l.pick(["在文件管理中打开插件目录", "在檔案管理中開啟外掛目錄", "Open the plugins folder in File manager"])).trail(Trail::None)]);
+    out.extend(hits(&open.rows, &[Action::OpenPluginFolder]));
+    y = open.bottom;
+    Frame::new(t, fit(c, t, y), out, l.pick(PLUGINS), top)
+}
+
+const PLUGINS: Text = ["插件", "外掛", "Plugins"];
+
+/// The slot's vbmeta image: what it is, the copies kept of it, making one,
+/// and putting one back. A copy older than the phone's rollback index is
+/// refused rather than written, since writing it is what stops a phone
+/// starting.
+pub fn vbmeta(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let mut c = long_page(cx);
+    let mut out = Vec::new();
+    let top = t.m.content_top;
+    let mut y = widgets::section_first(&mut c, t, f, top, l.pick(["当前 vbmeta", "目前 vbmeta", "This slot's vbmeta"]));
+    match &s.avb {
+        Some(Ok(state)) => {
+            let target = if state.suffix.is_empty() { "vbmeta".to_string() } else { format!("vbmeta{}", state.suffix) };
+            let flags = state.flags;
+            y = widgets::info_card(&mut c, t, f, y, &[
+                (l.pick(["目标分区", "目標分割區", "Target partition"]), target),
+                (l.pick(["标志", "旗標", "Flags"]), format!("0x{flags:08x}")),
+            ]);
+        }
+        Some(Err(why)) => y = widgets::footnote(&mut c, t, f, y, why),
+        None => y = widgets::footnote(&mut c, t, f, y, l.pick(["正在读取 vbmeta", "正在讀取 vbmeta", "Reading vbmeta"])),
+    }
+    // A copy is the only way back from a vbmeta write, so it comes first.
+    y = widgets::section(&mut c, t, f, y, l.pick(["备份", "備份", "Copies kept"]));
+    let copies = match &s.vbmeta_copies {
+        Some(Ok(copies)) => Some(copies),
+        Some(Err(why)) => {
+            y = widgets::footnote(&mut c, t, f, y, &tr!(l, "无法读取备份目录：{why}", "無法讀取備份目錄：{why}", "The copies can't be read: {why}"));
+            None
+        }
+        None => None,
+    };
+    if let Some(copies) = copies {
+        if copies.is_empty() {
+            y = widgets::footnote(&mut c, t, f, y, l.pick(["还没有留过副本，没有可写回的。", "還沒有留過副本，沒有可寫回的。", "No copy has been kept yet, so there is nothing to write back."]));
+        } else {
+            let chosen = s.vbmeta_pending.as_ref();
+            // `Row` borrows its words, so each copy's are built first and the
+            // rows borrow from them.
+            let said: Vec<(String, String)> = copies
+                .iter()
+                .map(|copy| {
+                    let when = fmt::datetime(l, copy.made, s.time_zone);
+                    let slot = match copy.suffix.as_str() {
+                        "" => l.pick(["单槽位", "單槽位", "one slot"]).to_string(),
+                        suffix => {
+                            let slot = suffix.trim_start_matches('_').to_uppercase();
+                            tr!(l, "{slot} 槽", "{slot} 槽", "slot {slot}")
+                        }
+                    };
+                    let title = tr!(l, "{when} · {slot}", "{when} · {slot}", "{when} · {slot}");
+                    // The number the guard compares, or why it cannot be read.
+                    // A copy whose header will not read is shown rather than
+                    // hidden: a person looking for one should see that it is
+                    // there, and the write refuses on it anyway.
+                    let sub = match &copy.rollback {
+                        Ok(rollback) => {
+                            let index = rollback.highest();
+                            match rollback.chained() {
+                                true => tr!(l, "回滚索引 {index}，另有链式分区", "回滾索引 {index}，另有鏈式分割區", "Rollback index {index}, with chained partitions"),
+                                false => tr!(l, "回滚索引 {index}", "回滾索引 {index}", "Rollback index {index}"),
+                            }
+                        }
+                        Err(why) => tr!(l, "无法读取：{why}", "無法讀取：{why}", "Can't be read: {why}"),
+                    };
+                    (title, sub)
+                })
+                .collect();
+            let rows: Vec<Row> = said
+                .iter()
+                .zip(copies)
+                .map(|((title, sub), copy)| {
+                    let picked = chosen.is_some_and(|p| p.name == copy.name && p.place == copy.place);
+                    Row::new(title).icon(GREEN, Icon::Backup).subtitle(sub).trail(Trail::Check(picked))
+                })
+                .collect();
+            let list = widgets::list(&mut c, t, f, y, &rows);
+            let picks: Vec<Action> = (0..copies.len()).map(Action::VbmetaRestore).collect();
+            out.extend(hits(&list.rows, &picks));
+            y = list.bottom;
+        }
+    }
+    // Keeping a copy is offered for each place the phone has open; a place that
+    // is not there has no row, rather than a row that could only fail.
+    y = widgets::section(&mut c, t, f, y, l.pick(["留一份副本", "留一份副本", "Keep a copy"]));
+    let mut keeping: Vec<Row> = Vec::new();
+    let mut keeping_hits: Vec<Action> = Vec::new();
+    if s.data.storage_open() {
+        keeping.push(Row::new(place_name(l, Place::Storage)).trail(Trail::None));
+        keeping_hits.push(Action::VbmetaBackup(Place::Storage));
+    }
+    if s.usb_drive.is_some() {
+        keeping.push(Row::new(place_name(l, Place::UsbDrive)).trail(Trail::None));
+        keeping_hits.push(Action::VbmetaBackup(Place::UsbDrive));
+    }
+    if keeping.is_empty() {
+        y = widgets::footnote(&mut c, t, f, y, l.pick([
+            "内部存储尚未打开，无法留副本；请先在「解密」中打开 data 分区。",
+            "內部儲存空間尚未開啟，無法留副本；請先在「解密」中開啟 data 分割區。",
+            "Internal storage is not open, so a copy can't be kept. Open the data partition in Decrypt first.",
+        ]));
+    } else {
+        let save = widgets::list(&mut c, t, f, y, &keeping);
+        out.extend(hits(&save.rows, &keeping_hits));
+        y = save.bottom;
+    }
+    let find = widgets::list(&mut c, t, f, y + t.m.card_gap, &[Row::new(l.pick(["刷新", "重新整理", "Refresh"])).trail(Trail::None)]);
+    out.extend(hits(&find.rows, &[Action::FindVbmeta]));
+    y = find.bottom;
+    // The rule that keeps a restore from bricking the phone, said where the
+    // restore is offered and before the swipe that does it.
+    let guard = l.pick([
+        "写回前会比对回滚索引：副本的索引低于手机现在的值时会拒绝写回，因为写回它正是让手机无法开机的原因。相同或更高则写回。",
+        "寫回前會比對回滾索引：副本的索引低於手機目前的值時會拒絕寫回，因為寫回它正是讓手機無法開機的原因。相同或更高則寫回。",
+        "A copy is written back only if its rollback index is not below the one the phone holds now: writing an older one back is what stops a phone starting. An equal or higher index is written.",
+    ]);
+    y = widgets::footnote(&mut c, t, f, y, guard);
+    if let Some(copy) = &s.vbmeta_pending {
+        let name = copy.name.as_str();
+        let what = match &copy.rollback {
+            Ok(rollback) => {
+                let index = rollback.highest();
+                tr!(
+                    l,
+                    "将把 {name} 写回当前槽位的 vbmeta（索引 {index}）。写回前会重读分区现在的索引再判断一次。",
+                    "將把 {name} 寫回目前槽位的 vbmeta（索引 {index}）。寫回前會重讀分割區目前的索引再判斷一次。",
+                    "{name} will be written back into this slot's vbmeta (index {index}). The slot's own index is read again before it is judged."
+                )
+            }
+            Err(why) => tr!(l, "{name} 无法读取，不能写回：{why}", "{name} 無法讀取，不能寫回：{why}", "{name} can't be read, so it can't be written back: {why}"),
+        };
+        y = widgets::footnote(&mut c, t, f, y, &what);
+        // Only a copy that reads is offered the swipe at all: one that does not
+        // is refused where the write is made, so offering the gesture would be
+        // offering something that cannot happen.
+        if copy.rollback.is_ok() {
+            let (label, danger) = confirm_label(Confirm::VbmetaRestore, s);
+            let track = widgets::confirm(&mut c, t, f, y + t.m.dp(28.0), label, danger, s.confirm);
+            out.push(Hit { rect: track, action: Action::Confirm(Confirm::VbmetaRestore) });
+            y = track.y + track.h;
+        }
+    }
+    if let Some(notice) = &s.vbmeta_notice {
+        y = widgets::footnote(&mut c, t, f, y, notice);
+    }
+    Frame::new(t, fit(c, t, y), out, l.pick(VBMETA), top)
+}
+
+const VBMETA: Text = ["vbmeta 备份", "vbmeta 備份", "vbmeta copies"];
 
 #[cfg(test)]
 mod tests {

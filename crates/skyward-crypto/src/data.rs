@@ -213,10 +213,15 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
     let mut closed = Vec::new();
     let mut owner = Note::default();
     for user in open_users(service)? {
+        // Read once and given to the opening below, which used to read it
+        // again for itself: it is the same files, read in the same job, and
+        // nothing writes them while the phone is in a recovery, so the
+        // second read could only give back the same value or the same
+        // failure at the same point.
         let protector = protector(user)?;
-        match protector.lock {
+        match &protector.lock {
             None => {
-                let note = open_user_files(service, user, None, None)?;
+                let note = open_user_files(service, user, &protector, None, None)?;
                 if user == OWNER {
                     owner = note;
                 }
@@ -231,7 +236,12 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
 /// and, where `user` is the owner, of each of `closed` whose credential
 /// the phone made up behind theirs; give those still closed.
 pub fn unlock(service: &KeyMint, closed: &[Closed], user: u32, credential: &[u8]) -> Result<Vec<Closed>> {
-    let note = open_user_files(service, user, Some(credential), None)?;
+    // Read here, which is where the opening read it before: what the phone
+    // keeps of the user's secret is read once for the opening that used to
+    // read it for itself, and a second read in the same job could only give
+    // back the same value or the same failure at the same point.
+    let protector = protector(user)?;
+    let note = open_user_files(service, user, &protector, Some(credential), None)?;
     let rest = closed.iter().filter(|c| c.user != user).cloned().collect();
     Ok(match user == OWNER {
         true => open_made_up(service, rest, &note),
@@ -257,7 +267,10 @@ fn open_made_up(service: &KeyMint, closed: Vec<Closed>, owner: &Note) -> Vec<Clo
         .into_iter()
         .filter_map(|c| match c.made_up {
             false => Some(c),
-            true => match open_user_files(service, c.user, None, Some(token)) {
+            // What the phone keeps of this user's secret is read here, as it
+            // was when the opening read it for itself: these users were not
+            // read for in the loop above, so this is the one read they get.
+            true => match protector(c.user).and_then(|protector| open_user_files(service, c.user, &protector, None, Some(token))) {
                 Ok(_) => None,
                 Err(e) => Some(Closed { why: Some(format!("{e:#}")), ..c }),
             },
@@ -469,13 +482,22 @@ const TAG_BYTES: usize = 16;
 
 /// Let in the key for a user's own files, and give the note the secure
 /// world wrote for the secret behind their credential, which is what the
-/// keys the phone keeps for them are guarded by. `credential` is what the
+/// keys the phone keeps for them are guarded by. `protector` is what the
+/// phone keeps of that user's secret, which the caller reads and hands in:
+/// every caller has just read it, and a second read of the same files in
+/// the same job could only give back the same value or the same failure at
+/// the same point, so the opening reads it once. `credential` is what the
 /// user would type at their screen lock; a user who has set none needs
 /// none, and a user the phone made one up for needs `owner`, the note the
 /// owner's own secret gave. The owner's files open, their shared storage
 /// shows at /sdcard.
-fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owner: Option<&Token>) -> Result<Note> {
-    let protector = protector(user)?;
+fn open_user_files(
+    service: &KeyMint,
+    user: u32,
+    protector: &crate::user::Protector,
+    credential: Option<&[u8]>,
+    owner: Option<&Token>,
+) -> Result<Note> {
     let stretched = match &protector.lock {
         Some(lock) => {
             let typed = match made_up_credential(service, user, &protector.id, owner)? {

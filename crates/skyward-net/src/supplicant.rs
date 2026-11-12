@@ -53,6 +53,36 @@ impl Security {
     pub fn joinable(self) -> bool {
         !matches!(self, Security::Wep | Security::Enterprise)
     }
+
+    /// The name this protection is written by where the phone keeps it: a
+    /// record read by a later version, which may list the protections
+    /// differently, reads the same. `None` for a record that names one this
+    /// version does not know, which is left out rather than guessed at.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Security::Open => "open",
+            Security::Owe => "owe",
+            Security::Wep => "wep",
+            Security::Psk => "psk",
+            Security::Sae => "sae",
+            Security::PskSae => "psk-sae",
+            Security::Enterprise => "enterprise",
+        }
+    }
+
+    /// The protection [`Security::tag`] names, where this version knows it.
+    pub fn of_tag(tag: &str) -> Option<Security> {
+        Some(match tag {
+            "open" => Security::Open,
+            "owe" => Security::Owe,
+            "wep" => Security::Wep,
+            "psk" => Security::Psk,
+            "sae" => Security::Sae,
+            "psk-sae" => Security::PskSae,
+            "enterprise" => Security::Enterprise,
+            _ => return None,
+        })
+    }
 }
 
 /// An access point a scan found.
@@ -190,6 +220,194 @@ pub fn network_commands(id: u32, ssid: &[u8], security: Security, password: &str
         Security::Wep | Security::Enterprise => bail!("the recovery does not join a network protected so"),
     }
     Ok(commands)
+}
+
+/// A network whose password the phone keeps, so that it is joined by itself
+/// at the next start.
+///
+/// The password is kept as it was typed, because that is the one thing the
+/// recovery cannot make again: a WPA2 passphrase and a WPA3 password are
+/// not derivable from anything the phone holds. What that costs is said
+/// where the switch that keeps it is offered — `/metadata` is a plain
+/// filesystem, so this is a password written down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Saved {
+    /// The network's name as the access point sends it, which need not be
+    /// UTF-8, and which is what tells two networks apart: a name shown on
+    /// the page is that in UTF-8 with what is not put right, so two names
+    /// can show alike and must not be taken for one another.
+    pub ssid: Vec<u8>,
+    /// Its name to show: as UTF-8, with what is not put right.
+    pub name: String,
+    pub security: Security,
+    pub password: String,
+}
+
+/// The most networks kept. `/metadata` is small and holds more than this:
+/// the key the data partition is opened with, and the settings. A phone in
+/// reach of more than sixteen networks it has joined has kept something
+/// other than what this is for.
+pub const SAVED_MOST: usize = 16;
+
+impl Saved {
+    /// Whether `other` is the same network as this one: the name as bytes,
+    /// so that a network whose name is not UTF-8 is not the network whose
+    /// name shows the same after what is not UTF-8 is put right.
+    pub fn same(&self, other: &Saved) -> bool {
+        self.ssid == other.ssid
+    }
+
+    /// What of this network a page is told: its name and its protection, and
+    /// never the password, which no page draws.
+    pub fn shown(&self) -> SavedNetwork {
+        SavedNetwork { ssid: self.ssid.clone(), name: self.name.clone(), security: self.security }
+    }
+}
+
+/// A network whose password the phone keeps, as a page that offers to forget
+/// one of them shows it.
+///
+/// This is not the same thing as what a scan found ([`crate::wlan::Network`]):
+/// a network kept is one the phone has joined, so it has no signal strength
+/// and no band, and it is the name as bytes that tells two of them apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedNetwork {
+    /// The name as the access point sends it, which need not be UTF-8.
+    pub ssid: Vec<u8>,
+    /// That name with what is not UTF-8 put right, which two networks can
+    /// share: it is for showing, never for telling them apart.
+    pub name: String,
+    pub security: Security,
+}
+
+/// `kept` written as the file that holds it, one network to a line: the
+/// name in hex, the protection by its tag, and the password.
+///
+/// The name is hex because it need not be UTF-8 and may hold a newline; the
+/// password is written as itself, because it is a password and a hex form
+/// would only make it harder to read without making it safer. A password
+/// holding a newline cannot be written — a WPA2 or WPA3 password that does
+/// is one no recovery joins — so such a record is left out rather than
+/// written as a line that reads back as another network.
+pub fn saved_text(kept: &[Saved]) -> String {
+    let mut out = String::new();
+    for k in kept {
+        if k.password.contains('\n') || k.password.contains('\r') {
+            continue;
+        }
+        out.push_str(&hex(&k.ssid));
+        out.push('\t');
+        out.push_str(k.security.tag());
+        out.push('\t');
+        out.push_str(&k.password);
+        out.push('\n');
+    }
+    out
+}
+
+/// What [`saved_text`] wrote, read back. A line this version cannot read is
+/// left out: a record written by a version that knew more than this one
+/// holds nothing this one can use, and a network left out is one that is
+/// not joined by itself, not one that is joined wrongly.
+pub fn saved_read(text: &str) -> Vec<Saved> {
+    let mut out: Vec<Saved> = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let (Some(ssid), Some(security), Some(password)) = (fields.next(), fields.next(), fields.next()) else { continue };
+        let Some(ssid) = unhex(ssid) else { continue };
+        let Some(security) = Security::of_tag(security) else { continue };
+        if ssid.is_empty() || !security.joinable() {
+            continue;
+        }
+        let entry = Saved { name: String::from_utf8_lossy(&ssid).into_owned(), ssid, security, password: password.to_string() };
+        // The last record of a name is the one that stands: a file that
+        // names one twice is one an earlier version wrote differently.
+        match out.iter().position(|k| k.same(&entry)) {
+            Some(at) => out[at] = entry,
+            None if out.len() < SAVED_MOST => out.push(entry),
+            None => {}
+        }
+    }
+    out
+}
+
+/// The bytes `hex` writes as hex digits, or `None` for anything that is not
+/// an even run of them.
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    let digits = text.as_bytes();
+    if !digits.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(digits.len() / 2);
+    for pair in digits.as_chunks::<2>().0 {
+        let pair = std::str::from_utf8(pair).ok()?;
+        out.push(u8::from_str_radix(pair, 16).ok()?);
+    }
+    Some(out)
+}
+
+/// The supplicant's own configuration, as it reads at a start: the settings
+/// that do not change, then every network kept, so that the phone joins one
+/// of them by itself.
+///
+/// This is generated rather than saved by the supplicant: a `SAVE_CONFIG`
+/// would have the supplicant write this file itself, which means `/metadata`
+/// writable for a length of time this program does not own, and a write
+/// straight into the file rather than into one beside it — a start cut off
+/// in the middle of it would leave a half-written configuration. What is
+/// written instead is the record, by the code that has that discipline, and
+/// this file is made afresh in RAM at every start from it.
+pub fn config_text(sockets: &str, kept: &[Saved]) -> String {
+    let mut out = format!(
+        "ctrl_interface={sockets}\n\
+         update_config=0\n\
+         p2p_disabled=1\n\
+         pmf=1\n\
+         sae_pwe=2\n"
+    );
+    // Every network is kept at the supplicant's own priority, so that the
+    // one it joins is the strongest of those in range rather than whichever
+    // was joined last: a phone that carried away from one network and back
+    // to another joins what it can hear, as the phone's own system does.
+    for k in kept.iter().filter(|k| k.security.joinable()) {
+        out.push_str(&format!("\nnetwork={{\n\tssid={}\n", hex(&k.ssid)));
+        match k.security {
+            Security::Open => out.push_str("\tkey_mgmt=NONE\n"),
+            Security::Owe => out.push_str("\tkey_mgmt=OWE\n\tieee80211w=2\n"),
+            // A passphrase a WPA2 network could not be joined with is left
+            // out of its network rather than written as one the supplicant
+            // would refuse to load, which would cost every network after it
+            // as well.
+            Security::Psk => {
+                out.push_str("\tkey_mgmt=WPA-PSK WPA-PSK-SHA256\n");
+                push_psk(&mut out, &k.password);
+            }
+            Security::Sae => {
+                out.push_str("\tkey_mgmt=SAE\n");
+                out.push_str(&format!("\tsae_password={}\n\tieee80211w=2\n", hex(k.password.as_bytes())));
+            }
+            Security::PskSae => {
+                out.push_str("\tkey_mgmt=WPA-PSK WPA-PSK-SHA256 SAE\n");
+                push_psk(&mut out, &k.password);
+                out.push_str(&format!("\tsae_password={}\n\tieee80211w=1\n", hex(k.password.as_bytes())));
+            }
+            // Nothing else is kept, and a record naming one is not one this
+            // writes: the filter above leaves it out before its block opens.
+            Security::Wep | Security::Enterprise => {}
+        }
+        out.push_str("}\n");
+    }
+    out
+}
+
+/// A WPA2 passphrase as the supplicant's configuration takes it, where it is
+/// one: eight characters at least, printable ASCII, and in quotes so that a
+/// quote inside it stays.
+fn push_psk(out: &mut String, password: &str) {
+    let ok = (8..=63).contains(&password.len()) && password.bytes().all(|b| (32..=126).contains(&b));
+    if ok {
+        out.push_str(&format!("\tpsk=\"{password}\"\n"));
+    }
 }
 
 /// What the supplicant tells a control connection attached to it.
@@ -439,5 +657,93 @@ mod tests {
         let status = fields("bssid=02:00:00:00:00:01\nfreq=5805\nssid=Skyward-5G\nwpa_state=COMPLETED\nip_address=192.168.1.5\n");
         assert_eq!(status["wpa_state"], "COMPLETED");
         assert_eq!(status["freq"], "5805");
+    }
+
+    fn kept(ssid: &[u8], security: Security, password: &str) -> Saved {
+        Saved { ssid: ssid.to_vec(), name: String::from_utf8_lossy(ssid).into_owned(), security, password: password.into() }
+    }
+
+    #[test]
+    fn what_is_kept_reads_back_as_it_was_written() {
+        let all = [
+            kept("Skyward客厅".as_bytes(), Security::Psk, "pass\"word"),
+            kept(b"Skyward-5G", Security::Sae, "短いパスワード"),
+            kept(b"\xff\xfe", Security::Open, ""),
+            kept(b"Both", Security::PskSae, "12345678"),
+        ];
+        let read = saved_read(&saved_text(&all));
+        assert_eq!(read, all);
+        assert_eq!(read[0].name, "Skyward客厅", "the name to show comes back with it");
+        assert_eq!(read[2].ssid, b"\xff\xfe", "a name that is not UTF-8 is kept as its bytes");
+    }
+
+    #[test]
+    fn a_record_that_does_not_read_leaves_out_only_itself() {
+        let good = kept(b"Good", Security::Psk, "12345678");
+        let text = format!(
+            "{}\nnot a record\ndeadbeeff\tpsk\tpw\n{}\tnosuch\tpw\n{}\tenterprise\tpw\n",
+            saved_text(std::slice::from_ref(&good)),
+            hex(b"Good"),
+            hex(b"Good")
+        );
+        assert_eq!(saved_read(&text), [good], "a line of each kind that cannot be read is left out");
+    }
+
+    #[test]
+    fn a_name_written_twice_is_kept_once_as_the_last_of_them() {
+        let (first, last) = (kept(b"Same", Security::Psk, "11111111"), kept(b"Same", Security::Psk, "22222222"));
+        assert_eq!(saved_read(&saved_text(&[first, last.clone()])), [last], "the last password written is the one that stands");
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_is_not_the_name_that_shows_the_same() {
+        let real = kept(b"\xff\xfe", Security::Psk, "12345678");
+        let shown = kept("\u{fffd}\u{fffd}".as_bytes(), Security::Psk, "12345678");
+        assert_eq!(real.name, shown.name, "the two show alike");
+        assert!(!real.same(&shown), "and are not taken for one another");
+    }
+
+    #[test]
+    fn a_password_that_could_not_be_a_line_is_not_kept() {
+        let bad = kept(b"Newline", Security::Psk, "1234\nnetwork={}");
+        assert_eq!(saved_read(&saved_text(&[bad])), Vec::new(), "which would read back as a network of another name");
+    }
+
+    #[test]
+    fn the_configuration_names_every_network_kept_and_no_other() {
+        let all = [kept(b"Home", Security::Psk, "12345678"), kept(b"Work", Security::Sae, "a-wpa3-password")];
+        let text = config_text("/ram/sockets", &all);
+        assert!(text.starts_with("ctrl_interface=/ram/sockets\n"), "{text}");
+        assert!(text.contains("update_config=0\n"), "the supplicant writes nothing of its own");
+        assert!(text.contains("\tssid=486f6d65\n"), "a name goes as hex, which takes any byte");
+        assert!(text.contains("\tpsk=\"12345678\"\n"));
+        assert!(text.contains("\tsae_password=612d777061332d70617373776f7264\n"));
+        assert_eq!(text.matches("network={").count(), 2, "one block a network, and no more");
+        assert_eq!(text.matches('}').count(), 2, "every block closed");
+        assert!(!text.contains("priority="), "the supplicant chooses among them itself");
+    }
+
+    #[test]
+    fn a_passphrase_a_wpa2_network_could_not_be_joined_with_is_left_out_of_its_own_block() {
+        let all = [kept(b"Home", Security::Psk, "short"), kept(b"Good", Security::Psk, "12345678")];
+        let text = config_text("/ram", &all);
+        assert!(
+            !text.contains("\tssid=486f6d65\n\tkey_mgmt=WPA-PSK WPA-PSK-SHA256\n\tpsk="),
+            "a passphrase of four characters is not written into its own network: {text}"
+        );
+        assert!(text.contains("\tssid=486f6d65\n"), "its network is still named");
+        assert!(
+            text.contains("\tssid=476f6f64\n\tkey_mgmt=WPA-PSK WPA-PSK-SHA256\n\tpsk=\"12345678\"\n"),
+            "the one that can be joined is written whole: {text}"
+        );
+        assert_eq!(text.matches("\tpsk=").count(), 1, "and only it has a passphrase, so one bad record costs no other");
+        assert_eq!(text.matches('}').count(), 2, "every block closes whether or not it holds a passphrase");
+    }
+
+    #[test]
+    fn no_network_kept_is_the_settings_alone() {
+        let text = config_text("/ram/sockets", &[]);
+        assert!(text.ends_with("sae_pwe=2\n"), "nothing a supplicant would refuse: {text}");
+        assert!(!text.contains("network="));
     }
 }

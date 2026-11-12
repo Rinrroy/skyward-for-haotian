@@ -26,9 +26,11 @@ use skyward_net::download::{Failure, Progress};
 use skyward_net::github::{Build, Newest};
 use skyward_net::release::{Release, Unanswered};
 use skyward_net::supplicant::Security;
+pub use skyward_net::supplicant::SavedNetwork;
 use skyward_net::wlan::{Joined, Network, Power, Stage as Joining, Traffic, Wlan};
 use skyward_systems::{Overview, Who};
 use skyward_vab::{BootSlots, Hold, Slot, SnapshotState, Standing};
+pub use skyward_vab::vbmeta::Rollback;
 
 /// The pages of the recovery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +141,14 @@ pub enum Screen {
     /// A network added by hand: its name, how it is protected and its
     /// password, typed on the screen's keyboard.
     WlanAdd,
+    /// Turning the phone off, and what that means: the swipe that does it.
+    PowerOff,
+    /// The plugins installed, as much of them as the recovery reads now:
+    /// what one is, where they go, and what was found.
+    Plugins,
+    /// The vbmeta image of the slot the phone runs from: the copies kept of
+    /// it, making one, and putting one back.
+    Vbmeta,
 }
 
 /// How far asking the update server for the newest system has come.
@@ -235,6 +245,11 @@ pub enum SkywardEnd {
 /// Where the full packages downloaded go, from the top of internal
 /// storage: the folder the stock updater keeps them in.
 pub const DOWNLOADS: &str = "downloaded_rom";
+
+/// Where a plugin's folder is looked for, from the top of internal storage:
+/// beside the backups the recovery writes, so that what a person puts on the
+/// phone and what the recovery keeps are found in one place.
+pub const PLUGIN_FOLDER: &str = "Skyward/plugins";
 
 /// Where the USB drive plugged in is shown.
 pub const USB_DRIVE: &str = "/mnt/usb";
@@ -573,6 +588,13 @@ pub enum Switch {
     DoubleTap,
     /// Show the password typed rather than a dot for each character.
     ShowPassword,
+    /// Keep the network joined, with its password, so that the recovery
+    /// joins it by itself at the next start.
+    RememberWlan,
+    /// Reach GitHub through a mirror in the mainland for the recovery's own
+    /// update: the check and the download both, since both hosts that serve
+    /// them are commonly out of reach there. Direct first, then the mirror.
+    Mirror,
 }
 
 /// What a backup can take, in the order the backup page lists it.
@@ -701,6 +723,23 @@ pub enum FileKind {
     Special,
 }
 
+/// An entry a search found, and the folder it is in: what the search box
+/// shows is the whole tree under the folder on the page, so a row of that
+/// list has to say which folder its entry came from — two folders can hold
+/// the same name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Found {
+    /// The folder the entry is in.
+    pub folder: String,
+    /// The entry, named as it is in that folder.
+    pub entry: FileRow,
+}
+
+/// The folder an entry a search found is in, and its name, as one path.
+pub fn found_path(found: &Found) -> String {
+    std::path::Path::new(&found.folder).join(&found.entry.name).to_string_lossy().into_owned()
+}
+
 /// A folder as a list of its entries shows it: where it is, what is in it
 /// as the runtime read it or why it could not, and when it was read, in
 /// Unix seconds: dates in the list are told against that day.
@@ -709,6 +748,9 @@ pub struct Folder {
     pub path: String,
     pub entries: Result<Vec<FileRow>, String>,
     pub listed: i64,
+    /// Which entries the rows show, in the order they are in: row `i` of
+    /// the list is entry `shown[i]`. Every entry while nothing is typed.
+    shown: Vec<usize>,
     /// The folders left for one inside them, outermost first, with how far
     /// each was scrolled.
     left: Vec<(String, f32)>,
@@ -717,12 +759,37 @@ pub struct Folder {
 impl Folder {
     /// The folder at `path`, not read yet.
     pub fn new(path: &str) -> Folder {
-        Folder { path: path.into(), entries: Ok(Vec::new()), listed: 0, left: Vec::new() }
+        Folder { path: path.into(), entries: Ok(Vec::new()), listed: 0, shown: Vec::new(), left: Vec::new() }
     }
 
-    /// The entry at this place in the list.
-    fn entry(&self, i: usize) -> &FileRow {
-        &self.entries.as_ref().expect("an entry touched is one the list shows")[i]
+    /// The entry at this place in the list, or none when the list no longer
+    /// has a row there — a listing that shrank between a tap and the tap
+    /// landing shows nothing rather than ending the recovery.
+    pub fn entry(&self, i: usize) -> Option<&FileRow> {
+        let entries = self.entries.as_ref().ok()?;
+        entries.get(*self.shown.get(i)?)
+    }
+
+    /// The entries the rows show, in the order they are in.
+    pub fn shown_entries(&self) -> Vec<&FileRow> {
+        match &self.entries {
+            Ok(entries) => self.shown.iter().filter_map(|i| entries.get(*i)).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Keep the entries `query` picks out, in the order they were read in;
+    /// a query with nothing in it keeps all of them. Matched without case
+    /// and anywhere in the name, as the stock file manager matches it.
+    pub fn keep(&mut self, query: &str) {
+        self.shown.clear();
+        let Ok(entries) = &self.entries else { return };
+        let needle = query.trim().to_lowercase();
+        for (i, e) in entries.iter().enumerate() {
+            if needle.is_empty() || e.name.to_lowercase().contains(&needle) {
+                self.shown.push(i);
+            }
+        }
     }
 
     /// Where the entry of this name in the folder is.
@@ -893,6 +960,17 @@ pub enum Confirm {
     RemoveSystem,
     /// Install the system the installer holds with the room chosen.
     InstallSystem,
+    /// Turn an AVB check off, which the AVB page asked for and which the
+    /// page had said what it costs: the second confirmation alone writes.
+    AvbDisable,
+    /// Write the vbmeta copy the page chose back into the slot's vbmeta.
+    VbmetaRestore,
+    /// Forget the network the WLAN page's details are of.
+    ForgetNetwork,
+    /// Delete the full package downloaded from internal storage.
+    DeleteDownload,
+    /// Turn the phone off.
+    PowerOff,
 }
 
 /// What the wipe page erases: everything a factory reset erases, or any of
@@ -1128,6 +1206,24 @@ pub enum Target {
 
 pub const TARGETS: [Target; 6] = [Target::System, Target::Recovery, Target::Fastboot, Target::Bootloader, Target::Edl, Target::PowerOff];
 
+/// How the file manager orders a folder's entries, in the order the page
+/// offers them. Folders come first in every one of them, as the stock file
+/// manager puts them; ties are broken by name, ignoring case.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortKey {
+    /// By name, ignoring case.
+    #[default]
+    Name,
+    /// Most recently changed first, so what was just written is at the top.
+    Modified,
+    /// By kind: folders, then files grouped by what they are — an image, a
+    /// package, a text file, anything else — each group ordered by name.
+    Kind,
+}
+
+/// The three orders, in the order the page lists them.
+pub const SORT_KEYS: [SortKey; 3] = [SortKey::Name, SortKey::Modified, SortKey::Kind];
+
 /// Where the fastboot page goes, in the order it lists them: the volume
 /// keys move between them and the power key takes one.
 pub const FASTBOOT_CHOICES: [(Text, Action); 4] = [
@@ -1183,6 +1279,44 @@ pub enum Action {
     AvbToggle(avbctl::Check),
     /// Take back a request to change vbmeta.
     CancelAvb,
+    /// A check was asked to be turned off, and the page says what that
+    /// means: this opens the second confirmation, which alone writes.
+    AvbConfirmOpen,
+    /// Keep the image the slot's vbmeta holds now, as a copy that outlives
+    /// this start, in `place`'s Skyward folder.
+    VbmetaBackup(Place),
+    /// Put the copy at this place in the list of those found back into the
+    /// slot's vbmeta, once the rollback index says it may be.
+    VbmetaRestore(usize),
+    /// Look again for the copies of vbmeta kept in the places that can be
+    /// read.
+    FindVbmeta,
+    /// Order the file manager's list by this key, and keep it for the rest
+    /// of the start.
+    SortFiles(SortKey),
+    /// Order the file manager's list by the next key after the one it is in,
+    /// the button beside the search box going round the three.
+    CycleSort,
+    /// Open the file manager's keyboard on its search box.
+    FilesSearch,
+    /// Put the file manager's keyboard away, keeping what it found.
+    CloseFilesSearch,
+    /// Empty the file manager's search box and show the whole folder again.
+    ClearFilesQuery,
+    /// Forget the network the WLAN page's details are of: its password and
+    /// how it is protected, from what the phone keeps. A swipe then does it.
+    ForgetNetwork,
+    /// Forget the saved network at this place in the list of those kept.
+    ForgetSaved(usize),
+    /// Pause the system update package's download, keeping what came of it.
+    PauseDownload,
+    /// Delete the full package downloaded, from internal storage. A swipe
+    /// then confirms it.
+    AskDeleteDownload,
+    /// Open the plugin at this place in the list of those found.
+    OpenPlugin(usize),
+    /// Open the folder the plugins are kept in, in the file manager.
+    OpenPluginFolder,
     Open(Screen),
     /// Leave the decrypt page for the page it was opened from; the page
     /// the recovery started on, for the home page without keeping it
@@ -1263,6 +1397,9 @@ pub enum Action {
     /// Open the file manager's entry at this place in the folder: a folder
     /// to look in, a text file to edit, or what can be done with any other.
     OpenEntry(usize),
+    /// Open row `i` of what the file manager's search box found, which may
+    /// be in any folder below the one the page shows.
+    OpenFound(usize),
     /// Open the terminal in the folder the file manager shows.
     TerminalHere,
     /// Open the entry at this place in a place's folder: a folder to look
@@ -1331,7 +1468,6 @@ pub enum Action {
     /// Download the newest system's full package, or carry on downloading
     /// it.
     Download,
-    StopDownload,
     /// Install the full package downloaded.
     InstallDownloaded,
     /// Ask GitHub for Skyward's newest release.
@@ -1754,6 +1890,36 @@ pub struct State {
     pub held: Option<Action>,
     /// The folder the file manager shows.
     pub files: Folder,
+    /// How the file manager orders a folder's entries.
+    pub sort: SortKey,
+    /// What is typed in the file manager's search box, which keeps the rows
+    /// of the folder shown down to the names it finds.
+    pub files_query: String,
+    /// Whether the file manager's keyboard stands at the bottom of it,
+    /// typing into that box.
+    pub files_search: bool,
+    /// What that box found in the folders below the one shown: `None` while
+    /// nothing is typed or while the search runs, and the reason it could
+    /// not run when it could not.
+    pub found: Option<Result<Vec<Found>, String>>,
+    /// A search is looking through the folders below the one shown.
+    pub finding: bool,
+    /// Which search an answer belongs to: typing over a query asks for
+    /// another search, and an answer to a query already typed over is
+    /// dropped rather than shown under the new one.
+    pub find_gen: u64,
+    /// Where the entry the file page describes is, when a search found it
+    /// and it is therefore not in the folder the list shows.
+    pub file_path: Option<String>,
+    /// Whether the recovery's own update reaches GitHub through a mirror in
+    /// the mainland. On by default: the check goes direct first either way,
+    /// so trying the mirror costs nothing when GitHub answers.
+    pub mirror: bool,
+    /// A network joined keeps its password, so that the recovery joins it by
+    /// itself at the next start. It starts on, because joining a network and
+    /// typing its password again at every start is the thing this spares
+    /// someone; a network that is never joined keeps nothing either way.
+    pub remember_wlan: bool,
     /// The folder of internal storage a file to install is chosen in, its
     /// path from the top of the storage.
     pub storage: Folder,
@@ -1824,6 +1990,83 @@ pub struct State {
     pub skyward_job: Option<SkywardJob>,
     /// How fast data went over the network joined in the last second.
     pub traffic: Traffic,
+    /// The copies of the slot's vbmeta image found in the places that can
+    /// be read, as the runtime last looked for them; none until it has.
+    pub vbmeta_copies: Option<Result<Vec<VbmetaCopy>, String>>,
+    /// The copy the page was asked to put back, and whether the page has
+    /// said what that means: the write waits on a swipe.
+    pub vbmeta_pending: Option<VbmetaCopy>,
+    /// What the last save or write back of vbmeta said, once it ended.
+    pub vbmeta_notice: Option<String>,
+    /// A check was asked to be turned off and the AVB page has said what
+    /// that means: the second confirmation stands over the page, and the
+    /// swipe it holds is the only place the write comes from.
+    pub avb_confirming: bool,
+    /// The network the details page shows and the swipe asks to forget.
+    pub forget_pending: Option<String>,
+    /// The networks whose passwords the phone keeps, as the runtime last
+    /// read them: what the WLAN page offers to forget one of.
+    pub saved: Vec<SavedNetwork>,
+    /// The plugins kept on the phone, as the runtime last read them; none
+    /// until it has.
+    pub plugins: Option<Result<Vec<PluginRow>, String>>,
+    /// The plugin the page was opened on, by its place in the list.
+    pub plugin_chosen: usize,
+}
+
+/// A copy of the slot's vbmeta image kept somewhere that outlives a start,
+/// as the AVB page lists it. What the image itself says — its slot and its
+/// rollback index — is `skyward_vab::vbmeta`'s to read; this is only the
+/// pairing of that with the place the file is in, which is the page's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VbmetaCopy {
+    pub place: Place,
+    /// The file's own name, which says the slot and when it was taken.
+    pub name: String,
+    /// The slot the image was read from, empty on a phone with one slot.
+    pub suffix: String,
+    /// Bytes the image takes.
+    pub size: u64,
+    /// The index it carries, or why it cannot be read as a vbmeta image. The
+    /// page shows either, so a file that cannot be read is never passed over
+    /// as though there were nothing there — and the write does not trust
+    /// this reading either: it reads the partition and the copy again where
+    /// the write is made, because what a page was showing is not what the
+    /// phone holds.
+    pub rollback: Result<Rollback, String>,
+    /// When it was taken, in Unix seconds.
+    pub made: i64,
+}
+
+/// A plugin found in the folder the recovery reads them from: what its
+/// manifest says, or why it cannot be used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginRow {
+    /// The plugin's folder name, which is what it is called.
+    pub name: String,
+    /// What its manifest says, or why there is none to read: the page shows
+    /// either, so a folder a person dropped in is never silently passed
+    /// over.
+    pub manifest: Result<Plugin, String>,
+}
+
+/// What a plugin's manifest says it is.
+///
+/// Nothing runs one yet: this release is the page and the reading of what a
+/// plugin will be, so that a later one has somewhere to put what it does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Plugin {
+    /// What it calls itself, where its folder's name is not enough.
+    pub title: Option<String>,
+    /// The version it is at, as its author numbers it.
+    pub version: Option<String>,
+    /// Who wrote it.
+    pub author: Option<String>,
+    /// What it is for, in one line.
+    pub about: Option<String>,
+    /// What it says it needs of the recovery, by name: what a later release
+    /// refuses to run it without.
+    pub needs: Vec<String>,
 }
 
 impl Default for State {
@@ -1892,6 +2135,15 @@ impl Default for State {
             layer: Layer::Letters,
             held: None,
             files: Folder::new("/"),
+            sort: SortKey::default(),
+            files_query: String::new(),
+            files_search: false,
+            found: None,
+            finding: false,
+            find_gen: 0,
+            file_path: None,
+            mirror: true,
+            remember_wlan: true,
             storage: Folder::new(""),
             usb_drive: None,
             drive: Folder::new(""),
@@ -1924,6 +2176,14 @@ impl Default for State {
             skyward_check: SkywardCheck::Idle,
             skyward_job: None,
             traffic: Traffic::default(),
+            vbmeta_copies: None,
+            vbmeta_pending: None,
+            vbmeta_notice: None,
+            avb_confirming: false,
+            forget_pending: None,
+            saved: Vec::new(),
+            plugins: None,
+            plugin_chosen: 0,
         }
     }
 }
@@ -2092,6 +2352,9 @@ pub enum Effect {
     Screenshot { storage: bool },
     /// Offer internal storage to a computer over USB, or stop.
     FileTransfer(bool),
+    /// Reach GitHub through a mirror in the mainland for the recovery's own
+    /// update, or go to it directly only.
+    SetMirror(bool),
     /// Start receiving a package over USB.
     Sideload,
     /// Start installing the file at this path from the top of a place,
@@ -2132,6 +2395,10 @@ pub enum Effect {
     Unmount(String),
     /// List the folder at this path for the file manager.
     ReadDir(String),
+    /// Look through the folders below `root` for the entries `query` names,
+    /// telling what it found with [`App::found_files`] against search `gen`
+    /// so that an answer to a query already typed over is dropped.
+    FindFiles { root: String, query: String, gen: u64, sort: SortKey },
     /// List the folder at this path from the top of a place, to choose a
     /// file to install in, telling what it holds with [`App::set_place`].
     ReadPlace(Place, String),
@@ -2240,7 +2507,6 @@ pub enum Effect {
     /// Download `release`'s full package into [`DOWNLOADS`], telling how it
     /// goes with [`App::download_progress`] and [`App::download_ended`].
     Download(Release),
-    StopDownload,
     /// Ask GitHub for Skyward's newest release, telling what it answered
     /// with [`App::skyward_checked`].
     CheckSkyward,
@@ -2252,6 +2518,27 @@ pub enum Effect {
     /// Merge the update that waits in the slot the phone runs from,
     /// telling how it goes with [`App::set_update`].
     Merge,
+    /// Stop the system update package's download as a pause: what came of
+    /// it stays on disk for a later start to go on from.
+    PauseDownload,
+    /// Delete the full package `name` from the downloads folder, telling
+    /// how it went with [`App::download_deleted`].
+    DeleteDownload(String),
+    /// Keep the running slot's vbmeta image as a copy in `place`, telling
+    /// how it went with [`App::vbmeta_notice`].
+    VbmetaBackup { place: Place },
+    /// Write the vbmeta copy at `name` in `place` back into the running
+    /// slot's vbmeta, telling how it went with [`App::vbmeta_notice`].
+    VbmetaRestore { place: Place, name: String },
+    /// Look for the vbmeta copies kept in the places that can be read,
+    /// telling what is found with [`App::set_vbmeta_copies`].
+    FindVbmeta { storage: bool, usb: bool },
+    /// Read the plugins kept on the phone, telling what is found with
+    /// [`App::set_plugins`].
+    ReadPlugins,
+    /// Forget the network named `name`, with what was kept of it, telling
+    /// how it went with [`App::wlan_forgotten`].
+    ForgetWlan(String),
 }
 
 enum Drag {
@@ -3026,7 +3313,7 @@ impl App {
     /// Open what can be done with entry `i` of the folder shown, held long
     /// enough to, with a tap of the motor.
     fn held_entry(&mut self, i: usize) -> Vec<Effect> {
-        let entry = self.state.files.entry(i).clone();
+        let Some(entry) = self.state.files.entry(i).cloned() else { return Vec::new() };
         self.state.file = Some(entry);
         self.state.asking_delete = false;
         self.open(Screen::FileInfo);
@@ -3415,11 +3702,83 @@ impl App {
     }
 
     /// What the AVB page's read found, and what the write before it said.
-    pub fn avb_read(&mut self, state: Result<avbctl::State, String>, notice: Option<String>) {        self.state.avb = Some(state);
+    pub fn avb_read(&mut self, state: Result<avbctl::State, String>, notice: Option<String>) {
+        self.state.avb = Some(state);
         self.state.avb_pending = None;
+        self.state.avb_confirming = false;
         self.state.avb_notice = notice;
         self.state.confirm = 0.0;
         self.refresh();
+    }
+
+    /// The copies of the slot's vbmeta image kept where the phone's storage
+    /// has them, or why they could not be read.
+    pub fn set_vbmeta_copies(&mut self, copies: Result<Vec<VbmetaCopy>, String>) {
+        self.state.vbmeta_copies = Some(copies);
+        self.state.vbmeta_pending = None;
+        self.state.confirm = 0.0;
+        self.refresh();
+    }
+
+    /// Saving a copy of vbmeta, or writing one back, ended: the page says
+    /// what came of it and the pending choice is put down.
+    pub fn vbmeta_notice(&mut self, said: String) {
+        self.state.vbmeta_notice = Some(said);
+        self.state.vbmeta_pending = None;
+        // A write back changes what the partition holds, which is what the
+        // AVB page shows and what the next copy would save.
+        self.state.avb = None;
+        self.state.confirm = 0.0;
+        self.refresh();
+    }
+
+    /// The plugins found in the folder the recovery reads them from, or why
+    /// it could not be read.
+    pub fn set_plugins(&mut self, plugins: Result<Vec<PluginRow>, String>) {
+        self.state.plugins = Some(plugins);
+        self.refresh();
+    }
+
+    /// A network joined has its password kept, or the one kept for it is
+    /// taken away: what the WLAN page offers to forget changed.
+    pub fn set_saved(&mut self, saved: Vec<SavedNetwork>) {
+        self.state.saved = saved;
+        self.refresh();
+    }
+
+    /// Forgetting a network ended: the page says what came of it, and what
+    /// is kept is read again.
+    pub fn wlan_forgotten(&mut self, forgot: Result<String, String>, now: u64) {
+        let l = self.state.lang;
+        let said = match forgot {
+            Ok(name) if !name.is_empty() => tr!(l, "已忘记「{name}」", "已忘記「{name}」", "“{name}” is forgotten"),
+            Ok(_) => l.pick(["已清除保存的网络", "已清除儲存的網路", "The networks kept are cleared"]).to_string(),
+            Err(why) => format!("{}: {why}", l.pick(["未能忘记该网络", "未能忘記該網路", "The network was not forgotten"])),
+        };
+        self.state.forget_pending = None;
+        self.state.details = None;
+        self.state.asking_delete = false;
+        self.state.confirm = 0.0;
+        self.refresh();
+        self.say(&said, now);
+    }
+
+    /// How deleting the full package downloaded went: bytes freed, and what
+    /// internal storage holds of it now; or why it is still there.
+    pub fn download_deleted(&mut self, outcome: Result<u64, String>, have: Have, now: u64) {
+        self.state.have = have;
+        self.state.asking_delete = false;
+        self.state.confirm = 0.0;
+        self.refresh();
+        let l = self.state.lang;
+        match outcome {
+            Ok(0) => self.say(l.pick(["安装包已不存在", "安裝檔已不存在", "The package is already gone"]), now),
+            Ok(freed) => {
+                let size = crate::fmt::file_size(freed);
+                self.say(&tr!(l, "已删除安装包，释放 {size}", "已刪除安裝檔，釋放 {size}", "Package deleted, freeing {size}"), now);
+            }
+            Err(why) => self.report(&tr!(l, "无法删除安装包：{why}", "無法刪除安裝檔：{why}", "Couldn't delete the package: {why}"), now),
+        }
     }
 
     /// The settings the pages show, as they are kept between starts.
@@ -3581,6 +3940,7 @@ impl App {
         if self.screen() == Screen::FileInfo {
             self.leave(false);
             self.state.file = None;
+            self.state.file_path = None;
             self.state.asking_delete = false;
             self.stack.pop();
         }
@@ -4286,10 +4646,22 @@ impl App {
                 }
             }
         }
+        // A folder gone into starts without a query: the one typed was for
+        // the folder left behind. Reading the same folder again, as after a
+        // file is deleted or the order changes, keeps it.
+        if screen == Screen::Files && folder != self.state.files.path {
+            self.state.files_query.clear();
+            self.state.files_search = false;
+            self.clear_found();
+        }
         let shown = self.state.folder_mut(screen);
         shown.path = folder;
         shown.entries = files;
         shown.listed = listed;
+        // The rows of a folder are all of them: what the box finds is the
+        // tree below it, and that is a list of its own, so nothing here is
+        // kept back by the text in the box.
+        shown.keep("");
         self.refresh();
     }
 
@@ -5331,6 +5703,20 @@ impl App {
                 vec![Effect::ReadAvb]
             }
             Screen::Mount => vec![Effect::ReadMounts],
+            Screen::Plugins => {
+                // Read afresh each time it opens: a plugin is a folder put
+                // there by someone else, and it may have come or gone since
+                // the page was last looked at.
+                self.state.plugins = None;
+                vec![Effect::ReadPlugins]
+            }
+            Screen::Vbmeta => {
+                // The copies kept are found again as the page opens, and the
+                // flags shown are the ones the phone has now.
+                self.state.vbmeta_copies = None;
+                self.state.vbmeta_pending = None;
+                vec![Effect::FindVbmeta { storage: true, usb: self.state.usb_drive.is_some() }, Effect::ReadAvb]
+            }
             Screen::Filesystems => vec![Effect::ReadFilesystems],
             Screen::Slot | Screen::Reboot => vec![Effect::ReadSlots],
             Screen::Systems => vec![Effect::ReadSystems],
@@ -5356,6 +5742,12 @@ impl App {
             // it opens, once a network is joined and nothing has been heard.
             Screen::Update => {
                 let mut fx = vec![Effect::ReadUpdate];
+                // Deleting a package is asked for on this page, and a swipe
+                // left armed by an earlier visit would draw over a page that
+                // did not ask for it. The page is opened afresh, so the
+                // question is put down with it.
+                self.state.asking_delete = false;
+                self.state.confirm = 0.0;
                 if self.state.update_server && matches!(self.state.check, Check::Idle | Check::Failed(_)) && self.state.online() {
                     self.state.check = Check::Asking;
                     fx.push(Effect::CheckUpdate);
@@ -5454,6 +5846,8 @@ impl App {
                     Switch::ShowPassword => &mut self.state.show_password,
                     Switch::AlwaysOn => &mut self.state.always_on,
                     Switch::DoubleTap => &mut self.state.double_tap,
+                    Switch::RememberWlan => &mut self.state.remember_wlan,
+                    Switch::Mirror => &mut self.state.mirror,
                     Switch::Wlan => unreachable!("the WLAN switch is turned above"),
                 };
                 *on = !*on;
@@ -5465,12 +5859,22 @@ impl App {
                 if switch == Switch::FileTransfer {
                     return vec![Effect::FileTransfer(now_on)];
                 }
+                if switch == Switch::Mirror {
+                    return vec![Effect::SetMirror(now_on)];
+                }
                 // Turning remembering off has to take the sealed file away,
                 // not only the copy the pages hold: a credential left on the
                 // phone after the switch was turned off is the one thing the
                 // switch promises not to do.
                 if switch == Switch::RememberPassword && !now_on {
                     return vec![Effect::RememberPassword(None)];
+                }
+                // Turning remembering a network off takes what is stored
+                // away, as turning the credential off does: a password kept
+                // on the phone after the switch was turned off is the one
+                // thing the switch promises not to do.
+                if switch == Switch::RememberWlan && !now_on {
+                    return vec![Effect::ForgetWlan(String::new())];
                 }
             }
             Action::MountToggle(i) => {
@@ -5519,8 +5923,13 @@ impl App {
                     }
                 }
             }
+            // Taking the request back puts down both the change and the step
+            // that asks what it costs: a page left open on the second
+            // confirmation with nothing pending behind it would write
+            // nothing, which is a control that lies about what it does.
             Action::CancelAvb => {
                 self.state.avb_pending = None;
+                self.state.avb_confirming = false;
                 self.state.confirm = 0.0;
                 self.refresh();
             }
@@ -5573,7 +5982,7 @@ impl App {
                 return vec![Effect::Dismiss];
             }
             Action::PickEntry(op) => {
-                let path = self.entry_path();
+                let Some(path) = self.entry_path() else { return self.no_entry(now) };
                 self.state.clip = Some(Clip { op, path });
                 return self.back(now);
             }
@@ -5581,7 +5990,13 @@ impl App {
             // folder it is in stays put: the entry stays picked for another
             // folder.
             Action::Paste => {
-                let clip = self.state.clip.clone().expect("only a picked entry is pasted");
+                // A paste from a frame drawn before the copy's page came
+                // down has nothing picked any more: say so rather than
+                // ending the run.
+                let Some(clip) = self.state.clip.clone() else {
+                    self.say(l.pick(["没有选中的条目", "沒有選取的項目", "Nothing is picked to paste"]), now);
+                    return Vec::new();
+                };
                 let (path, folder) = (std::path::Path::new(&clip.path), std::path::Path::new(&self.state.files.path));
                 let name = path.file_name().map_or_else(|| clip.path.clone(), |n| n.to_string_lossy().into_owned());
                 if folder.starts_with(path) {
@@ -5597,14 +6012,20 @@ impl App {
                 self.refresh();
             }
             Action::RenameEntry => {
-                self.state.new_name = self.state.file.as_ref().expect("the file page shows an entry").name.clone();
+                let Some(name) = self.state.file.as_ref().map(|f| f.name.clone()) else { return self.no_entry(now) };
+                self.state.new_name = name;
                 self.state.layer = Layer::Letters;
                 self.open(Screen::Rename);
             }
-            Action::EditEntry => return vec![Effect::OpenText(self.entry_path())],
+            Action::EditEntry => return match self.entry_path() {
+                Some(path) => vec![Effect::OpenText(path)],
+                None => self.no_entry(now),
+            },
             Action::InstallEntry => {
-                let size = self.state.file.as_ref().expect("the file page shows an entry").size;
-                return self.install_opened(self.entry_path(), size, now);
+                let (Some(size), Some(path)) = (self.state.file.as_ref().map(|f| f.size), self.entry_path()) else {
+                    return self.no_entry(now);
+                };
+                return self.install_opened(path, size, now);
             }
             Action::SaveText => {
                 let ed = self.state.editor.as_ref().expect("the editor page shows a file");
@@ -5612,8 +6033,10 @@ impl App {
             }
             Action::OpenPermissions => self.open(Screen::Permissions),
             Action::ModeBit(bit) => {
-                let mode = self.state.file.as_ref().expect("the permissions page shows an entry").mode;
-                return vec![Effect::SetMode { path: self.entry_path(), mode: (mode ^ bit) & 0o7777 }];
+                let (Some(mode), Some(path)) = (self.state.file.as_ref().map(|f| (f.mode ^ bit) & 0o7777), self.entry_path()) else {
+                    return self.no_entry(now);
+                };
+                return vec![Effect::SetMode { path, mode }];
             }
             Action::AskDelete => {
                 self.state.asking_delete = true;
@@ -5621,7 +6044,14 @@ impl App {
                 self.refresh();
             }
             Action::Resolve(choice) => {
-                let (clip, into, _) = self.state.clash.take().expect("a choice answers a clash");
+                // The clash's page is the only place a choice is offered,
+                // and a frame drawn before it went away can still ask: with
+                // no clash left there is nothing to answer, and saying so
+                // keeps the run going.
+                let Some((clip, into, _)) = self.state.clash.take() else {
+                    self.say(l.pick(["没有要处理的同名条目", "沒有要處理的同名項目", "There is no clash left to answer"]), now);
+                    return Vec::new();
+                };
                 self.leave(true);
                 self.stack.pop();
                 self.settle_page();
@@ -5758,7 +6188,7 @@ impl App {
                 self.refresh();
             }
             Action::OpenEntry(i) => {
-                let entry = self.state.files.entry(i).clone();
+                let Some(entry) = self.state.files.entry(i).cloned() else { return Vec::new() };
                 match entry.kind {
                     FileKind::Folder { .. } | FileKind::Link { folder: true, .. } => {
                         let scroll = self.top().1;
@@ -5773,7 +6203,42 @@ impl App {
                         return self.install_opened(path, entry.size, now);
                     }
                     FileKind::File | FileKind::Link { folder: false, .. } | FileKind::Special => {
+                        self.state.file_path = None;
                         self.state.file = Some(entry);
+                        self.open(Screen::FileInfo);
+                    }
+                }
+            }
+            // What a search found is opened from its own row, whatever folder
+            // under this one it is in: a folder goes to that folder, with the
+            // box emptied, and anything else opens as it would there.
+            Action::OpenFound(i) => {
+                let Some(found) = self.state.found.as_ref().and_then(|f| f.as_ref().ok()).and_then(|list| list.get(i)).cloned() else {
+                    return Vec::new();
+                };
+                let path = found_path(&found);
+                match found.entry.kind {
+                    FileKind::Folder { .. } | FileKind::Link { folder: true, .. } => {
+                        let scroll = self.top().1;
+                        self.state.files.leave(scroll);
+                        // Opening a folder ends the search: the box asked a
+                        // question, and this is the answer being walked into.
+                        // Leaving the text there would keep the page showing
+                        // the results of a search nobody is in any more.
+                        self.state.files_query.clear();
+                        self.state.files_search = false;
+                        self.clear_found();
+                        return vec![Effect::ReadDir(found.folder)];
+                    }
+                    FileKind::File if matches!(files::file_type(&found.entry.name), FileType::Text | FileType::Code) => {
+                        return vec![Effect::OpenText(path)];
+                    }
+                    _ if installs(&found.entry) => {
+                        return self.install_opened(path, found.entry.size, now);
+                    }
+                    FileKind::File | FileKind::Link { folder: false, .. } | FileKind::Special => {
+                        self.state.file_path = Some(path);
+                        self.state.file = Some(found.entry);
                         self.open(Screen::FileInfo);
                     }
                 }
@@ -5795,7 +6260,7 @@ impl App {
                 let screen = self.screen();
                 let Screen::Choose(place) = screen else { unreachable!("only a place's folder is chosen in") };
                 let folder = self.state.folder(screen);
-                let entry = folder.entry(i).clone();
+                let Some(entry) = folder.entry(i).cloned() else { return Vec::new() };
                 let path = folder.inside(&entry.name);
                 match entry.kind {
                     FileKind::Folder { .. } | FileKind::Link { folder: true, .. } => {
@@ -5936,14 +6401,6 @@ impl App {
                     return vec![Effect::Download(release)];
                 }
             }
-            Action::StopDownload => {
-                let job = self.state.download.as_mut().expect("only a download under way is stopped");
-                if job.outcome.is_none() && !job.stopping {
-                    job.stopping = true;
-                    self.refresh();
-                    return vec![Effect::StopDownload];
-                }
-            }
             Action::InstallDownloaded => {
                 let name = self.state.newest().expect("the package installed is the newest system's").name.clone();
                 let Have::Whole(size) = self.state.have else { unreachable!("only a whole package is offered to install") };
@@ -5990,6 +6447,127 @@ impl App {
                 }
             }
             Action::Unavailable(text) => self.say(text, now),
+            // The file manager's order, chosen from the page's own list: the
+            // folder is listed again in it, and the order is kept for the
+            // rest of the start.
+            Action::SortFiles(key) => {
+                if self.state.sort != key {
+                    self.state.sort = key;
+                    self.refresh();
+                    return vec![Effect::ReadDir(self.state.files.path.clone())];
+                }
+            }
+            // One button for three orders: each tap moves on to the next and
+            // the list is read again in it.
+            Action::CycleSort => {
+                let at = SORT_KEYS.iter().position(|key| *key == self.state.sort).unwrap_or(0);
+                let next = SORT_KEYS[(at + 1) % SORT_KEYS.len()];
+                self.state.sort = next;
+                self.refresh();
+                // What the box found is ordered by the same key, so it is
+                // looked for again in the new order rather than left in the
+                // old one under a button that says otherwise.
+                if !self.state.files_query.trim().is_empty() {
+                    return self.find_files();
+                }
+                return vec![Effect::ReadDir(self.state.files.path.clone())];
+            }
+            Action::FilesSearch => {
+                if !self.state.files_search {
+                    self.state.files_search = true;
+                    self.refresh();
+                }
+            }
+            Action::CloseFilesSearch => {
+                if self.state.files_search {
+                    self.state.files_search = false;
+                    self.refresh();
+                }
+            }
+            Action::ClearFilesQuery => {
+                if !self.state.files_query.is_empty() {
+                    self.state.files_query.clear();
+                    self.state.files.keep("");
+                    self.clear_found();
+                    self.edits += 1;
+                    self.refresh();
+                }
+            }
+            // Taking a check off is what the second confirmation is for: the
+            // AVB page says what it costs, and the confirmation alone writes.
+            Action::AvbConfirmOpen => {
+                if matches!(self.state.avb_pending, Some((_, _, true))) {
+                    self.state.avb_confirming = true;
+                    self.state.confirm = 0.0;
+                    self.refresh();
+                } else {
+                    self.say(l.pick(["没有要关闭的校验", "沒有要關閉的驗證", "There is no check to turn off"]), now);
+                }
+            }
+            Action::VbmetaBackup(place) => {
+                self.state.vbmeta_notice = None;
+                return vec![Effect::VbmetaBackup { place }];
+            }
+            Action::VbmetaRestore(i) => {
+                let found = match &self.state.vbmeta_copies {
+                    Some(Ok(copies)) => copies.get(i).cloned(),
+                    _ => None,
+                };
+                match found {
+                    Some(copy) => {
+                        self.state.vbmeta_pending = Some(copy);
+                        self.state.vbmeta_notice = None;
+                        self.state.confirm = 0.0;
+                        self.refresh();
+                    }
+                    None => self.say(l.pick(["没有这个备份", "沒有這個備份", "That copy is not here"]), now),
+                }
+            }
+            Action::FindVbmeta => {
+                self.state.vbmeta_copies = None;
+                self.refresh();
+                return vec![Effect::FindVbmeta { storage: self.state.data.storage_open(), usb: self.state.usb_drive.is_some() }];
+            }
+            // Forgetting a network is the details page's, and the swipe that
+            // asks for it confirms it.
+            Action::ForgetNetwork => {
+                if self.state.details.is_some() {
+                    self.state.asking_delete = true;
+                    self.state.confirm = 0.0;
+                    self.refresh();
+                }
+            }
+            Action::ForgetSaved(i) => {
+                if let Some(saved) = self.state.saved.get(i) {
+                    self.state.forget_pending = Some(saved.name.clone());
+                    self.state.asking_delete = true;
+                    self.state.confirm = 0.0;
+                    self.refresh();
+                }
+            }
+            // Pausing is stopping the download in a way that keeps what came
+            // of it: the page then offers to go on from there.
+            Action::PauseDownload => {
+                if self.state.download.as_ref().is_some_and(|j| j.outcome.is_none() && !j.stopping) {
+                    if let Some(job) = self.state.download.as_mut() {
+                        job.stopping = true;
+                    }
+                    self.refresh();
+                    return vec![Effect::PauseDownload];
+                }
+            }
+            Action::AskDeleteDownload => {
+                if matches!(self.state.have, Have::Whole(_)) && self.state.download.as_ref().is_none_or(|j| j.outcome.is_some()) {
+                    self.state.asking_delete = true;
+                    self.state.confirm = 0.0;
+                    self.refresh();
+                }
+            }
+            Action::OpenPlugin(i) => {
+                self.state.plugin_chosen = i;
+                self.refresh();
+            }
+            Action::OpenPluginFolder => return vec![Effect::ReadDir(PLUGIN_FOLDER.to_string())],
         }
         Vec::new()
     }
@@ -5998,6 +6576,7 @@ impl App {
     fn typing(&mut self) -> &mut String {
         match self.screen() {
             Screen::Search => &mut self.state.search,
+            Screen::Files => &mut self.state.files_query,
             Screen::Decrypt => &mut self.state.code,
             Screen::Rename => &mut self.state.new_name,
             Screen::WlanPassword => &mut self.state.password,
@@ -6012,10 +6591,30 @@ impl App {
         }
     }
 
-    /// Where the entry the file page shows is.
-    fn entry_path(&self) -> String {
-        let entry = self.state.file.as_ref().expect("the file page shows an entry");
-        self.state.files.inside(&entry.name)
+    /// Where the entry the file page shows is, or `None` when no page is
+    /// describing one any more.
+    ///
+    /// The entry a page describes is taken away the moment work on it
+    /// starts, so a second touch that arrived from a frame drawn before
+    /// that finds nothing here. Saying so leaves the phone where it is;
+    /// ending the run over it would take the phone back to the home page
+    /// with the work it just began still going.
+    fn entry_path(&self) -> Option<String> {
+        let entry = self.state.file.as_ref()?;
+        // An entry a search found is in a folder the list does not show, and
+        // its own path says where: joining it to the folder on the page would
+        // name a file that is not there.
+        Some(match &self.state.file_path {
+            Some(path) => path.clone(),
+            None => self.state.files.inside(&entry.name),
+        })
+    }
+
+    /// What a page whose entry has gone says, instead of acting on nothing.
+    fn no_entry(&mut self, now: u64) -> Vec<Effect> {
+        let said = self.state.lang.pick(["没有可操作的条目", "沒有可操作的項目", "There is no entry left to act on"]);
+        self.say(said, now);
+        Vec::new()
     }
 
     /// Install the file of `size` bytes at `path` in `place`, its page
@@ -6189,6 +6788,9 @@ impl App {
                         return self.act(Action::Open(first.screen), now);
                     }
                 }
+                // Return puts the file manager's keyboard away, keeping what
+                // the box found: the list stays as it is under the box.
+                Screen::Files => return self.act(Action::CloseFilesSearch, now),
                 Screen::Decrypt if self.state.code.is_empty() => self.say(l.pick(["请输入锁屏密码", "請輸入螢幕鎖定密碼", "Enter the screen lock"]), now),
                 Screen::Decrypt => {
                     let code = std::mem::take(&mut self.state.code);
@@ -6198,15 +6800,17 @@ impl App {
                 // the user's words; an unchanged one leaves the page.
                 Screen::Rename => {
                     let name = self.state.new_name.clone();
-                    let current = &self.state.file.as_ref().expect("the file page shows an entry").name;
+                    let (Some(current), Some(path)) = (self.state.file.as_ref().map(|f| f.name.clone()), self.entry_path()) else {
+                        return self.no_entry(now);
+                    };
                     let taken = self.state.files.entries.as_ref().is_ok_and(|entries| entries.iter().any(|e| e.name == name));
                     match name.as_str() {
                         "" => self.say(l.pick(["请输入名称", "請輸入名稱", "Enter a name"]), now),
                         "." | ".." => self.say(l.pick(["名称不能为\".\"或\"..\"", "名稱不能是「.」或「..」", "A name can't be “.” or “..”"]), now),
                         _ if name.contains('/') => self.say(l.pick(["名称不能包含\"/\"", "名稱不能包含「/」", "A name can't hold “/”"]), now),
-                        _ if name == *current => return self.back(now),
+                        _ if name == current => return self.back(now),
                         _ if taken => self.say_taken(now),
-                        _ => return vec![Effect::Rename { path: self.entry_path(), name }],
+                        _ => return vec![Effect::Rename { path, name }],
                     }
                 }
                 // A password the network's protection cannot take is turned
@@ -6260,15 +6864,63 @@ impl App {
                 other => unreachable!("{other:?} shows no keyboard"),
             },
         }
-        // What is typed shows above the keyboard, which stays as it was
-        // while its keys do.
-        if matches!(cap, Cap::Char(_) | Cap::Space | Cap::Backspace) && self.state.layer == layer {
+        // The file manager's box stands in the strip held over its list, and
+        // what the box finds is that list, so both are drawn again on every
+        // key; the pages that type above their keyboard keep it as it was.
+        if self.screen() == Screen::Files {
+            if matches!(cap, Cap::Char(_) | Cap::Space | Cap::Backspace) {
+                return self.find_files();
+            }
+            self.refresh();
+        } else if matches!(cap, Cap::Char(_) | Cap::Space | Cap::Backspace) && self.state.layer == layer {
             let t = self.theme();
             self.refresh_rows(0, (t.m.h as f32 - widgets::keyboard_height(&t)).floor() as u32);
         } else {
             self.refresh();
         }
         Vec::new()
+    }
+
+    /// Look through the folders below the one shown for what the box says,
+    /// which is what its list shows while anything is typed. The folder's own
+    /// entries stay whole behind it, so emptying the box puts them back
+    /// without reading the folder again.
+    fn find_files(&mut self) -> Vec<Effect> {
+        self.state.files.keep("");
+        let query = self.state.files_query.trim().to_owned();
+        self.state.find_gen += 1;
+        let gen = self.state.find_gen;
+        if query.is_empty() {
+            self.clear_found();
+            self.refresh();
+            return Vec::new();
+        }
+        // Nothing to show until the answer comes: an older answer would be
+        // rows of the query before this one.
+        self.state.found = None;
+        self.state.finding = true;
+        self.refresh();
+        vec![Effect::FindFiles { root: self.state.files.path.clone(), query, gen, sort: self.state.sort }]
+    }
+
+    /// Forget what a search found, because its text is gone or the folder
+    /// under it has changed.
+    fn clear_found(&mut self) {
+        self.state.found = None;
+        self.state.finding = false;
+        self.state.find_gen += 1;
+    }
+
+    /// What the search `gen` found, or why it could not look: an answer to a
+    /// query typed over since is dropped, since the rows under the box are
+    /// the rows of the text that is in it now.
+    pub fn found_files(&mut self, gen: u64, found: Result<Vec<Found>, String>) {
+        if gen != self.state.find_gen {
+            return;
+        }
+        self.state.finding = false;
+        self.state.found = Some(found);
+        self.refresh();
     }
 
     pub fn touch(&mut self, ev: Touch, f: &Fonts, now: u64) -> Vec<Effect> {
@@ -6834,15 +7486,38 @@ impl App {
                     fx.push(Effect::Merge);
                 }
             }
-            Confirm::DeleteEntry => fx.push(Effect::Delete(self.entry_path())),
+            Confirm::DeleteEntry => match self.entry_path() {
+                Some(path) => fx.push(Effect::Delete(path)),
+                // The entry this page described is gone, or the work on it
+                // has already started and taken it away: say so rather than
+                // ending the run, which would take the phone to the home
+                // page while the delete it just began is still going.
+                None => return self.no_entry(now),
+            },
             // The partition has to be open; whether its users have unlocked
             // their own files makes no difference.
             Confirm::Avb => {
                 // The write refuses unless the slot still holds what the page
                 // showed, and unless the bootloader is unlocked; both are
                 // checked again where the write is made.
+                //
+                // **Turning a check off is not this arm's to do.** It is
+                // `Confirm::AvbDisable`'s alone, which the page reaches only
+                // through `Action::AvbConfirmOpen`, so that a disable is
+                // never one swipe away — not from a stale frame, not from
+                // another screen, and not from this arm. A pending disable
+                // that arrives here is sent to the step that says what it
+                // costs instead of being written.
                 match self.state.avb_pending.take() {
-                    Some((expected, check, disabled)) => fx.push(Effect::SetAvb { expected, check, disabled }),
+                    // Turning a check on can only make the phone check more,
+                    // so it keeps the single swipe.
+                    Some((expected, check, false)) => fx.push(Effect::SetAvb { expected, check, disabled: false }),
+                    Some((expected, check, true)) => {
+                        self.state.avb_pending = Some((expected, check, true));
+                        self.state.avb_confirming = true;
+                        self.state.confirm = 0.0;
+                        self.refresh();
+                    }
                     None => self.say(l.pick(["没有待确认的改动", "沒有待確認的變更", "There is no change to confirm"]), now),
                 }
             }
@@ -6897,6 +7572,45 @@ impl App {
                     self.refresh();
                 }
             }
+            // The second confirmation is the only place a check is turned
+            // off from: the page above it said what it costs, and this says
+            // it again over its own swipe.
+            Confirm::AvbDisable => match self.state.avb_pending.take() {
+                Some((expected, check, true)) => {
+                    self.state.avb_confirming = false;
+                    fx.push(Effect::SetAvb { expected, check, disabled: true });
+                }
+                other => {
+                    self.state.avb_pending = other;
+                    self.state.avb_confirming = false;
+                    self.say(l.pick(["没有要关闭的校验", "沒有要關閉的驗證", "There is no check to turn off"]), now);
+                }
+            },
+            Confirm::VbmetaRestore => match self.state.vbmeta_pending.take() {
+                Some(copy) => fx.push(Effect::VbmetaRestore { place: copy.place, name: copy.name }),
+                None => self.say(l.pick(["没有选择要写回的备份", "沒有選擇要寫回的備份", "No copy is chosen to write back"]), now),
+            },
+            // Two ways in reach this: the details page's own row, which has
+            // the network in hand, and a row of a network whose password is
+            // kept, which leaves only its name behind. Whichever asked, that
+            // is what the swipe forgets.
+            Confirm::ForgetNetwork => {
+                let name = self.state.details.take().map(|n| n.name).or_else(|| self.state.forget_pending.take());
+                self.state.asking_delete = false;
+                self.state.confirm = 0.0;
+                self.state.forget_pending = None;
+                match name {
+                    Some(name) => fx.push(Effect::ForgetWlan(name)),
+                    None => self.say(l.pick(["没有要忘记的网络", "沒有要忘記的網路", "There is no network to forget"]), now),
+                }
+            }
+            Confirm::DeleteDownload => match self.state.have {
+                Have::Whole(_) if self.state.download.as_ref().is_none_or(|j| j.outcome.is_some()) => {
+                    fx.push(Effect::DeleteDownload(self.state.newest().map_or_else(String::new, |r| r.name.clone())))
+                }
+                _ => self.say(l.pick(["没有可删除的安装包", "沒有可刪除的安裝檔", "There is no package to delete"]), now),
+            },
+            Confirm::PowerOff => fx.push(Effect::Reboot(Target::PowerOff)),
         }
         fx
     }
@@ -8448,14 +9162,49 @@ mod tests {
         app.act(Action::CancelAvb, 2000);
         assert!(app.state.avb_pending.is_none(), "the request can be taken back");
         app.act(Action::AvbToggle(avbctl::Check::Verification), 3000);
-        // The page has to draw the swipe before it can be worked, and it is
-        // the swipe that writes.
+        // The page offers no swipe at all while a disable is only asked for:
+        // what it draws is the row that opens the step saying what a disable
+        // costs. So there is no track here for a swipe to reach, stale frame
+        // or not.
         app.frame(&f, &i);
+        assert!(
+            !app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Confirm(Confirm::Avb)),
+            "a disable is never one swipe away"
+        );
+        // The second step is reached by that row, and only while a disable is
+        // pending: there is a check to turn off, so it opens.
+        app.act(Action::AvbConfirmOpen, 3500);
+        assert!(app.state.avb_confirming, "the row opens the second step");
         assert_eq!(
-            swipe(&mut app, &f, &i, Confirm::Avb),
-            vec![Effect::SetAvb { expected: state, check: avbctl::Check::Verification, disabled: true }]
+            app.state.avb_pending,
+            Some((state.clone(), avbctl::Check::Verification, true)),
+            "and the request is only a request still"
+        );
+        // The second step has its own swipe, and that one writes.
+        assert_eq!(
+            swipe(&mut app, &f, &i, Confirm::AvbDisable),
+            vec![Effect::SetAvb { expected: state, check: avbctl::Check::Verification, disabled: true }],
+            "the second step's swipe is the one that writes it"
         );
         assert!(app.state.avb_pending.is_none(), "and the request is spent");
+        assert!(!app.state.avb_confirming, "and the second step is over");
+    }
+
+    #[test]
+    fn turning_a_check_on_keeps_the_single_swipe_because_it_only_checks_more() {
+        use skyward_install::commands::avbctl;
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Avb, W, H, PPD);
+        let state = avbctl::State { suffix: "_a".into(), flags: 0b11, unlocked: true, digest: [0; 32] };
+        app.avb_read(Ok(state.clone()), None);
+        assert!(app.act(Action::AvbToggle(avbctl::Check::Verification), 1000).is_empty());
+        assert_eq!(app.state.avb_pending, Some((state.clone(), avbctl::Check::Verification, false)));
+        assert_eq!(
+            swipe(&mut app, &f, &i, Confirm::Avb),
+            vec![Effect::SetAvb { expected: state, check: avbctl::Check::Verification, disabled: false }],
+            "turning one on is the one direction that writes from a single swipe"
+        );
+        assert!(!app.state.avb_confirming, "and it never asks twice");
     }
 
     #[test]
@@ -9106,16 +9855,16 @@ mod tests {
         let snug = snug(&f, &info());
         let i = DeviceInfo { snapshot: SnapshotState::Snapshotted, ..info() };
         let mut app = App::new(Screen::Home, W, snug, PPD);
-        let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::Reboot));
+        let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::PowerOff));
         assert!(y > snug as f32, "below the screen to start with");
-        light_on(&mut app, &f, &i, Stop::Hit(Action::Open(Screen::Reboot)));
+        light_on(&mut app, &f, &i, Stop::Hit(Action::Open(Screen::PowerOff)));
         for ms in (0..3000).step_by(8) {
             app.tick(ms);
         }
-        let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::Reboot));
+        let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::PowerOff));
         assert!(y < snug as f32, "the page scrolled the lit row into view");
         press(&mut app, Key::Power, 3000);
-        assert_eq!(app.screen(), Screen::Reboot);
+        assert_eq!(app.screen(), Screen::PowerOff);
     }
 
     #[test]
@@ -9182,7 +9931,7 @@ mod tests {
         assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::About))));
         press(&mut app, Key::VolumeUp, 0);
         press(&mut app, Key::VolumeUp, 0);
-        assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::Reboot))), "up from the first goes round to the last");
+        assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::PowerOff))), "up from the first goes round to the last");
         app.tick(5000);
         let reboot = app.lit().expect("lit");
         assert!(app.shows(&reboot, app.top().1), "scrolled into view");
@@ -10408,6 +11157,127 @@ mod tests {
     }
 
     #[test]
+    fn the_file_page_searches_below_its_folder_and_one_button_cycles_the_order() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Files, W, H, PPD);
+        app.set_files(
+            "/sdcard".into(),
+            Ok(vec![
+                entry("alpha.txt", FileKind::File),
+                entry("beta.zip", FileKind::File),
+                entry("DCIM", folder(2)),
+            ]),
+            LISTED,
+        );
+        assert_eq!(app.state.files.shown_entries().len(), 3, "every entry is shown before anything is typed");
+        let frame = app.frame(&f, &i);
+        assert!(frame.pinned.is_some(), "the search box is pinned under the bar");
+        assert!(frame.dock.is_none(), "no keyboard is drawn until the box is touched");
+
+        // The keyboard arrives in the strip at the bottom, where the page
+        // cannot scroll it away. The box itself is a hit under the bar, and
+        // touching it is what brings the keys up.
+        assert!(tap(&mut app, &f, &i, Action::FilesSearch).is_empty(), "the box only opens the keys");
+        let frame = app.frame(&f, &i);
+        let dock = frame.dock.as_ref().expect("the keyboard is drawn in the strip");
+        assert!(!dock.hits.is_empty(), "the keys are reachable");
+        assert_eq!(app.screen(), Screen::Files, "the keyboard does not leave the page");
+
+        // A key in the strip is where the finger is: the dock's hits are in
+        // its own corner, and the screen adds the strip's height back. What
+        // it asks for is a walk of the folders below this one, since a name
+        // three folders down is what a search of one folder cannot find.
+        let asked = tap_at(&mut app, &f, &i, Action::Type(Cap::Char('b')), 1010);
+        assert_eq!(asked, vec![Effect::FindFiles { root: "/sdcard".into(), query: "b".into(), gen: app.state.find_gen, sort: SortKey::Name }]);
+        assert_eq!(app.state.files_query, "b");
+        assert!(app.state.finding, "the page says it is looking");
+        assert_eq!(app.state.files.shown_entries().len(), 3, "the folder's own list stays whole behind the box");
+        assert_eq!(app.frame(&f, &i).rows.as_ref().map(|r| r.count()), None, "nothing is listed until the answer comes");
+
+        // The answer is the list: a row per entry found, wherever it is.
+        app.found_files(app.state.find_gen, Ok(vec![Found { folder: "/sdcard/DCIM/Camera".into(), entry: entry("beach.jpg", FileKind::File) }]));
+        assert!(!app.state.finding);
+        assert_eq!(app.frame(&f, &i).rows.as_ref().map(|r| r.count()), Some(1), "the entry found below the folder is the list");
+
+        // One button, and it turns: name, then modified, then kind, then
+        // name. With the box holding something it looks again in the new
+        // order rather than leaving the rows in the old one.
+        assert_eq!(app.state.sort, SortKey::Name);
+        for expected in [SortKey::Modified, SortKey::Kind, SortKey::Name] {
+            let asked = tap_at(&mut app, &f, &i, Action::CycleSort, 1015);
+            assert_eq!(asked, vec![Effect::FindFiles { root: "/sdcard".into(), query: "b".into(), gen: app.state.find_gen, sort: expected }], "the tree is walked again in the new order");
+            assert_eq!(app.state.sort, expected);
+        }
+
+        // The cross on the box shows everything again, and Done puts the
+        // keyboard away without leaving the page.
+        assert!(tap_at(&mut app, &f, &i, Action::ClearFilesQuery, 1020).is_empty(), "clearing is not a listing");
+        assert!(app.state.found.is_none(), "what was found is gone with the text");
+        assert_eq!(app.state.files.shown_entries().len(), 3, "every entry comes back");
+        assert_eq!(app.frame(&f, &i).rows.as_ref().map(|r| r.count()), Some(3));
+        assert!(app.act(Action::CloseFilesSearch, 1025).is_empty());
+        assert!(app.frame(&f, &i).dock.is_none(), "the keyboard goes away");
+
+        // Another folder is another search: what was typed is not carried.
+        app.act(Action::Type(Cap::Char('a')), 1030);
+        assert_eq!(app.state.files_query, "a");
+        app.set_files("/sdcard/DCIM".into(), Ok(vec![entry("photo.jpg", FileKind::File)]), LISTED);
+        assert_eq!(app.state.files_query, "", "a folder opened is searched from nothing");
+        assert_eq!(app.state.files.shown_entries().len(), 1);
+    }
+
+    #[test]
+    fn what_a_search_found_opens_where_it_is_and_not_where_the_page_is() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Files, W, H, PPD);
+        app.set_files("/sdcard".into(), Ok(vec![entry("DCIM", folder(2))]), LISTED);
+        tap(&mut app, &f, &i, Action::FilesSearch);
+        tap_at(&mut app, &f, &i, Action::Type(Cap::Char('b')), 1000);
+        app.found_files(
+            app.state.find_gen,
+            Ok(vec![
+                Found { folder: "/sdcard/DCIM/Camera".into(), entry: entry("beach.jpg", FileKind::File) },
+                Found { folder: "/sdcard/DCIM/Camera".into(), entry: entry("backup", folder(3)) },
+            ]),
+        );
+
+        // A file found opens the page about it, and that page acts on the
+        // path it was found at: joined to the folder on the file page, its
+        // name would be a file that is not there.
+        assert!(app.act(Action::OpenFound(0), 1005).is_empty());
+        assert_eq!(app.screen(), Screen::FileInfo);
+        assert_eq!(app.state.file.as_ref().map(|e| e.name.as_str()), Some("beach.jpg"));
+        assert_eq!(app.act(Action::EditEntry, 1006), vec![Effect::OpenText("/sdcard/DCIM/Camera/beach.jpg".into())]);
+
+        // A folder found goes to that folder, and the box empties: what is
+        // typed is for the tree it was typed over.
+        app.act(Action::Back, 1007);
+        assert_eq!(app.screen(), Screen::Files);
+        assert_eq!(app.act(Action::OpenFound(1), 1011), vec![Effect::ReadDir("/sdcard/DCIM/Camera".into())]);
+        assert_eq!(app.state.files_query, "");
+        assert!(app.state.found.is_none());
+    }
+
+    #[test]
+    fn an_answer_to_a_query_typed_over_is_dropped() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Files, W, H, PPD);
+        app.set_files("/sdcard".into(), Ok(vec![entry("alpha.txt", FileKind::File)]), LISTED);
+        tap(&mut app, &f, &i, Action::FilesSearch);
+        tap_at(&mut app, &f, &i, Action::Type(Cap::Char('a')), 1000);
+        let for_a = app.state.find_gen;
+        tap_at(&mut app, &f, &i, Action::Type(Cap::Char('l')), 1001);
+        let for_al = app.state.find_gen;
+
+        // The answer to "a" arrives while the box says "al": its rows are
+        // not the rows of the text in the box, so they are not shown.
+        app.found_files(for_a, Ok(vec![Found { folder: "/sdcard".into(), entry: entry("alpha.txt", FileKind::File) }]));
+        assert!(app.state.found.is_none(), "an answer to a query typed over is not the list");
+        app.found_files(for_al, Ok(vec![Found { folder: "/sdcard/x".into(), entry: entry("alfa.txt", FileKind::File) }]));
+        assert!(app.state.found.is_some(), "the answer to what the box says now is");
+    }
+
+    #[test]
     fn the_bars_round_button_darkens_under_a_finger_on_the_frames_drawn() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Files, W, H, PPD);
@@ -11399,11 +12269,11 @@ mod tests {
         app.download_progress(Progress::Checking { done: 0, total: 7_572_375_802 }, 0);
         app.download_progress(Progress::Downloading { done: 1_000_000_000, total: 7_572_375_802 }, 12_000_000);
         assert!(app.state.downloading());
-        assert_eq!(tap(&mut app, &f, &i, Action::StopDownload), vec![Effect::StopDownload]);
-        assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::StopDownload), "stopping, it is not asked again");
+        assert_eq!(tap(&mut app, &f, &i, Action::PauseDownload), vec![Effect::PauseDownload]);
+        assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::PauseDownload), "pausing, it is not asked again");
         // An end lights the panel, and a touch just after only keeps it lit.
         app.download_ended(DownloadEnd::Stopped, Have::Part(1_000_000_000), 0);
-        assert_eq!(tap_at(&mut app, &f, &i, Action::Download, 2000), vec![Effect::Download(newest())], "a download stopped carries on");
+        assert_eq!(tap_at(&mut app, &f, &i, Action::Download, 2000), vec![Effect::Download(newest())], "a download paused carries on");
         let damaged = skyward_net::download::Failure::Damaged;
         app.download_ended(DownloadEnd::Failed(damaged.clone()), Have::Nothing, 3000);
         assert_eq!(fmt::download_failure(Lang::Hans, &damaged), "完整更新包校验失败，已删除，请重新下载。");
@@ -11439,6 +12309,7 @@ mod tests {
                 size: 42_739_608,
                 sha256: "62b66f7d13a0eb6c9af3359b5ec6f9c223fd9a86b1f8abab3e9d2646cb2ce534".into(),
             }),
+            via: None,
         }
     }
 
@@ -11576,6 +12447,35 @@ mod tests {
         assert_eq!(app.screen(), Screen::FileJob, "how it ended stays to be read");
         app.key(Key::Back, 1000);
         assert_eq!(app.screen(), Screen::Files, "back past the entry's page, which was for an entry being deleted");
+    }
+
+    /// A delete that has begun takes the entry its page described away with
+    /// it. Everything that page could still ask for from a frame drawn
+    /// before that has no entry to act on, and must say so: the run's own
+    /// `Err` and panic both restart the recovery, which starts at the home
+    /// page — a phone that goes home in the middle of deleting a file is
+    /// what that looks like to whoever is holding it.
+    #[test]
+    fn what_asks_for_an_entry_a_started_delete_took_away_says_so_and_stays() {
+        let (f, i) = (fonts(), info());
+        let mut app = in_sdcard(&f, &i);
+        hold_entry(&mut app, &f, &i, 1);
+        tap(&mut app, &f, &i, Action::AskDelete);
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::DeleteEntry), vec![Effect::Delete("/sdcard/a.zip".into())]);
+        app.file_job_started(FileTask::Delete { path: "/sdcard/a.zip".into() });
+        // The page that described the entry is gone with it.
+        assert_eq!(app.state.file, None, "the work takes the entry it describes");
+        for (action, at) in [
+            (Action::EditEntry, 1000),
+            (Action::InstallEntry, 1001),
+            (Action::RenameEntry, 1002),
+            (Action::PickEntry(FileOp::Copy), 1003),
+            (Action::ModeBit(0o100), 1004),
+            (Action::Confirm(Confirm::DeleteEntry), 1005),
+        ] {
+            assert!(app.act(action, at).is_empty(), "{action:?} asks for an entry that is gone");
+            assert_eq!(app.screen(), Screen::FileJob, "{action:?} leaves the work's page up");
+        }
     }
 
     #[test]

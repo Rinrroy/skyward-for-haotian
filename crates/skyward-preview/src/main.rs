@@ -1494,6 +1494,7 @@ fn skyward_newest() -> Newest {
             size: 43_145_196,
             sha256: "9f6165079529418d8f6635beddfdd9abf9a70c89d69eb467a9922b0db69bfaf1".into(),
         }),
+        via: None,
     }
 }
 

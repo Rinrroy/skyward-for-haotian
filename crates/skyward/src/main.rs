@@ -15,6 +15,8 @@ mod decrypt;
 #[cfg(target_os = "android")]
 mod filework;
 #[cfg(target_os = "android")]
+mod find;
+#[cfg(target_os = "android")]
 mod haptics;
 #[cfg(target_os = "android")]
 mod input;
@@ -22,6 +24,8 @@ mod input;
 mod merge;
 #[cfg(target_os = "android")]
 mod partwork;
+#[cfg(target_os = "android")]
+mod plugins;
 #[cfg(target_os = "android")]
 mod pty;
 #[cfg(target_os = "android")]
@@ -42,6 +46,8 @@ mod systems;
 mod ui;
 #[cfg(target_os = "android")]
 mod updates;
+#[cfg(target_os = "android")]
+mod vbmeta;
 #[cfg(target_os = "android")]
 mod wipe;
 #[cfg(target_os = "android")]

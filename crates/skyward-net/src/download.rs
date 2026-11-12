@@ -27,6 +27,16 @@ pub fn partial(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// The package called `name` in `folder`, where `name` is a package's own
+/// name: one plain path component, with nothing in it that leads out of the
+/// folder. The name comes from the update server, and what it names is
+/// deleted, so a name that does not hold up here is no package at all.
+pub fn package(folder: &Path, name: &str) -> Option<PathBuf> {
+    let only = Path::new(name);
+    let plain = matches!(only.components().next(), Some(std::path::Component::Normal(_))) && only.components().count() == 1;
+    plain.then(|| folder.join(only))
+}
+
 /// How far a download has come.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Progress {
@@ -124,6 +134,18 @@ fn hex(digest: &[u8]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// How much of the package a download already holds, to go on from: what is
+/// in the part, which is what the range it asks for starts at. A part longer
+/// than the package cannot be of it — the server now offers something else —
+/// so nothing of it is kept.
+fn resume_from(have: u64, total: u64) -> u64 {
+    if have > total {
+        0
+    } else {
+        have
+    }
+}
+
 /// Download `url` to `path`, carrying on from what an earlier download
 /// left, and give it its name once it has the digest `sum`. A part as long
 /// as the package is only checked; a server that will not send from the
@@ -147,10 +169,10 @@ fn fetch_as<D: Digest>(agent: &ureq::Agent, url: &str, path: &Path, sum: &str, s
     }
     let total = content_length(head.headers()).context("the server does not say how long the package is")?;
     let mut file = OpenOptions::new().create(true).read(true).append(true).open(&part).with_context(|| format!("open {}", part.display()))?;
-    let mut have = file.metadata().with_context(|| format!("read {}", part.display()))?.len();
-    if have > total {
+    let held = file.metadata().with_context(|| format!("read {}", part.display()))?.len();
+    let mut have = resume_from(held, total);
+    if have != held {
         file.set_len(0).with_context(|| format!("empty {}", part.display()))?;
-        have = 0;
     }
     let room = free(dir)?;
     if total - have > room {
@@ -214,6 +236,24 @@ mod tests {
     #[test]
     fn a_part_is_named_after_its_package() {
         assert_eq!(partial(Path::new("/sdcard/downloaded_rom/a.zip")), Path::new("/sdcard/downloaded_rom/a.zip.part"));
+    }
+
+    #[test]
+    fn a_package_is_named_by_one_component_that_cannot_lead_out_of_its_folder() {
+        let folder = Path::new("/sdcard/downloaded_rom");
+        assert_eq!(package(folder, "ishtar-ota_full-OS3.0.310.0.WMACNXM.zip"), Some(folder.join("ishtar-ota_full-OS3.0.310.0.WMACNXM.zip")));
+        assert_eq!(package(folder, ""), None, "nothing is no package");
+        for led_away in ["../locksettings.db", "..", ".", "/sdcard/a.zip", "a/../../b.zip", "a/b.zip"] {
+            assert_eq!(package(folder, led_away), None, "{led_away} leads out of the folder");
+        }
+    }
+
+    #[test]
+    fn a_download_goes_on_from_what_its_part_holds_but_not_from_more_than_the_package() {
+        assert_eq!(resume_from(0, 100), 0);
+        assert_eq!(resume_from(40, 100), 40, "a paused download goes on from its part's own length");
+        assert_eq!(resume_from(100, 100), 100, "a part as long as the package is only checked");
+        assert_eq!(resume_from(101, 100), 0, "a longer part is of another package and is let go");
     }
 
     #[test]

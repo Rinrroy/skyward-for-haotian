@@ -1,4 +1,4 @@
-use crate::app::{Action, FileKind, FileRow, Hit, Pinned, Rows};
+use crate::app::{Action, FileKind, FileRow, Found, Hit, Pinned, Rows};
 use crate::canvas::Canvas;
 use crate::color::{mix, Rgba};
 use crate::fmt;
@@ -27,9 +27,19 @@ const ARROW_GAP_DP: f32 = 6.0;
 const ARROW_DP: f32 = 14.0;
 /// Where the first row starts on an unscrolled page.
 pub const ROWS_TOP_DP: f32 = 223.7;
+/// How much taller the file manager's header is than its path: the row the
+/// search box and the button that changes the order stand in, above it.
+pub const HEAD_DP: f32 = 56.0;
+/// Where the first row starts on a page whose header holds that row too.
+pub const SEARCHED_ROWS_TOP_DP: f32 = ROWS_TOP_DP + HEAD_DP;
 const ROW_DP: f32 = 72.0;
 /// What a second line of name adds to a row.
 const NAME_LINE_DP: f32 = 22.33;
+/// What the line naming the folder of an entry a search found adds to its
+/// row, and where that line's ink sits below the line it follows.
+const FOUND_LINE_DP: f32 = 20.0;
+const FOUND_BASE_DP: f32 = 13.0;
+const FOUND_DP: f32 = 10.4;
 const SIDE_DP: f32 = 28.0;
 const ICON_DP: f32 = 40.0;
 const TEXT_X_DP: f32 = 84.0;
@@ -204,13 +214,12 @@ fn middle(c: &Canvas, face: &Face, px: f32, text: &str, w: f32) -> String {
     format!("{}…{}", chars[..left].iter().collect::<String>(), chars[right..].iter().collect::<String>())
 }
 
-/// The list's rows for `entries`, the first starting where an unscrolled
-/// page puts it, each touched for `action`; a row grows by a line for a
-/// name on two.
-pub fn rows(t: &Theme, f: &Fonts, entries: &[FileRow], action: fn(usize) -> Action) -> Rows {
+/// The list's rows for `entries`, the first starting `top` dp down the page,
+/// each touched for `action`; a row grows by a line for a name on two.
+pub fn rows(t: &Theme, f: &Fonts, top: f32, entries: &[&FileRow], action: fn(usize) -> Action) -> Rows {
     let m = &t.m;
     let w = name_width(t);
-    let mut y = m.dp(ROWS_TOP_DP).round();
+    let mut y = m.dp(top).round();
     let mut edges = Vec::with_capacity(entries.len() + 1);
     edges.push(y);
     for e in entries {
@@ -219,6 +228,47 @@ pub fn rows(t: &Theme, f: &Fonts, entries: &[FileRow], action: fn(usize) -> Acti
         edges.push(y);
     }
     Rows { edges, action: Some(action) }
+}
+
+/// The rows of what a search found, each a line taller than a folder's own
+/// rows: the folder the entry is in is written under it, because one list of
+/// a whole tree can hold two entries of the same name.
+pub fn found_rows(t: &Theme, f: &Fonts, top: f32, found: &[&Found], action: fn(usize) -> Action) -> Rows {
+    let m = &t.m;
+    let w = name_width(t);
+    let mut y = m.dp(top).round();
+    let mut edges = Vec::with_capacity(found.len() + 1);
+    edges.push(y);
+    for e in found {
+        let lines = name_lines(&f.heading, m.dp(NAME_DP), &e.entry.name, w).len();
+        y += (m.dp(ROW_DP) + m.dp(NAME_LINE_DP) * (lines - 1) as f32 + m.dp(FOUND_LINE_DP)).round();
+        edges.push(y);
+    }
+    Rows { edges, action: Some(action) }
+}
+
+/// What a search found, drawn as its entry's row with the folder it is in
+/// under it, named from the folder searched in rather than from the top of
+/// the filesystem.
+#[allow(clippy::too_many_arguments)]
+pub fn found_row(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, found: &Found, root: &str, now: i64, zone: usize) {
+    row(c, t, f, l, &found.entry, now, zone);
+    let m = &t.m;
+    let (x, w) = (m.dp(TEXT_X_DP), name_width(t));
+    let lines = name_lines(&f.heading, m.dp(NAME_DP), &found.entry.name, w).len();
+    let y = m.dp(LINE_BASE_DP + NAME_LINE_DP * (lines - 1) as f32 + FOUND_BASE_DP);
+    c.text(&f.value, &in_folder(&found.folder, root), x, y, m.dp(FOUND_DP), palette(t).note, Some(w));
+}
+
+/// The folder a found entry is in, said from the one searched in: the part
+/// of the path below it, or the folder searched in itself for an entry of
+/// that folder.
+fn in_folder(folder: &str, root: &str) -> String {
+    let under = Path::new(folder).strip_prefix(root).map(|rest| rest.to_string_lossy().into_owned()).unwrap_or_default();
+    match under.trim_matches('/') {
+        "" => Path::new(root).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| folder.to_string()),
+        rest => rest.to_string(),
+    }
 }
 
 /// Entry `e`'s row over the whole of `c`, sized for it: its icon, its name
@@ -471,13 +521,68 @@ pub fn strip(t: &Theme, f: &Fonts, top: &str, folder: &str) -> Pinned {
     Pinned { canvas: c, top: m.dp(STRIP_TOP_DP), hits }
 }
 
-/// What the page says in place of the list, centred below the path, with
-/// the reason under it when there is one.
-pub fn note(c: &mut Canvas, t: &Theme, f: &Fonts, title: &str, why: Option<&str>) {
+/// What the file manager holds still over its list: the search box with the
+/// button that changes the order beside it, over the path. Every rect is in
+/// the strip's own coordinates, so a touch lands on the numbers it was
+/// drawn at.
+pub struct Head {
+    pub pinned: Pinned,
+    pub field: Rect,
+    pub clear: Option<Rect>,
+    pub order: Rect,
+}
+
+impl Head {
+    /// The strip as a page takes it, with the box, its clear button and the
+    /// order button answering to `field`, `clear` and `order`.
+    ///
+    /// The clear button is offered before the box, because it is drawn
+    /// inside the box's right end: the first hit that holds a finger is the
+    /// one that answers, and a cross that cannot be pressed because the
+    /// field was registered first is a cross that does nothing.
+    pub fn hits(mut self, field: Action, clear: Action, order: Action) -> Pinned {
+        if let Some(rect) = self.clear {
+            self.pinned.hits.push(Hit { rect, action: clear });
+        }
+        self.pinned.hits.push(Hit { rect: self.field, action: field });
+        self.pinned.hits.push(Hit { rect: self.order, action: order });
+        self.pinned
+    }
+}
+
+/// The strip the file manager holds still over its list: the path to
+/// `folder` under `top`, and under it the box holding `query` typed so far
+/// (or `hint` while there is none) with the order it is in, `order`, on its
+/// right.
+pub fn head(t: &Theme, f: &Fonts, query: &str, hint: &str, order: &str, top: &str, folder: &str) -> Head {
+    let m = &t.m;
+    let path = strip(t, f, top, folder);
+    let down = m.dp(HEAD_DP).round() as i32;
+    let mut c = Canvas::new(m.w, path.canvas.h + down as u32);
+    c.clear(palette(t).page);
+    // The path stays where it has always been, directly under the bar, so a
+    // folder's name does not move when the box arrives beneath it.
+    c.put(&path.canvas, 0);
+    let cy = path.canvas.h as f32 + down as f32 / 2.0;
+    let order = widgets::order_button(&mut c, t, f, m.w as f32 - m.margin, cy, order);
+    let field = Rect::new(m.margin, cy - m.search_h / 2.0, order.x - m.dp(10.0) - m.margin, m.search_h);
+    let clear = widgets::search_box(&mut c, t, f, field, query, hint);
+    // The box's own hit stops at the cross, so the two never answer for the
+    // same finger.
+    let field = match clear {
+        Some(disc) => Rect { w: disc.x - m.dp(6.0) - field.x, ..field },
+        None => field,
+    };
+    Head { pinned: Pinned { canvas: c, top: path.top, hits: path.hits }, field, clear, order }
+}
+
+/// What the page says in place of the list, `top` dp down the page (where
+/// its rows would have started), with the reason under it when there is one.
+pub fn note(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, title: &str, why: Option<&str>) {
     let m = &t.m;
     let p = palette(t);
     let cx = m.w as f32 / 2.0;
-    let cy = m.dp(ROWS_TOP_DP + NOTE_DP);
+    let cy = m.dp(top + NOTE_DP);
     c.text_center(&f.body, title, cx, cy, m.dp(NOTE_TEXT_DP), p.note);
     let Some(why) = why else { return };
     let lines = widgets::wrap(c, &f.body, why, m.sub_px, m.w as f32 - m.dp(SIDE_DP) * 2.0);

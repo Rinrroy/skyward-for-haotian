@@ -5,10 +5,15 @@
 //! a time zone, a part or a place by its name, so a later version that lists
 //! them otherwise reads them the same.
 
-use crate::app::{Place, State, SCREEN_OFF, TIME_ZONES};
+use crate::app::{Place, SortKey, State, SCREEN_OFF, TIME_ZONES};
 use crate::Lang;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+/// What a switch that is not named in the file is: on.
+fn yes() -> bool {
+    true
+}
 
 /// How long settings stand unchanged before they are written, so a slider
 /// dragged across the page is written once, after the hand stops.
@@ -19,6 +24,9 @@ const PARTS: [&str; 4] = ["boot", "system", "data", "modem"];
 /// Where a backup goes, by name.
 const STORAGE: &str = "storage";
 const USB_DRIVE: &str = "usb_drive";
+/// The orders the file manager can show a folder in, by name, in the order
+/// its page offers them.
+const SORTS: [&str; 3] = ["name", "modified", "kind"];
 /// The logs exported, and where they go, by name, in the order of the page
 /// that exports them.
 const LOGS: [&str; 2] = ["recovery", "kernel"];
@@ -64,6 +72,16 @@ pub struct Settings {
     /// Remember the screen lock that opens the data partition, and try it
     /// by itself at the next start.
     pub remember_password: bool,
+    /// The order the file manager shows a folder in, by name: by name,
+    /// modified or kind.
+    pub sort: String,
+    /// The recovery's own update reaches GitHub through a mirror in the
+    /// mainland. A file that names none leaves it on: the check asks GitHub
+    /// first either way, so the mirror is only tried when that does not
+    /// answer, and a phone that cannot reach GitHub at all is the phone this
+    /// is for.
+    #[serde(default = "yes")]
+    pub mirror: bool,
     pub install: Install,
     pub backup: Backup,
     pub logs: Logs,
@@ -145,6 +163,13 @@ impl Settings {
             double_tap: state.double_tap,
             disable_avb: state.disable_avb,
             remember_password: state.remember_password,
+            sort: SORTS[match state.sort {
+                SortKey::Name => 0,
+                SortKey::Modified => 1,
+                SortKey::Kind => 2,
+            }]
+            .to_string(),
+            mirror: state.mirror,
             install: Install { check_signature: state.check_signature, keep_recovery: state.keep_recovery },
             backup: Backup {
                 parts: names(&state.backup, &PARTS),
@@ -207,6 +232,12 @@ impl Settings {
         state.double_tap = self.double_tap;
         state.disable_avb = self.disable_avb;
         state.remember_password = self.remember_password;
+        state.mirror = self.mirror;
+        // A name this version does not know leaves the order as it is, as an
+        // unknown time zone or place does.
+        if let Some(at) = SORTS.iter().position(|name| *name == self.sort) {
+            state.sort = [SortKey::Name, SortKey::Modified, SortKey::Kind][at];
+        }
         state.check_signature = self.install.check_signature;
         state.keep_recovery = self.install.keep_recovery;
         state.backup = picked(&self.backup.parts, &PARTS);
@@ -343,6 +374,23 @@ mod tests {
         // the phone must not carry it.
         let text = Settings::of(&State { remembered: Some("1234".into()), ..state }).text();
         assert!(!text.contains("1234"), "the credential is not in the settings file");
+    }
+
+    #[test]
+    fn the_mirror_is_on_unless_the_file_says_otherwise() {
+        // A phone that has never reached the settings page still tries the
+        // mirror, because the check asks GitHub first either way: the only
+        // phone the mirror takes anything away from is one whose owner
+        // turned it off.
+        let mut fresh = State::default();
+        Settings::of(&State::default()).apply(&mut fresh);
+        assert!(fresh.mirror, "the mirror is on before anything is chosen");
+        assert!(Settings::read("{}").unwrap().mirror, "a file naming no mirror leaves it on");
+
+        let off = Settings::of(&State { mirror: false, ..State::default() }).text();
+        let mut back = State::default();
+        Settings::read(&off).unwrap().apply(&mut back);
+        assert!(!back.mirror, "a switch turned off stays off across a start");
     }
 
     #[test]

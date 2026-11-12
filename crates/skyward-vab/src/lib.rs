@@ -8,6 +8,7 @@ use std::path::Path;
 pub mod boot;
 mod partitions;
 pub mod snapshots;
+pub mod vbmeta;
 
 pub use partitions::{
     check_merge, map_slot, map_whole, mount_one, mount_partitions, mount_point, mounted_partitions, release_partitions, slot_bases,

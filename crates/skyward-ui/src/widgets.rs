@@ -1134,6 +1134,44 @@ pub fn search_field(c: &mut Canvas, t: &Theme, f: &Fonts, x: f32, w: f32, cy: f3
     SearchField { field, clear, caret }
 }
 
+/// The search field showing `text`, or its placeholder while there is none,
+/// in `r`: the file manager's, which stands still under the bar over a list
+/// that scrolls, so it draws no cursor of its own — the field is redrawn
+/// only when what it says changes, and a cursor that could not blink would
+/// only look broken. Returns where the button that clears it is, while
+/// there is something to clear.
+pub fn search_box(c: &mut Canvas, t: &Theme, f: &Fonts, r: Rect, text: &str, placeholder: &str) -> Option<Rect> {
+    let (_, clear, _) = draw_search_field(c, t, f, r.x, r.w, r.y + r.h / 2.0, text, placeholder, false);
+    clear
+}
+
+/// The button beside it that changes the order a list is in: its right edge
+/// at `right`, its middle at `cy`, the order it is in now in `label`, and a
+/// pair of arrows saying it moves on to the next one when touched. Its
+/// arrows are drawn as strokes rather than set as characters, because the
+/// typeface test reads every string in this crate and asks the bundled font
+/// for each character: a glyph nobody draws would fail it. Returns where it
+/// was drawn.
+pub fn order_button(c: &mut Canvas, t: &Theme, f: &Fonts, right: f32, cy: f32, label: &str) -> Rect {
+    let m = &t.m;
+    let px = m.row_title_px;
+    let h = m.search_h;
+    let w = (c.text_width(&f.heading, label, px) + m.dp(52.0)).max(m.dp(78.0));
+    let r = Rect::new(right - w, cy - h / 2.0, w, h);
+    c.fill_round_rect(r.x, r.y, w, h, h / 2.0, t.pal.search);
+    let arm = m.dp(3.4);
+    let (ax, rise) = (r.x + w - m.dp(15.0), m.dp(1.0));
+    let sw = m.dp(1.4);
+    // Two chevrons, one up and one down: the order, and the one after it.
+    c.line(ax - arm, cy - rise - arm, ax, cy - rise, sw, t.pal.search_icon);
+    c.line(ax, cy - rise, ax + arm, cy - rise - arm, sw, t.pal.search_icon);
+    c.line(ax - arm, cy + rise + arm, ax, cy + rise, sw, t.pal.search_icon);
+    c.line(ax, cy + rise, ax + arm, cy + rise + arm, sw, t.pal.search_icon);
+    let (from, to) = (r.x + m.dp(13.0), ax - arm - m.dp(5.0));
+    c.text_center(&f.heading, label, (from + to) / 2.0, cy, px, t.pal.text);
+    r
+}
+
 /// Draw the search field, with its cursor if `caret`; returns where the
 /// field, its clear button and the cursor are.
 #[allow(clippy::too_many_arguments)]
@@ -1274,6 +1312,12 @@ pub fn paragraph(c: &mut Canvas, t: &Theme, f: &Fonts, y: f32, text: &str) -> f3
 /// them for the gesture area. Returns the bar and where each button is on
 /// it.
 pub fn dock_bar(t: &Theme, f: &Fonts, bg: Rgba, labels: &[&str]) -> (Canvas, Vec<Rect>) {
+    chosen_bar(t, f, bg, labels, labels.len().checked_sub(1))
+}
+
+/// The same bar with the button `chosen` in the accent colour instead of
+/// the last one: what a bar of choices is of, which one is on.
+pub fn chosen_bar(t: &Theme, f: &Fonts, bg: Rgba, labels: &[&str], chosen: Option<usize>) -> (Canvas, Vec<Rect>) {
     let m = &t.m;
     let (h, pad, gap) = (m.dp(48.0), m.dp(12.0), m.dp(12.0));
     let mut c = Canvas::new(m.w, (pad + h + m.dp(KEYBOARD_BOTTOM_DP)).ceil() as u32);
@@ -1283,7 +1327,7 @@ pub fn dock_bar(t: &Theme, f: &Fonts, bg: Rgba, labels: &[&str]) -> (Canvas, Vec
     let mut rects = Vec::new();
     for (k, label) in labels.iter().enumerate() {
         let x = m.margin + k as f32 * (w + gap);
-        let (fill, ink) = if k + 1 == labels.len() { (t.pal.accent, Rgba::rgb(255, 255, 255)) } else { (t.pal.search, t.pal.text) };
+        let (fill, ink) = if chosen == Some(k) { (t.pal.accent, Rgba::rgb(255, 255, 255)) } else { (t.pal.search, t.pal.text) };
         c.fill_round_rect(x, pad, w, h, h / 2.0, fill);
         c.text_center(&f.heading, label, x + w / 2.0, pad + h / 2.0, m.row_title_px, ink);
         rects.push(Rect::new(x, pad, w, h));

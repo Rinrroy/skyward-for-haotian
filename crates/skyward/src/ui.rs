@@ -326,10 +326,16 @@ fn asked(request: &bcb::Request) -> Asked {
 /// whose own files are still closed says so in place of its entries: the
 /// names in it cannot be read until that user's credential is given.
 fn list(app: &mut App, folder: String, closed: &[Closed]) -> Result<()> {
-    let files = match closed_to_user(closed, Path::new(&folder)) {
+    let mut files = match closed_to_user(closed, Path::new(&folder)) {
         Some((_, why)) => Err(why),
         None => read_folder(Path::new(&folder)).map_err(|e| format!("{e:#}")),
     };
+    // The order is the file page's own switch, applied in the one place an
+    // order is decided: `sort` is the only function that orders a listing, so
+    // a folder cannot come out one way here and another way there.
+    if let Ok(rows) = &mut files {
+        skyward_ui::sort::sort(rows, app.state.sort);
+    }
     app.set_files(folder, files, unix_now()?);
     Ok(())
 }
@@ -367,7 +373,13 @@ fn closed_to_user(closed: &[Closed], path: &Path) -> Option<(u32, String)> {
 /// Read a folder of `place` to choose a file to install in, as it is now;
 /// `folder` is its path from the place's top.
 fn list_place(app: &mut App, place: Place, folder: String) -> Result<()> {
-    let files = read_folder(&in_place(place, &folder)).map_err(|e| format!("{e:#}"));
+    let mut files = read_folder(&in_place(place, &folder)).map_err(|e| format!("{e:#}"));
+    // A place's list is for choosing something to install, not for browsing,
+    // so it is always by name: the file page's switch has nothing to mean
+    // here.
+    if let Ok(rows) = &mut files {
+        skyward_ui::sort::sort(rows, skyward_ui::app::SortKey::Name);
+    }
     app.set_place(place, folder, files, unix_now()?);
     Ok(())
 }
@@ -951,44 +963,60 @@ fn waiting_of(closed: &[Closed]) -> Vec<skyward_crypto::users::Waiting> {
 /// links to folders first, then by name ignoring case, each folder with how
 /// many entries it holds. An entry gone by the time it is looked at, as
 /// processes in /proc go, is left out.
-fn read_folder(path: &Path) -> Result<Vec<FileRow>> {
-    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+pub(crate) fn read_folder(path: &Path) -> Result<Vec<FileRow>> {
     let mut rows = Vec::new();
     for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
         let full = entry.with_context(|| format!("read {}", path.display()))?.path();
-        let meta = match fs::symlink_metadata(&full) {
-            Ok(meta) => meta,
-            Err(e) if gone(&e) => continue,
-            Err(e) => return Err(e).with_context(|| format!("stat {}", full.display())),
-        };
-        let kind = if meta.file_type().is_symlink() {
-            let target = fs::read_link(&full).with_context(|| format!("read the link {}", full.display()))?;
-            // A link to nothing leads to no folder.
-            let folder = match fs::metadata(&full) {
-                Ok(to) => to.is_dir(),
-                Err(e) if gone(&e) => false,
-                Err(e) => return Err(e).with_context(|| format!("follow {}", full.display())),
-            };
-            FileKind::Link { target: target.to_string_lossy().into_owned(), folder }
-        } else if meta.is_dir() {
-            // A folder that may not be read shows that in place of a count.
-            let items = match fs::read_dir(&full) {
-                Ok(inside) => Some(inside.count()),
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
-                Err(e) if gone(&e) => continue,
-                Err(e) => return Err(e).with_context(|| format!("read {}", full.display())),
-            };
-            FileKind::Folder { items }
-        } else if meta.is_file() {
-            FileKind::File
-        } else {
-            FileKind::Special
-        };
-        let name = full.file_name().with_context(|| format!("{} has no name", full.display()))?.to_string_lossy().into_owned();
-        rows.push(FileRow { name, kind, size: meta.len(), modified: meta.mtime(), mode: meta.mode(), uid: meta.uid(), gid: meta.gid() });
+        if let Some(row) = read_row(&full)? {
+            rows.push(row);
+        }
     }
-    rows.sort_by_key(|r| (!matches!(r.kind, FileKind::Folder { .. } | FileKind::Link { folder: true, .. }), r.name.to_lowercase()));
+    // The order is not decided here: `skyward_ui::sort::sort` is the one
+    // place that decides one, so that the file page's switch and the choose
+    // pages cannot disagree with each other about the same folder.
     Ok(rows)
+}
+
+/// What the file manager shows for one entry of a folder: its name, what
+/// kind of thing it is, and the size, time and owner its row says. `Ok(None)`
+/// is an entry gone by the time it is looked at, as processes in /proc go.
+///
+/// This is the only place one entry is looked at closely, so that a walk of
+/// a whole tree can ask it about the entries it is going to show and not
+/// about every entry it passes: a stat per entry, and a count of the
+/// contents of every folder passed, is what makes such a walk slow.
+pub(crate) fn read_row(full: &Path) -> Result<Option<FileRow>> {
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let meta = match fs::symlink_metadata(full) {
+        Ok(meta) => meta,
+        Err(e) if gone(&e) => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("stat {}", full.display())),
+    };
+    let kind = if meta.file_type().is_symlink() {
+        let target = fs::read_link(full).with_context(|| format!("read the link {}", full.display()))?;
+        // A link to nothing leads to no folder.
+        let folder = match fs::metadata(full) {
+            Ok(to) => to.is_dir(),
+            Err(e) if gone(&e) => false,
+            Err(e) => return Err(e).with_context(|| format!("follow {}", full.display())),
+        };
+        FileKind::Link { target: target.to_string_lossy().into_owned(), folder }
+    } else if meta.is_dir() {
+        // A folder that may not be read shows that in place of a count.
+        let items = match fs::read_dir(full) {
+            Ok(inside) => Some(inside.count()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(e) if gone(&e) => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("read {}", full.display())),
+        };
+        FileKind::Folder { items }
+    } else if meta.is_file() {
+        FileKind::File
+    } else {
+        FileKind::Special
+    };
+    let name = full.file_name().with_context(|| format!("{} has no name", full.display()))?.to_string_lossy().into_owned();
+    Ok(Some(FileRow { name, kind, size: meta.len(), modified: meta.mtime(), mode: meta.mode(), uid: meta.uid(), gid: meta.gid() }))
 }
 
 /// The slot's logical partitions and how each shows now, for the mount page.
@@ -1206,6 +1234,10 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     let locale = request.locale.as_deref().or(info.locale.as_deref());
     let named = locale.map(Lang::for_locale).transpose()?;
     app.take_settings(kept.settings(), named);
+    // Whether the update reaches for a mirror is settled before the first
+    // frame, so a file that says no is honoured without the switch being
+    // touched. Nothing here can fail the run: `set` writes a flag.
+    skyward_net::mirror::set(app.state.mirror);
     let mut keeper = Keeper::new(&kept);
     skyward_sys::kmsg(&format!(
         "the pages speak {:?}, {}, and the locale named is {}",
@@ -2216,6 +2248,15 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 app.set_traffic(t);
             }
         }
+        // What the phone keeps of the networks joined, and one just
+        // forgotten: each comes back only when it has changed, so nothing is
+        // redrawn for nothing.
+        if let Some(saved) = wlan.as_ref().and_then(wlan::Worker::saved) {
+            app.set_saved(saved);
+        }
+        if let Some(forgot) = wlan.as_ref().and_then(wlan::Worker::forgotten) {
+            app.wlan_forgotten(forgot, now);
+        }
         // The WLAN page scans again now and then while it shows, as the
         // stock settings do.
         let wlan_on = app.state.wlan.as_ref().is_some_and(|w| w.power == WlanPower::On);
@@ -2697,6 +2738,32 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         };
                         app.avb_read(state, Some(notice));
                     }
+                    // A copy of the slot's vbmeta is kept beside the backups,
+                    // and put back from there. Both are writes to a partition
+                    // and follow the rule a flag change follows: nothing else
+                    // may be writing partitions, and what is written is read
+                    // back before it is believed. The rollback index is
+                    // checked where the write is made, against the partition
+                    // as it is now.
+                    Effect::VbmetaBackup { place } => app.vbmeta_notice(crate::vbmeta::keep(place, app.state.lang)),
+                    Effect::VbmetaRestore { place, name } => {
+                        let busy = installer.is_some() || part_worker.is_some() || eraser.is_some() || backuper.is_some() || skyward_updater.is_some();
+                        if busy {
+                            let said = app.state.lang.pick([
+                                "其他分区操作尚未结束，暂不能写回 vbmeta。",
+                                "其他分割區操作尚未結束，暫不能寫回 vbmeta。",
+                                "Another partition operation is active; vbmeta cannot be written back yet.",
+                            ]);
+                            app.vbmeta_notice(said.to_string());
+                        } else {
+                            app.vbmeta_notice(crate::vbmeta::write_back(place, &name, app.state.lang));
+                        }
+                    }
+                    Effect::FindVbmeta { storage, usb } => app.set_vbmeta_copies(crate::vbmeta::find(storage, usb)),
+                    // Listing plugins reads files someone else put there, so
+                    // it cannot be allowed to end the run: a folder that
+                    // cannot be read is a row saying so, and the page stays.
+                    Effect::ReadPlugins => app.set_plugins(crate::plugins::read(app.state.lang)),
                     Effect::RememberPassword(code) => match code {
                         Some(credential) => match crate::remembered::save(&credential) {
                             Ok(()) => app.state.remembered = Some(credential),
@@ -2712,11 +2779,29 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         }
                     },
                     Effect::ReadDir(folder) => list(&mut app, folder, &closed)?,
+                    // The box's answer is bounded work done here rather than
+                    // on a thread of its own: it stops at a couple of
+                    // thousand folders, so the page waits a moment and the
+                    // run cannot be held by a tree that never ends. Failing
+                    // to walk it says so on the page; it does not end the run.
+                    Effect::FindFiles { root, query, gen, sort } => {
+                        let found = crate::find::find(Path::new(&root), &query, sort).map_err(|e| format!("{e:#}"));
+                        app.found_files(gen, found);
+                    }
                     Effect::ReadPlace(place, folder) => list_place(&mut app, place, folder)?,
                     // A name taken where an entry goes is the user's to
                     // decide on before anything is written.
                     Effect::Paste { op, path, into, clash } => {
-                        ensure!(worker.is_none(), "work on files is under way already");
+                        if worker.is_some() {
+                            // A second paste asked for while the first is
+                            // still going comes from a frame drawn before
+                            // the work began. Dropping it leaves the run
+                            // going, where ending it would take the phone
+                            // back to the home page mid-copy.
+                            let _ = skyward_sys::kmsg("work on files is under way already; the paste asked for is dropped");
+                            app.report(app.state.lang.pick(["文件操作还在进行", "檔案操作還在進行", "Work on files is already under way"]), now);
+                            continue;
+                        }
                         let clash = match clash {
                             Some(choice) => clash_rule(choice),
                             None => match skyward_files::clashes(&[PathBuf::from(&path)], Path::new(&into)) {
@@ -2748,15 +2833,33 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         app.file_job_started(shown);
                     }
                     Effect::Delete(path) => {
-                        ensure!(worker.is_none(), "work on files is under way already");
+                        if worker.is_some() {
+                            // As with a paste: a delete asked for twice is
+                            // dropped, never allowed to end the run.
+                            let _ = skyward_sys::kmsg("work on files is under way already; the delete asked for is dropped");
+                            app.report(app.state.lang.pick(["文件操作还在进行", "檔案操作還在進行", "Work on files is already under way"]), now);
+                            continue;
+                        }
                         worker = Some(filework::Worker::start(filework::Task::Delete { path: PathBuf::from(&path) })?);
                         app.file_job_started(FileTask::Delete { path });
                     }
-                    Effect::StopJob => worker.as_ref().context("there is no work on files to stop")?.stop(),
+                    // Stopping what is not running is a tap from a frame
+                    // drawn before the work ended, not a reason to end the
+                    // run.
+                    Effect::StopJob => match &worker {
+                        Some(w) => w.stop(),
+                        None => {
+                            let _ = skyward_sys::kmsg("no work on files to stop; the request is dropped");
+                        }
+                    },
                     // Rules kept on a partition that is not mounted are the
                     // page's to report, with what to do first.
                     Effect::Relabel => {
-                        ensure!(relabeler.is_none(), "relabeling is under way already");
+                        if relabeler.is_some() {
+                            let _ = skyward_sys::kmsg("relabeling is under way already; the request is dropped");
+                            app.report(app.state.lang.pick(["文件操作还在进行", "檔案操作還在進行", "Work on files is already under way"]), now);
+                            continue;
+                        }
                         let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
                         match relabel::rule_files(slot) {
                             Ok(rules) => {
@@ -2769,7 +2872,12 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             },
                         }
                     }
-                    Effect::StopRelabel => relabeler.as_ref().context("there is no relabeling to stop")?.stop(),
+                    Effect::StopRelabel => match &relabeler {
+                        Some(r) => r.stop(),
+                        None => {
+                            let _ = skyward_sys::kmsg("no relabeling to stop; the request is dropped");
+                        }
+                    },
                     // Partitions that cannot be read are the page's to say.
                     Effect::ReadFilesystems => app.set_filesystems(read_filesystems().map_err(|e| format!("{e:#}"))),
                     // The data partition made afresh as another filesystem
@@ -2879,7 +2987,11 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         wlan_worker(&wlan)?.send(wlan::Command::Scan);
                     }
                     Effect::JoinWlan { ssid, name, security, password } => {
-                        wlan_worker(&wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0 })
+                        // Whether the password is kept for the next start is
+                        // the settings page's switch, read here rather than
+                        // asked of the page that typed it.
+                        let remember = app.state.remember_wlan;
+                        wlan_worker(&wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0, remember })
                     }
                     Effect::LeaveWlan => wlan_worker(&wlan)?.send(wlan::Command::Leave),
                     // What the installed system is called is the page's to
@@ -2907,7 +3019,43 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             Err(e) => app.download_ended(DownloadEnd::Failed(Failure::Other(format!("{e:#}"))), have(&app, &release), now),
                         }
                     }
-                    Effect::StopDownload => downloader.as_ref().context("there is no download to stop")?.stop(),
+                    // Pausing stops the transfer and keeps what came of it:
+                    // whoever goes on downloads from the part's own length.
+                    // No `?` on a stray pause — an error out of `run()` is a
+                    // recovery that restarts, which is the shape of the bug
+                    // this release is fixing.
+                    Effect::PauseDownload => match &downloader {
+                        Some(d) => d.stop(),
+                        None => {
+                            let _ = skyward_sys::kmsg("there is no download to pause");
+                        }
+                    },
+                    // Deleting the package whole, once nothing is downloading
+                    // it and no install is reading it.
+                    Effect::DeleteDownload(name) => {
+                        let folder = Path::new(skyward_crypto::data::SDCARD).join(skyward_ui::app::DOWNLOADS);
+                        let deleted = match (downloader.is_some(), installer.is_some(), updates::package_in(&folder, &name)) {
+                            (true, _, _) => Err("the package is being downloaded".to_string()),
+                            (_, true, _) => Err("an install is under way".to_string()),
+                            (_, _, None) => Err(format!("{name} is not a package name")),
+                            (false, false, Some(path)) => updates::delete(&path).map_err(|e| format!("{e:#}")),
+                        };
+                        // What internal storage holds of the newest package
+                        // now, read from disk rather than assumed: deleting a
+                        // part and deleting a whole one leave different
+                        // states behind.
+                        let after = app.state.newest().map_or(Have::Nothing, |release| have(&app, release));
+                        app.download_deleted(deleted, after, now);
+                    }
+                    // Forgetting a network takes what the phone keeps of it
+                    // away. An empty name is the WLAN switch turned off,
+                    // which forgets everything stored rather than one network.
+                    // The thread does it, and tells the page what is kept
+                    // now when it has.
+                    Effect::ForgetWlan(name) => {
+                        let asked = wlan_worker(&wlan).map(|w| w.forget(name.clone())).map_err(|e| format!("{e:#}"));
+                        app.wlan_forgotten(asked.map(|()| name), now);
+                    }
                     Effect::CheckSkyward => {
                         ensure!(skyward_checker.is_none(), "GitHub is being asked already");
                         let probe = cfg.wlan.as_ref().context("the phone's WLAN is not brought up")?.probe.clone();
@@ -3024,6 +3172,10 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             (on, t) => unreachable!("the switch turned file transfer {on} while it was {}", t.is_some()),
                         }
                     }
+                    // A flag, and nothing it can fail: the next update check
+                    // and download reach GitHub itself first and a mirror only
+                    // when that does not answer.
+                    Effect::SetMirror(on) => skyward_net::mirror::set(on),
                 }
             }
         }
