@@ -4,13 +4,13 @@
 
 [English](README.md) | 简体中文
 
-![version](https://img.shields.io/badge/version-v0.2.7-4c8ddf)
-![CI](https://img.shields.io/badge/CI-passing-brightgreen)
-![license](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)
-![status](https://img.shields.io/badge/status-公开测试-8ea9f1)
-![device](https://img.shields.io/badge/设备-Xiaomi_15_Pro_(haotian)-555555)
-![stars](https://img.shields.io/github/stars/Rinrroy/skyward-for-haotian?style=flat&label=stars&color=4c8ddf)
-![downloads](https://img.shields.io/github/downloads/Rinrroy/skyward-for-haotian/total?style=flat&label=下载量&color=4c8ddf)
+[![version](https://img.shields.io/github/v/release/Rinrroy/skyward-for-haotian?display_name=tag&label=version&color=4c8ddf)](https://github.com/Rinrroy/skyward-for-haotian/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/Rinrroy/skyward-for-haotian/build-haotian.yml?branch=main&label=CI)](https://github.com/Rinrroy/skyward-for-haotian/actions/workflows/build-haotian.yml)
+[![license](https://img.shields.io/github/license/Rinrroy/skyward-for-haotian?label=license&color=4c8ddf)](LICENSE)
+[![status](https://img.shields.io/badge/status-公开测试-8ea9f1)](https://github.com/Rinrroy/skyward-for-haotian/releases)
+[![device](https://img.shields.io/badge/设备-Xiaomi_15_Pro_(haotian)-555555)](#skyward-是使用-rust-编写的-recovery)
+[![stars](https://img.shields.io/github/stars/Rinrroy/skyward-for-haotian?style=flat&label=stars&color=4c8ddf)](https://github.com/Rinrroy/skyward-for-haotian/stargazers)
+[![downloads](https://img.shields.io/github/downloads/Rinrroy/skyward-for-haotian/total?style=flat&label=下载量&color=4c8ddf)](https://github.com/Rinrroy/skyward-for-haotian/releases)
 
 Skyward 是使用 Rust 编写的 recovery，从零开始编写。本分支只为一台手机构建：
 **Xiaomi 15 Pro（`haotian`）**，基于中国版系统 OS4.0.0.19。

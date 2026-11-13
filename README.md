@@ -4,13 +4,13 @@
 
 English | [简体中文](README.zh-CN.md)
 
-![version](https://img.shields.io/badge/version-v0.2.7-4c8ddf)
-![CI](https://img.shields.io/badge/CI-passing-brightgreen)
-![license](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)
-![status](https://img.shields.io/badge/status-public_beta-8ea9f1)
-![device](https://img.shields.io/badge/device-Xiaomi_15_Pro_(haotian)-555555)
-![stars](https://img.shields.io/github/stars/Rinrroy/skyward-for-haotian?style=flat&label=stars&color=4c8ddf)
-![downloads](https://img.shields.io/github/downloads/Rinrroy/skyward-for-haotian/total?style=flat&label=downloads&color=4c8ddf)
+[![version](https://img.shields.io/github/v/release/Rinrroy/skyward-for-haotian?display_name=tag&label=version&color=4c8ddf)](https://github.com/Rinrroy/skyward-for-haotian/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/Rinrroy/skyward-for-haotian/build-haotian.yml?branch=main&label=CI)](https://github.com/Rinrroy/skyward-for-haotian/actions/workflows/build-haotian.yml)
+[![license](https://img.shields.io/github/license/Rinrroy/skyward-for-haotian?label=license&color=4c8ddf)](LICENSE)
+[![status](https://img.shields.io/badge/status-public_beta-8ea9f1)](https://github.com/Rinrroy/skyward-for-haotian/releases)
+[![device](https://img.shields.io/badge/device-Xiaomi_15_Pro_(haotian)-555555)](#skyward-for-the-xiaomi-15-pro)
+[![stars](https://img.shields.io/github/stars/Rinrroy/skyward-for-haotian?style=flat&label=stars&color=4c8ddf)](https://github.com/Rinrroy/skyward-for-haotian/stargazers)
+[![downloads](https://img.shields.io/github/downloads/Rinrroy/skyward-for-haotian/total?style=flat&label=downloads&color=4c8ddf)](https://github.com/Rinrroy/skyward-for-haotian/releases)
 
 Skyward is a recovery written in Rust, from scratch. This fork is built for one
 phone: **Xiaomi 15 Pro (`haotian`)**, on the Chinese system's OS4.0.0.19.
