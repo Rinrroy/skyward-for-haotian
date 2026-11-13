@@ -226,7 +226,16 @@ fn copy(from: &mut dyn Read, to: &mut dyn Write) -> Result<u64, Failed> {
                 }
                 Ok(read) => filled += read,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(Failed::Reading(e)),
+                Err(e) => {
+                    // What was read before the input broke is still what the
+                    // input said: a frame that ends in the middle of being
+                    // written leaves the frames before it whole, and a file
+                    // that was cut short leaves what came before the cut.
+                    if filled > 0 {
+                        to.write_all(&chunk[..filled]).map_err(Failed::Writing)?;
+                    }
+                    return Err(Failed::Reading(e));
+                }
             }
         }
         to.write_all(&chunk).map_err(Failed::Writing)?;
