@@ -22,6 +22,11 @@ mod ffs;
 #[cfg(target_os = "android")]
 mod run;
 
+/// Waiting on the OTA engine is the same on the phone and in a test, and it
+/// is what the tests of it here exercise.
+#[cfg(any(target_os = "android", all(test, unix)))]
+mod engine;
+
 pub use image::{ImageKind, Ramdisk};
 #[cfg(target_os = "android")]
 pub use run::{Detach, Installer};

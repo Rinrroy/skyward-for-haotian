@@ -7,6 +7,7 @@
 use crate::adb::{self, Connection, Offer, Service};
 use crate::asked::Asked;
 use crate::blockmap::BlockMap;
+use crate::engine::{engine_lines, wait_engine};
 use crate::ffs::{Endpoints, Shared, Usb};
 use crate::fuse::{self, Fault, LocalFile, Mount, Name};
 use crate::image::{self, ImageKind};
@@ -27,6 +28,7 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -855,18 +857,25 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
     let stderr = child.stderr.take().expect("stderr is piped");
     let mut log = File::create(ENGINE_LOG).with_context(|| format!("create {ENGINE_LOG}"))?;
 
+    // Both pipes are read until they are told to stop. A helper the engine
+    // starts inherits them, and one that serves the snapshots of the slot
+    // outlives the engine: a reader that waited for the pipe itself to close
+    // would keep the install from ever ending.
+    let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let status_tx = tx.clone();
+    let status_stop = stop.clone();
     let status = thread::spawn(move || {
-        lines(File::from(status_read), |line| {
+        engine_lines(File::from(status_read), &status_stop, |line| {
             if let Some(s) = ota::status(line) {
                 let _ = status_tx.send(Line::Status(s));
             }
             Ok(())
         })
     });
+    let log_stop = stop.clone();
     let logged = thread::spawn(move || {
-        lines(stderr, |line| {
+        engine_lines(stderr, &log_stop, |line| {
             if let Some(l) = ota::log(line) {
                 let _ = tx.send(Line::Log(l));
             }
@@ -878,24 +887,29 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
     let mut stage = Stage::Writing { done: 0, total };
     ctx.send(Event::Progress(stage.clone()));
     let mut told = Instant::now();
-    let (mut partitions, mut verifying, mut finishing, mut error) = (0, None, false, None);
-    loop {
-        match rx.recv_timeout(PROGRESS_EVERY) {
-            Ok(Line::Status(Status::Step(step))) => finishing = step == 2,
-            Ok(Line::Status(Status::Error(code))) => error = Some(code),
-            Ok(Line::Log(Log::Partition(_))) => partitions += 1,
-            Ok(Line::Log(Log::Overwriting)) => ctx.send(Event::Overwriting),
-            Ok(Line::Log(Log::Hashing { index, partition })) => verifying = Some((index, partition)),
-            Err(RecvTimeoutError::Timeout) => {}
-            // Both outputs closed: the program has ended.
-            Err(RecvTimeoutError::Disconnected) => break,
+    let (mut partitions, mut verifying, mut finishing, mut error, mut progress) = (0, None, false, None, None);
+    let mut receive = |line| {
+        match line {
+            Line::Status(Status::Step(step)) => finishing = step == 2,
+            Line::Status(Status::Progress(value)) | Line::Log(Log::Progress(value)) => {
+                // The engine's own count, never how far into the package
+                // something has read: the zip's directory is at its end and
+                // is read before any of it is applied.
+                if !finishing && verifying.is_none() {
+                    progress = Some(progress.unwrap_or(0).max(value));
+                }
+            }
+            Line::Status(Status::Error(code)) => error = Some(code),
+            Line::Log(Log::Partition(_)) => partitions += 1,
+            Line::Log(Log::Overwriting) => ctx.send(Event::Overwriting),
+            Line::Log(Log::Hashing { index, partition }) => verifying = Some((index, partition)),
         }
         let now = if finishing {
             Stage::Finishing
         } else if let Some((index, partition)) = &verifying {
             Stage::Verifying { index: *index, count: partitions.max(index + 1), partition: partition.clone() }
         } else {
-            Stage::Writing { done: mount.served().saturating_sub(update.payload_offset).min(total), total }
+            Stage::Writing { done: total.saturating_mul(u64::from(progress.unwrap_or(0))) / 1000, total }
         };
         let moved_on = std::mem::discriminant(&now) != std::mem::discriminant(&stage);
         if now != stage && (moved_on || told.elapsed() >= PROGRESS_EVERY) {
@@ -903,10 +917,19 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
             ctx.send(Event::Progress(stage.clone()));
             told = Instant::now();
         }
-    }
-    let ended = child.wait().context("wait for update_engine")?;
+    };
+    let ended = wait_engine(&mut child, &rx, &mut receive);
+    // The engine has ended, or waiting on it failed. Reading stops here; what
+    // is already in the pipes is handed over below, and a helper still
+    // holding one is left alone.
+    stop.store(true, Ordering::Relaxed);
     status.join().expect("the status reader does not panic").context("read update_engine's status")?;
     logged.join().expect("the log reader does not panic").context("read update_engine's log")?;
+    for line in rx.try_iter() {
+        receive(line);
+    }
+    let ended = ended?;
+    let _ = kmsg(&format!("install: update_engine ended with {ended}, having reported {error:?}"));
     match (ended.code(), error) {
         (_, Some(code)) => Ok(code),
         (Some(code), None) => Ok(code),
