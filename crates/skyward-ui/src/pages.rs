@@ -1088,14 +1088,14 @@ pub fn install(cx: &Ctx) -> Frame {
     // A phone that can hold a second system installs one from here too.
     let what = l.pick(match cx.state.dual_boot {
         true => [
-            "支持安装 A/B 完整更新包、带安装脚本的刷机包和第二系统的安装包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分区镜像。系统更新将安装到另一个槽位，重启后从该槽位启动；第二系统安装在 data 分区中，可在「双系统」中切换。选择文件时仅列出文件夹以及 .zip、.img 文件。",
-            "支援安裝 A/B 完整更新檔、帶有安裝指令碼的刷機包和第二系統的安裝檔，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分割區映像檔。系統更新將安裝到另一個槽位，重新啟動後從該槽位啟動；第二系統安裝在 data 分割區中，可在「雙系統」中切換。選擇檔案時僅列出資料夾以及 .zip、.img 檔案。",
-            "Installs A/B full OTA packages, flashable zips with an install script and second systems' packages, and flashes boot, init_boot, vendor_boot, recovery, dtbo and vbmeta partition images. A system update installs to the other slot, which starts after a reboot; a second system installs into the data partition, and Dual boot switches to it. Choosing a file lists only folders and .zip and .img files.",
+            "支持安装 A/B 完整更新包、带安装脚本的刷机包和第二系统的安装包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta、super 分区镜像。刷入 super 会写整个分区，其中的逻辑分区要重启手机后才会重新映射。系统更新将安装到另一个槽位，重启后从该槽位启动；第二系统安装在 data 分区中，可在「双系统」中切换。选择文件时仅列出文件夹以及 .zip、.img 文件。",
+            "支援安裝 A/B 完整更新檔、帶有安裝指令碼的刷機包和第二系統的安裝檔，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta、super 分割區映像檔。刷入 super 會寫入整個分割區，其中的邏輯分割區要重新啟動手機後才會重新映射。系統更新將安裝到另一個槽位，重新啟動後從該槽位啟動；第二系統安裝在 data 分割區中，可在「雙系統」中切換。選擇檔案時僅列出資料夾以及 .zip、.img 檔案。",
+            "Installs A/B full OTA packages, flashable zips with an install script and second systems' packages, and flashes boot, init_boot, vendor_boot, recovery, dtbo, vbmeta and super partition images. A super image is written to the whole partition, and the logical partitions inside it are mapped anew only when the phone next starts. A system update installs to the other slot, which starts after a reboot; a second system installs into the data partition, and Dual boot switches to it. Choosing a file lists only folders and .zip and .img files.",
         ],
         false => [
-            "支持安装 A/B 完整更新包和带安装脚本的刷机包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分区镜像。系统更新将安装到另一个槽位，重启后从该槽位启动。选择文件时仅列出文件夹以及 .zip、.img 文件。",
-            "支援安裝 A/B 完整更新檔和帶有安裝指令碼的刷機包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分割區映像檔。系統更新將安裝到另一個槽位，重新啟動後從該槽位啟動。選擇檔案時僅列出資料夾以及 .zip、.img 檔案。",
-            "Installs A/B full OTA packages and flashable zips with an install script, and flashes boot, init_boot, vendor_boot, recovery, dtbo and vbmeta partition images. A system update installs to the other slot, which starts after a reboot. Choosing a file lists only folders and .zip and .img files.",
+            "支持安装 A/B 完整更新包和带安装脚本的刷机包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta、super 分区镜像。刷入 super 会写整个分区，其中的逻辑分区要重启手机后才会重新映射。系统更新将安装到另一个槽位，重启后从该槽位启动。选择文件时仅列出文件夹以及 .zip、.img 文件。",
+            "支援安裝 A/B 完整更新檔和帶有安裝指令碼的刷機包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta、super 分割區映像檔。刷入 super 會寫入整個分割區，其中的邏輯分割區要重新啟動手機後才會重新映射。系統更新將安裝到另一個槽位，重新啟動後從該槽位啟動。選擇檔案時僅列出資料夾以及 .zip、.img 檔案。",
+            "Installs A/B full OTA packages and flashable zips with an install script, and flashes boot, init_boot, vendor_boot, recovery, dtbo, vbmeta and super partition images. A super image is written to the whole partition, and the logical partitions inside it are mapped anew only when the phone next starts. A system update installs to the other slot, which starts after a reboot. Choosing a file lists only folders and .zip and .img files.",
         ],
     });
     let y = widgets::footnote(&mut c, t, f, methods.bottom, what);
