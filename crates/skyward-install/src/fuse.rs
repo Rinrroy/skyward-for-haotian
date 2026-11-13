@@ -193,7 +193,9 @@ impl Server {
     }
 
     /// Record that serving cannot go on: the first thing to go wrong is what
-    /// every read after it fails with.
+    /// every read after it fails with. Only the phone's own serving loop has
+    /// anything to record it from.
+    #[cfg(target_os = "android")]
     fn fail(&mut self, fault: Fault) {
         self.fault.get_or_insert(fault);
     }
