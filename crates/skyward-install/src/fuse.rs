@@ -192,6 +192,12 @@ impl Server {
         self.fault.as_ref()
     }
 
+    /// Record that serving cannot go on: the first thing to go wrong is what
+    /// every read after it fails with.
+    fn fail(&mut self, fault: Fault) {
+        self.fault.get_or_insert(fault);
+    }
+
     pub fn handle(&mut self, request: &[u8], fetch: &mut Fetch) -> Result<Handled> {
         let (header, body) =
             fuse_in_header::read_from_prefix(request).map_err(|_| anyhow!("a request of {} bytes", request.len()))?;
@@ -351,7 +357,7 @@ pub use device::{mount, Mount, Mounted};
 mod device {
     use super::{Fault, Handled, Name, Server, Source, EXIT, MOUNT_POINT, PACKAGE};
     use crate::adb::Offer;
-    use anyhow::{Context, Result};
+    use anyhow::{anyhow, Context, Result};
     use std::ffi::CString;
     use std::fs::{self, File, OpenOptions};
     use std::io::{ErrorKind, Read, Write};
@@ -361,6 +367,7 @@ mod device {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
 
     /// Big enough for any request: the kernel asks for at least 8 KiB, and
     /// writes never come.
@@ -450,20 +457,30 @@ mod device {
             let handled = server.handle(&buf[..n], &mut fetch)?;
             served.store(server.served(), Ordering::Relaxed);
             match handled {
-                Handled::Reply(r) => answer(dev, &r)?,
+                Handled::Reply(r) => answer(dev, &r, server)?,
                 Handled::Silent => {}
-                Handled::Exit(r) => return answer(dev, &r),
+                Handled::Exit(r) => return answer(dev, &r, server),
             }
         }
     }
 
     /// Write a reply; the kernel refuses one whose request was interrupted
-    /// and gone.
-    fn answer(dev: &File, reply: &[u8]) -> Result<()> {
-        match { dev }.write(reply) {
-            Ok(_) => Ok(()),
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
-            Err(e) => Err(e).context("write a FUSE reply"),
+    /// and gone. A reply it will not take for any other reason leaves that
+    /// request unanswered for good, so serving is recorded as failed and goes
+    /// on: every read after it fails at once rather than waiting on a reply
+    /// that will never come.
+    fn answer(dev: &File, reply: &[u8], server: &mut Server) -> Result<()> {
+        loop {
+            match { dev }.write(reply) {
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
+                Err(e) => {
+                    server.fail(Fault::Transfer(format!("a reply the kernel would not take: {e}")));
+                    let _ = skyward_sys::kmsg("sideload: the kernel would not take a reply; reads after it fail\n");
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -485,6 +502,36 @@ mod device {
         pub fn unmount(self) -> (S, Result<Option<Fault>>) {
             let stopped = stop();
             let (source, served) = self.thread.join().expect("the FUSE thread does not panic");
+            let unmounted = skyward_block::mount::umount_detach(Path::new(MOUNT_POINT));
+            (source, stopped.and(unmounted).and(served))
+        }
+
+        /// Stop serving and unmount, waiting no longer than `patience` for
+        /// the thread. Fetching a block from the computer has no deadline of
+        /// its own, so a thread in a fetch stops for nothing this side can
+        /// do: one still in a fetch after `patience` is left behind. The
+        /// mount point is unmounted either way, so an install that has
+        /// stopped can end and say why; the source does not come back from a
+        /// thread left behind, since the connection it holds is what it is
+        /// stuck on.
+        pub fn unmount_within(self, patience: Duration) -> (Option<S>, Result<Option<Fault>>) {
+            let stopped = stop();
+            let Mount { thread, .. } = self;
+            let waited = Instant::now();
+            while !thread.is_finished() && waited.elapsed() < patience {
+                thread::sleep(Duration::from_millis(20));
+            }
+            let (source, served) = if thread.is_finished() {
+                match thread.join() {
+                    Ok((source, served)) => (Some(source), served),
+                    // The serving thread does not panic; one that ended so
+                    // leaves nothing to serve out of.
+                    Err(_) => (None, Err(anyhow!("the sideload serving thread ended where it should not have"))),
+                }
+            } else {
+                let _ = skyward_sys::kmsg("sideload: the serving thread is stuck; leaving it behind\n");
+                (None, Err(anyhow!("the sideload serving thread is stuck in a fetch from the computer")))
+            };
             let unmounted = skyward_block::mount::umount_detach(Path::new(MOUNT_POINT));
             (source, stopped.and(unmounted).and(served))
         }

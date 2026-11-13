@@ -143,9 +143,6 @@ pub enum Screen {
     WlanAdd,
     /// Turning the phone off, and what that means: the swipe that does it.
     PowerOff,
-    /// The plugins installed, as much of them as the recovery reads now:
-    /// what one is, where they go, and what was found.
-    Plugins,
     /// The vbmeta image of the slot the phone runs from: the copies kept of
     /// it, making one, and putting one back.
     Vbmeta,
@@ -245,11 +242,6 @@ pub enum SkywardEnd {
 /// Where the full packages downloaded go, from the top of internal
 /// storage: the folder the stock updater keeps them in.
 pub const DOWNLOADS: &str = "downloaded_rom";
-
-/// Where a plugin's folder is looked for, from the top of internal storage:
-/// beside the backups the recovery writes, so that what a person puts on the
-/// phone and what the recovery keeps are found in one place.
-pub const PLUGIN_FOLDER: &str = "Skyward/plugins";
 
 /// Where the USB drive plugged in is shown.
 pub const USB_DRIVE: &str = "/mnt/usb";
@@ -1313,10 +1305,6 @@ pub enum Action {
     /// Delete the full package downloaded, from internal storage. A swipe
     /// then confirms it.
     AskDeleteDownload,
-    /// Open the plugin at this place in the list of those found.
-    OpenPlugin(usize),
-    /// Open the folder the plugins are kept in, in the file manager.
-    OpenPluginFolder,
     Open(Screen),
     /// Leave the decrypt page for the page it was opened from; the page
     /// the recovery started on, for the home page without keeping it
@@ -2007,11 +1995,6 @@ pub struct State {
     /// The networks whose passwords the phone keeps, as the runtime last
     /// read them: what the WLAN page offers to forget one of.
     pub saved: Vec<SavedNetwork>,
-    /// The plugins kept on the phone, as the runtime last read them; none
-    /// until it has.
-    pub plugins: Option<Result<Vec<PluginRow>, String>>,
-    /// The plugin the page was opened on, by its place in the list.
-    pub plugin_chosen: usize,
 }
 
 /// A copy of the slot's vbmeta image kept somewhere that outlives a start,
@@ -2036,37 +2019,6 @@ pub struct VbmetaCopy {
     pub rollback: Result<Rollback, String>,
     /// When it was taken, in Unix seconds.
     pub made: i64,
-}
-
-/// A plugin found in the folder the recovery reads them from: what its
-/// manifest says, or why it cannot be used.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PluginRow {
-    /// The plugin's folder name, which is what it is called.
-    pub name: String,
-    /// What its manifest says, or why there is none to read: the page shows
-    /// either, so a folder a person dropped in is never silently passed
-    /// over.
-    pub manifest: Result<Plugin, String>,
-}
-
-/// What a plugin's manifest says it is.
-///
-/// Nothing runs one yet: this release is the page and the reading of what a
-/// plugin will be, so that a later one has somewhere to put what it does.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Plugin {
-    /// What it calls itself, where its folder's name is not enough.
-    pub title: Option<String>,
-    /// The version it is at, as its author numbers it.
-    pub version: Option<String>,
-    /// Who wrote it.
-    pub author: Option<String>,
-    /// What it is for, in one line.
-    pub about: Option<String>,
-    /// What it says it needs of the recovery, by name: what a later release
-    /// refuses to run it without.
-    pub needs: Vec<String>,
 }
 
 impl Default for State {
@@ -2182,8 +2134,6 @@ impl Default for State {
             avb_confirming: false,
             forget_pending: None,
             saved: Vec::new(),
-            plugins: None,
-            plugin_chosen: 0,
         }
     }
 }
@@ -2533,9 +2483,6 @@ pub enum Effect {
     /// Look for the vbmeta copies kept in the places that can be read,
     /// telling what is found with [`App::set_vbmeta_copies`].
     FindVbmeta { storage: bool, usb: bool },
-    /// Read the plugins kept on the phone, telling what is found with
-    /// [`App::set_plugins`].
-    ReadPlugins,
     /// Forget the network named `name`, with what was kept of it, telling
     /// how it went with [`App::wlan_forgotten`].
     ForgetWlan(String),
@@ -3729,13 +3676,6 @@ impl App {
         // AVB page shows and what the next copy would save.
         self.state.avb = None;
         self.state.confirm = 0.0;
-        self.refresh();
-    }
-
-    /// The plugins found in the folder the recovery reads them from, or why
-    /// it could not be read.
-    pub fn set_plugins(&mut self, plugins: Result<Vec<PluginRow>, String>) {
-        self.state.plugins = Some(plugins);
         self.refresh();
     }
 
@@ -5703,13 +5643,6 @@ impl App {
                 vec![Effect::ReadAvb]
             }
             Screen::Mount => vec![Effect::ReadMounts],
-            Screen::Plugins => {
-                // Read afresh each time it opens: a plugin is a folder put
-                // there by someone else, and it may have come or gone since
-                // the page was last looked at.
-                self.state.plugins = None;
-                vec![Effect::ReadPlugins]
-            }
             Screen::Vbmeta => {
                 // The copies kept are found again as the page opens, and the
                 // flags shown are the ones the phone has now.
@@ -6563,11 +6496,6 @@ impl App {
                     self.refresh();
                 }
             }
-            Action::OpenPlugin(i) => {
-                self.state.plugin_chosen = i;
-                self.refresh();
-            }
-            Action::OpenPluginFolder => return vec![Effect::ReadDir(PLUGIN_FOLDER.to_string())],
         }
         Vec::new()
     }
@@ -9766,6 +9694,33 @@ mod tests {
         app.key(Key::Back, 2000);
         assert_eq!(app.screen(), Screen::Install);
         assert_eq!(app.state.install, Install::Idle);
+    }
+
+    #[test]
+    fn a_super_image_is_written_whole_and_asks_for_no_slot() {
+        let (f, i) = (fonts(), info());
+        let mut app = sideloading(&f, &i);
+        app.install(Event::Checking { size: 6 << 30 }, 0);
+        app.install(Event::Image { kind: ImageKind::Super, size: 6 << 30, partitions: vec!["super"] }, 0);
+        let frame = app.frame(&f, &i);
+        let actions: Vec<Action> = frame.hits.iter().map(|h| h.action).collect();
+        assert!(actions.contains(&Action::FlashPartition(0)), "the one partition it is written to");
+        assert!(!actions.iter().any(|a| matches!(a, Action::FlashSlots(_))), "a super image has no slot to pick");
+        assert!(actions.contains(&Action::Confirm(Confirm::Flash)), "one swipe, as for any other flash");
+        // The image lit the panel, so the user looks and taps past the wake
+        // guard; the swipe then writes the whole partition.
+        tap_at(&mut app, &f, &i, Action::FlashPartition(0), 1000);
+        let track = app.frame(&f, &i).hits.iter().find(|h| h.action == Action::Confirm(Confirm::Flash)).unwrap().rect;
+        let y = track.centre().1 - app.top().1;
+        app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
+        app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
+        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Flash { partition: "super", pick: Pick::Current }]);
+        assert_eq!(app.state.install, Install::Flashing { partition: "super", stage: None });
+        // The installer ignores the pick and reports no slot, which the page
+        // after it has to say without one.
+        app.install(Event::Finished(Outcome::Flashed { partition: "super", slots: Vec::new() }), 1000);
+        assert!(matches!(app.state.install, Install::Finished { damage: None, .. }), "a flash that worked broke nothing");
+        assert_eq!(tap_at(&mut app, &f, &i, Action::RebootTo(Target::System), 2000), vec![Effect::Reboot(Target::System)], "the note says to restart");
     }
 
     #[test]

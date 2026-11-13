@@ -192,7 +192,9 @@ pub enum Outcome {
     /// The update is in `slot`, which starts next; `wipe` when all user data
     /// is to be erased before it does.
     Installed { slot: Slot, wipe: bool },
-    /// The image is in the partition of these slots.
+    /// The image is in the partition of these slots, which is empty for a
+    /// super image: it is written to the one partition that holds the
+    /// partitions of both slots, and has no slot of its own.
     Flashed { partition: &'static str, slots: Vec<Slot> },
     /// The install script ran to its end; `wipe_cache` when it asked for
     /// the cache partition to be erased after.

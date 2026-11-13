@@ -57,8 +57,39 @@ const SCRIPT_PATH: &str = "/sbin:/system/bin:/system/xbin";
 /// long its output is waited on before it is let go.
 const LINGER: Duration = Duration::from_secs(1);
 
+/// How long the install script may print nothing and ask for nothing before
+/// the recovery says so in the kernel log, and how often it says it again
+/// while the script stays quiet. The log kept in memory dies with a reboot,
+/// so an install that stalls where the phone cannot show it would otherwise
+/// leave nothing behind of what it was doing.
+const STALL: Duration = Duration::from_secs(30);
+
 /// The most often progress is told.
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
+
+/// How much of a line the install script prints is mirrored into the kernel
+/// log, and the most lines of it: enough of both to tell what the script was
+/// doing, without moving all of its output there.
+const MIRRORED_CHARS: usize = 200;
+const MIRRORED_LINES: usize = 400;
+
+/// How much of what `/proc` says of a script that has stalled is kept for
+/// the report of it.
+const PROC_CHARS: usize = 64;
+
+/// How long an install waits for the sideload serving thread to end once it
+/// has been told to. The thread can be inside a read from the computer, which
+/// has no deadline of its own, so it is left behind rather than waited on: the
+/// install has already ended, and the screen is owed how it ended.
+const UNMOUNT_PATIENCE: Duration = Duration::from_secs(5);
+
+/// How long an install script may go on with neither output nor requests
+/// while not one block of the package it reads has been served before the
+/// install is stopped. Every wait on this path is without a deadline, so a
+/// script that is waiting on a package that will never arrive waits for ever:
+/// ten minutes of nothing at all is not a write making progress, since a write
+/// that is going on keeps the package being read.
+const GIVE_UP: Duration = Duration::from_secs(600);
 
 pub struct Installer {
     events: Receiver<Event>,
@@ -245,15 +276,24 @@ fn run(ctx: &mut Context) -> Outcome {
         // Cancelled as the computer started sending.
         Ok(_) if ctx.shared.cancelled() => {
             finish(&mut conn, adb::DONE);
-            (Outcome::Cancelled, conn)
+            (Outcome::Cancelled, Some(conn))
         }
         Ok(offer) => receive(ctx, conn, offer, false),
-        Err(adb::Error::Interrupted) => (Outcome::Cancelled, conn),
-        Err(adb::Error::OldHost) => (Outcome::Refused(Refusal::OldHost), conn),
-        Err(e) => (failed(anyhow!(e).context("wait for adb sideload")), conn),
+        Err(adb::Error::Interrupted) => (Outcome::Cancelled, Some(conn)),
+        Err(adb::Error::OldHost) => (Outcome::Refused(Refusal::OldHost), Some(conn)),
+        Err(e) => (failed(anyhow!(e).context("wait for adb sideload")), Some(conn)),
     };
-    if let Err(e) = usb.close(conn.into_link()) {
-        let _ = kmsg(&format!("install: USB not handed back to adb: {e:#}"));
+    match conn {
+        Some(conn) => {
+            if let Err(e) = usb.close(conn.into_link()) {
+                let _ = kmsg(&format!("install: USB not handed back to adb: {e:#}"));
+            }
+        }
+        // The connection is held by a serving thread that would not end, and
+        // taking the port back under it would take it away mid-read.
+        None => {
+            let _ = kmsg("install: the sideload connection stays with the thread that would not end\n");
+        }
     }
     // Cancelling while the transfer starts cuts it off.
     if ctx.shared.cancelled() && matches!(outcome, Outcome::Failed(_)) {
@@ -276,7 +316,7 @@ enum Done {
 /// Install the package the computer offers. `rescue` tells the computer
 /// how the install went, as rescue does, where sideload only says the
 /// package was read.
-fn receive(ctx: &mut Context, mut conn: Connection<Endpoints>, offer: Offer, rescue: bool) -> (Outcome, Connection<Endpoints>) {
+fn receive(ctx: &mut Context, mut conn: Connection<Endpoints>, offer: Offer, rescue: bool) -> (Outcome, Option<Connection<Endpoints>>) {
     let _ = kmsg(&format!("install: {} bytes offered in blocks of {}", offer.size, offer.block_size));
     let ending = |outcome: &Outcome| match (rescue, outcome) {
         (true, Outcome::Installed { .. } | Outcome::Flashed { .. } | Outcome::Ran { .. } | Outcome::SystemInstalled { .. }) | (false, _) => adb::DONE,
@@ -285,7 +325,7 @@ fn receive(ctx: &mut Context, mut conn: Connection<Endpoints>, offer: Offer, res
     if let Err(e) = offer.check() {
         let outcome = failed(anyhow!(e));
         finish(&mut conn, ending(&outcome));
-        return (outcome, conn);
+        return (outcome, Some(conn));
     }
     ctx.send(Event::Checking { size: offer.size });
     // A package the computer sends comes with no name: the service string it
@@ -295,15 +335,22 @@ fn receive(ctx: &mut Context, mut conn: Connection<Endpoints>, offer: Offer, res
         Err(e) => {
             let outcome = failed(e);
             finish(&mut conn, ending(&outcome));
-            return (outcome, conn);
+            return (outcome, Some(conn));
         }
     };
     let mount = mounted.serve(conn);
     let done = install(ctx, &mount, offer.size).unwrap_or_else(Done::Error);
-    let (mut conn, served) = mount.unmount();
+    // Waiting on the serving thread is bounded: it can be in a read from the
+    // computer that has no deadline of its own, and an install that has
+    // ended must be able to say how it ended either way.
+    let (conn, served) = mount.unmount_within(UNMOUNT_PATIENCE);
     let outcome = conclude(done, served, ctx.origin);
+    let mut conn = match conn {
+        Some(conn) => conn,
+        None => return (outcome, None),
+    };
     finish(&mut conn, ending(&outcome));
-    (outcome, conn)
+    (outcome, Some(conn))
 }
 
 /// Install the file at `path`, read where it is.
@@ -374,11 +421,14 @@ fn rescue(ctx: &mut Context) -> Outcome {
         Err(e) => return failed(e.context("set USB up for rescue")),
     };
     ctx.send(Event::Waiting);
-    let mut conn = Connection::new(endpoints, banner(adb::RESCUE));
+    let mut conn = Some(Connection::new(endpoints, banner(adb::RESCUE)));
     let mut last = Outcome::Cancelled;
     let ended = loop {
+        // A connection a serving thread would not give back cannot be served
+        // on any more, and the loop ends with it.
+        let Some(mut current) = conn.take() else { break Ok(()) };
         ctx.shared.accepting(true);
-        let accepted = conn.accept_service();
+        let accepted = current.accept_service();
         ctx.shared.accepting(false);
         let (service, remote) = match accepted {
             Ok(opened) => opened,
@@ -386,22 +436,24 @@ fn rescue(ctx: &mut Context) -> Outcome {
             Err(e) => break Err(anyhow!(e).context("wait for adb rescue")),
         };
         let _ = kmsg(&format!("rescue: the computer asks for {service:?}"));
-        let served = match service {
-            Service::RescueInstall(offer) => match conn.take(remote) {
+        let (served, back) = match service {
+            Service::RescueInstall(offer) => match current.take(remote) {
                 Ok(()) => {
-                    let (outcome, back) = receive(ctx, conn, offer, true);
-                    conn = back;
+                    let (outcome, back) = receive(ctx, current, offer, true);
                     ctx.send(Event::Done(outcome.clone()));
                     last = outcome;
                     // The screen may have left the page meanwhile.
                     if ctx.shared.cancelled() {
                         break Ok(());
                     }
-                    Ok(())
+                    (Ok(()), back)
                 }
-                Err(e) => Err(e),
+                Err(e) => (Err(e), Some(current)),
             },
-            Service::RescueGetprop(name) => conn.take(remote).and_then(|()| conn.answer(rescue_answer(&name).as_bytes())),
+            Service::RescueGetprop(name) => {
+                let answered = current.take(remote).and_then(|()| current.answer(rescue_answer(&name).as_bytes()));
+                (answered, Some(current))
+            }
             Service::RescueWipe { target, size } if target == "userdata" => {
                 ctx.send(Event::Wipe);
                 let erased = match ctx.commands.recv() {
@@ -409,25 +461,37 @@ fn rescue(ctx: &mut Context) -> Outcome {
                     Ok(Command::Cancel) | Err(_) => break Ok(()),
                     Ok(other) => break Err(anyhow!("rescue waiting for user data to be erased was told {other:?}")),
                 };
-                conn.take(remote).and_then(|()| conn.answer(&adb::rescue_wiped(erased, size)))
+                let wiped = current.take(remote).and_then(|()| current.answer(&adb::rescue_wiped(erased, size)));
+                (wiped, Some(current))
             }
             Service::Reboot(target) => {
                 // Taken and closed at once, as the phone leaves.
-                if let Err(e) = conn.take(remote).and_then(|()| conn.end()) {
+                if let Err(e) = current.take(remote).and_then(|()| current.end()) {
                     let _ = kmsg(&format!("rescue: the computer's reboot was not answered: {e}"));
                 }
                 ctx.send(Event::Reboot(target));
                 break Ok(());
             }
             // What rescue does not serve is refused, as minadbd refuses it.
-            _ => conn.send(&adb::Packet::new(adb::CLSE, 0, remote, [])),
+            _ => (current.send(&adb::Packet::new(adb::CLSE, 0, remote, [])), Some(current)),
         };
+        conn = back;
         if let Err(e) = served {
             let _ = kmsg(&format!("rescue: the computer went away mid-command: {e}"));
         }
+        if conn.is_none() {
+            break Ok(());
+        }
     };
-    if let Err(e) = usb.close(conn.into_link()) {
-        let _ = kmsg(&format!("rescue: USB not handed back to adb: {e:#}"));
+    match conn {
+        Some(conn) => {
+            if let Err(e) = usb.close(conn.into_link()) {
+                let _ = kmsg(&format!("rescue: USB not handed back to adb: {e:#}"));
+            }
+        }
+        None => {
+            let _ = kmsg("rescue: the connection stays with the thread that would not end\n");
+        }
     }
     match ended {
         Ok(()) => last,
@@ -837,11 +901,20 @@ fn lines(from: impl Read, mut each: impl FnMut(&str) -> io::Result<()>) -> io::R
     }
 }
 
-fn flash_image<S>(ctx: &Context, mount: &Mount<S>, kind: ImageKind, size: u64) -> Result<Done> {
+fn flash_image<S>(ctx: &mut Context, mount: &Mount<S>, kind: ImageKind, size: u64) -> Result<Done> {
     let dir = Path::new(skyward_block::BY_NAME);
     let partitions = image::partitions(kind, dir)?;
     if partitions.is_empty() {
         return Ok(Done::Decided(Outcome::Refused(Refusal::NoPartition)));
+    }
+    // Super holds the partitions the running system is mapped through, built
+    // from metadata that writing it replaces: an update in flight would lose
+    // where its own are.
+    if kind == ImageKind::Super {
+        let state = skyward_vab::snapshot_state()?;
+        if state != SnapshotState::None {
+            return Ok(Done::Decided(Outcome::Refused(Refusal::Pending(state))));
+        }
     }
     ctx.send(Event::Image { kind, size, partitions: partitions.clone() });
     let (partition, slots) = match ctx.commands.recv() {
@@ -850,20 +923,50 @@ fn flash_image<S>(ctx: &Context, mount: &Mount<S>, kind: ImageKind, size: u64) -
         Ok(other) => bail!("an image waiting for its partition was told {other:?}"),
     };
     ensure!(partitions.contains(&partition), "{partition} is not among {partitions:?}");
+    // A super image has no slot of its own to pick: it holds the partitions
+    // of both slots, so the screen sends none and the whole of super is
+    // written.
+    if kind == ImageKind::Super {
+        flash_super(ctx, mount, size)?;
+        return Ok(Done::Decided(Outcome::Flashed { partition, slots: Vec::new() }));
+    }
     ensure!(!slots.is_empty(), "no slot chosen for {partition}");
     if [skyward_systems::store::BOOT, skyward_systems::store::INIT_BOOT].contains(&partition) {
         installed_boot_set()?;
     }
     let devices: Vec<_> = slots.iter().map(|&slot| image::device(dir, partition, slot)).collect();
+    flash_to(ctx, mount, size, &devices)?;
+    Ok(Done::Decided(Outcome::Flashed { partition, slots }))
+}
+
+/// Write a super image over the whole of super, so that the partitions it
+/// holds are the ones the image describes.
+///
+/// The slot's partitions are mapped through the metadata super holds now, so
+/// they come off with the rest first, as they do before an install script
+/// runs: a table built from the metadata this write replaces must be neither
+/// mounted nor mapped while super is written. Afterwards what is mapped is
+/// stale, and nothing here maps it again — the next start maps what super
+/// then holds, which is what the image says.
+fn flash_super<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<()> {
+    let dir = Path::new(skyward_block::BY_NAME);
+    detach_once(ctx)?;
+    flash_to(ctx, mount, size, &[image::super_device(dir)])?;
+    let _ = kmsg("super: written, a reboot maps what it now holds");
+    Ok(())
+}
+
+/// Write `size` bytes of the package being served to `devices`, telling the
+/// screen how far it is.
+fn flash_to<S>(ctx: &Context, mount: &Mount<S>, size: u64, devices: &[PathBuf]) -> Result<()> {
     let mut file = BufReader::with_capacity(1 << 20, File::open(mount.path()).context("open the package")?);
     let mut told: Option<Instant> = None;
-    image::flash(&mut file, size, &devices, &mut |done, total| {
+    image::flash(&mut file, size, devices, &mut |done, total| {
         if done == total || told.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
             ctx.send(Event::Progress(Stage::Flashing { done, total }));
             told = Some(Instant::now());
         }
-    })?;
-    Ok(Done::Decided(Outcome::Flashed { partition, slots }))
+    })
 }
 
 /// Run the install script of the zip being served, `size` bytes, once the
@@ -1084,7 +1187,11 @@ fn run_binary<S>(ctx: &Context, mount: &Mount<S>) -> Result<(i32, bool)> {
         })
     });
     thread::spawn(move || {
+        let mut mirrored = 0;
         lines(File::from(output_read), |line| {
+            // What the script prints is kept where a reboot does not lose
+            // it, so that an install that stalls can still be told of after.
+            mirror(line, &mut mirrored);
             let _ = output_tx.send(Said::Output(line.to_string()));
             Ok(())
         })
@@ -1097,8 +1204,21 @@ fn run_binary<S>(ctx: &Context, mount: &Mount<S>) -> Result<(i32, bool)> {
     let mut wipe_cache = false;
     let mut ended = None;
     let mut others_ended = false;
+    // What the script last said, and when: a script that says nothing and
+    // asks for nothing for long is stalled, and told of as such.
+    let mut last_heard = Instant::now();
+    let mut last_output = String::new();
+    let mut stalled: Option<Instant> = None;
+    // How far into the package reads have reached, and when they last did: a
+    // script waiting on a package that never comes has both standing still.
+    let mut served = mount.served();
+    let mut served_at = Instant::now();
     loop {
-        match rx.recv_timeout(PROGRESS_EVERY) {
+        let said = rx.recv_timeout(PROGRESS_EVERY);
+        if said.is_ok() {
+            last_heard = Instant::now();
+        }
+        match said {
             // An empty line only ends the one before it, in the recoveries
             // these scripts are written for.
             Ok(Said::Request(Request::Print(text))) if text.is_empty() => {}
@@ -1114,7 +1234,10 @@ fn run_binary<S>(ctx: &Context, mount: &Mount<S>) -> Result<(i32, bool)> {
             Ok(Said::Request(Request::Other(what))) => writeln!(log, "[asked for {what}]").context("write the log")?,
             Ok(Said::Request(moving)) => bar.hear(&moving, started.elapsed()),
             Ok(Said::Unknown(line)) => writeln!(log, "[unknown request] {line}").context("write the log")?,
-            Ok(Said::Output(line)) => writeln!(log, "{line}").context("write the log")?,
+            Ok(Said::Output(line)) => {
+                writeln!(log, "{line}").context("write the log")?;
+                last_output = line;
+            }
             Err(RecvTimeoutError::Timeout) => {}
             // Every output has closed: the script, and all it ran, are done.
             Err(RecvTimeoutError::Disconnected) => break,
@@ -1126,6 +1249,31 @@ fn run_binary<S>(ctx: &Context, mount: &Mount<S>) -> Result<(i32, bool)> {
         }
         if ended.is_none() {
             ended = child.try_wait().context("see whether the install script has ended")?.map(|status| (status, Instant::now()));
+        }
+        let now_served = mount.served();
+        if now_served != served {
+            served = now_served;
+            served_at = Instant::now();
+        }
+        // A script that has printed nothing and asked for nothing for long
+        // shows as nothing happening at all on the phone: say where it waits,
+        // while there is still a phone running to read that from.
+        if ended.is_none() && last_heard.elapsed() >= STALL && stalled.is_none_or(|at| at.elapsed() >= STALL) {
+            stalled = Some(Instant::now());
+            let report = stall_report(child.id(), last_heard.elapsed(), &last_output);
+            let _ = kmsg(&report);
+            // Said on the screen too, where the script's own output is shown:
+            // a phone that stalls here cannot be asked for its log afterwards,
+            // so what it was doing is said while it is still stuck.
+            ctx.send(Event::Print(report));
+        }
+        // Nothing printed, nothing asked for, and not one block of the package
+        // read for as long as that: every wait on this path is without a
+        // deadline, so a script waiting on a package that is not coming waits
+        // for ever. The install is stopped here instead, and the screen is
+        // told what the script was doing when it was stopped.
+        if ended.is_none() && last_heard.elapsed() >= GIVE_UP && served_at.elapsed() >= GIVE_UP {
+            bail!("{}; the install is stopped", stall_report(child.id(), last_heard.elapsed(), &last_output));
         }
         if let Some((_, at)) = ended {
             if at.elapsed() >= LINGER && !others_ended {
@@ -1149,6 +1297,53 @@ fn run_binary<S>(ctx: &Context, mount: &Mount<S>) -> Result<(i32, bool)> {
     };
     writeln!(log, "[ended: {status}]").context("write the log")?;
     Ok((status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)), wipe_cache))
+}
+
+/// Mirror a line the install script printed into the kernel log, which a
+/// reboot does not lose: the first [`MIRRORED_CHARS`] of it, and no more than
+/// [`MIRRORED_LINES`] lines per install, so that a script printing a great
+/// deal cannot flood the kernel log either.
+fn mirror(line: &str, mirrored: &mut usize) {
+    if line.trim().is_empty() {
+        return;
+    }
+    if *mirrored < MIRRORED_LINES {
+        *mirrored += 1;
+        let short: String = line.chars().take(MIRRORED_CHARS).collect();
+        let _ = kmsg(&format!("install: {short}"));
+    } else if *mirrored == MIRRORED_LINES {
+        // Said once, where the mirroring stops, so that a log read afterwards
+        // tells a quiet script from one whose words were not kept.
+        *mirrored += 1;
+        let _ = kmsg(&format!("install: the script's output stops being mirrored after {MIRRORED_LINES} lines"));
+    }
+}
+
+/// What the recovery says of an install script that has printed nothing and
+/// asked for nothing for `quiet`: how long that has been, which process it
+/// is, where it waits and in what state, and the last line it printed.
+fn stall_report(pid: u32, quiet: Duration, last_output: &str) -> String {
+    let waiting = read_proc(pid, "wchan").unwrap_or_else(|| "?".to_string());
+    let state = process_state(pid).map_or_else(|| "?".to_string(), |state| state.to_string());
+    let short: String = last_output.chars().take(MIRRORED_CHARS).collect();
+    let last = if short.is_empty() { "nothing".to_string() } else { format!("\"{short}\"") };
+    format!("install: the script has printed nothing and asked for nothing for {}s (pid {pid}, waiting in {waiting}, state {state}); its last line was {last}", quiet.as_secs())
+}
+
+/// What `/proc/<pid>/<what>` holds, trimmed and cut short: none when it
+/// cannot be read, which telling of a stall must never fail over.
+fn read_proc(pid: u32, what: &str) -> Option<String> {
+    let text = fs::read_to_string(format!("/proc/{pid}/{what}")).ok()?;
+    Some(text.trim().chars().take(PROC_CHARS).collect())
+}
+
+/// The state `/proc/<pid>/stat` gives the process, as it names it: `R` for
+/// running, `D` for waiting on storage, `S` for sleeping; none when there is
+/// no such file. The program's name comes second in brackets and may hold
+/// anything, so the state is the first field after the bracket closing it.
+fn process_state(pid: u32) -> Option<char> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?.1.split_whitespace().next()?.chars().next()
 }
 
 /// Take away what the script mounted and left mounted, the latest first,

@@ -2760,10 +2760,6 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         }
                     }
                     Effect::FindVbmeta { storage, usb } => app.set_vbmeta_copies(crate::vbmeta::find(storage, usb)),
-                    // Listing plugins reads files someone else put there, so
-                    // it cannot be allowed to end the run: a folder that
-                    // cannot be read is a row saying so, and the page stays.
-                    Effect::ReadPlugins => app.set_plugins(crate::plugins::read(app.state.lang)),
                     Effect::RememberPassword(code) => match code {
                         Some(credential) => match crate::remembered::save(&credential) {
                             Ok(()) => app.state.remembered = Some(credential),

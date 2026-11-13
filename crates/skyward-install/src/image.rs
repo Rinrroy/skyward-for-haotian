@@ -18,6 +18,17 @@ const VENDOR_BOOT_MAGIC: &[u8] = b"VNDRBOOT";
 const DTBO_MAGIC: &[u8] = &[0xd7, 0xb7, 0xab, 0x1e];
 const VBMETA_MAGIC: &[u8] = b"AVB0";
 
+/// A raw super image, as `lpmake` builds one, keeps a page clear and then
+/// opens its geometry with this, little-endian: skyward_lp's own
+/// `GEOMETRY_MAGIC`, at the offset of its `RESERVED_BYTES`.
+const SUPER_GEOMETRY_MAGIC: [u8; 4] = 0x616c_4467u32.to_le_bytes();
+const SUPER_GEOMETRY_AT: u64 = 4096;
+
+/// A sparse image packs the chunks of a partition instead of holding it, and
+/// is made into one as it is written, so it is no image this tells the kind
+/// of.
+const SPARSE_MAGIC: &[u8] = &[0x3a, 0xff, 0x26, 0xed];
+
 /// How a ramdisk is packed, by its first bytes: LZ4 in the legacy framing
 /// Android uses or the standard one, gzip, or a bare newc archive.
 const LZ4_LEGACY: &[u8] = &[0x02, 0x21, 0x4c, 0x18];
@@ -42,6 +53,9 @@ pub enum ImageKind {
     VendorBoot,
     Dtbo,
     Vbmeta,
+    /// A raw super image, holding every partition of both slots: it goes to
+    /// the one partition that holds them all, whole.
+    Super,
 }
 
 /// The ramdisk a boot image carries.
@@ -67,6 +81,7 @@ impl ImageKind {
             ImageKind::VendorBoot => &["vendor_boot"],
             ImageKind::Dtbo => &["dtbo"],
             ImageKind::Vbmeta => &["vbmeta", "vbmeta_system", "vbmeta_vendor"],
+            ImageKind::Super => &["super"],
         }
     }
 }
@@ -97,7 +112,20 @@ pub fn detect<R: Read + Seek>(file: &mut R, head: &[u8]) -> Result<Option<ImageK
     if head.starts_with(VBMETA_MAGIC) {
         return Ok(Some(ImageKind::Vbmeta));
     }
-    Ok(None)
+    if head.starts_with(SPARSE_MAGIC) {
+        return Ok(None);
+    }
+    // A super image's geometry opens past the page it keeps clear, so it is
+    // past what `head` holds and is read where it is.
+    file.seek(SeekFrom::Start(SUPER_GEOMETRY_AT)).context("seek to where a super image's geometry opens")?;
+    let mut geometry = [0u8; 4];
+    match file.read_exact(&mut geometry) {
+        Ok(()) if geometry == SUPER_GEOMETRY_MAGIC => Ok(Some(ImageKind::Super)),
+        Ok(()) => Ok(None),
+        // Shorter than a super image's first page and the geometry after it.
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e).context("read where a super image's geometry opens"),
+    }
 }
 
 /// Whether a packed ramdisk is a recovery's, by the names in its archive.
@@ -178,21 +206,39 @@ pub fn device(dir: &Path, name: &str, slot: Slot) -> PathBuf {
     dir.join(format!("{name}{}", slot.suffix()))
 }
 
-/// The partitions `kind` fits that this phone has in both slots, among the
-/// links in `dir`, the likeliest first.
+/// The one partition a super image goes to among the links in `dir`: super
+/// holds the partitions of both slots inside it, so it has no slot of its own
+/// and no sibling.
+pub fn super_device(dir: &Path) -> PathBuf {
+    dir.join("super")
+}
+
+/// The partitions `kind` fits that this phone has, among the links in `dir`,
+/// the likeliest first: a super image's is the one node that holds both
+/// slots, and the others' are in both slots.
 pub fn partitions(kind: ImageKind, dir: &Path) -> Result<Vec<&'static str>> {
     let mut found = Vec::new();
     for name in kind.partitions() {
-        let mut has = true;
-        for slot in [Slot::A, Slot::B] {
-            let path = device(dir, name, slot);
-            has &= path.try_exists().with_context(|| format!("look for {}", path.display()))?;
-        }
-        if has {
+        if has_partition(kind, dir, name)? {
             found.push(*name);
         }
     }
     Ok(found)
+}
+
+/// Whether this phone has the partition `name` an image of `kind` fits, among
+/// the links in `dir`.
+fn has_partition(kind: ImageKind, dir: &Path, name: &str) -> Result<bool> {
+    if kind == ImageKind::Super {
+        let path = super_device(dir);
+        return path.try_exists().with_context(|| format!("look for {}", path.display()));
+    }
+    let mut has = true;
+    for slot in [Slot::A, Slot::B] {
+        let path = device(dir, name, slot);
+        has &= path.try_exists().with_context(|| format!("look for {}", path.display()))?;
+    }
+    Ok(has)
 }
 
 /// Write `len` bytes of `image` to all of `devices` in one pass, then read
@@ -290,6 +336,16 @@ pub(crate) mod samples {
         out
     }
 
+    /// A raw super image as `lpmake` builds one: a page kept clear, then the
+    /// geometry the metadata follows, whose size is the next field.
+    pub fn super_image() -> Vec<u8> {
+        let mut out = vec![0u8; SUPER_GEOMETRY_AT as usize];
+        out.extend_from_slice(&SUPER_GEOMETRY_MAGIC);
+        out.extend_from_slice(&0x28u32.to_le_bytes());
+        out.resize(1 << 20, 0);
+        out
+    }
+
     /// A newc archive of empty files named `names`.
     pub fn archive(names: &[&str]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -326,7 +382,7 @@ pub(crate) mod samples {
 
 #[cfg(test)]
 mod tests {
-    use super::samples::{archive, boot_image, lz4_legacy, recovery, skyward_for};
+    use super::samples::{archive, boot_image, lz4_legacy, recovery, skyward_for, super_image};
     use super::*;
     use abootimg_oxide::binrw::BinWrite;
     use abootimg_oxide::VendorHeaderV4;
@@ -406,6 +462,36 @@ mod tests {
         assert_eq!(kind_of(&[0xd7, 0xb7, 0xab, 0x1e, 0, 0, 0, 0x40]).unwrap(), Some(ImageKind::Dtbo));
         assert_eq!(kind_of(b"AVB0\0\0\0\x01").unwrap(), Some(ImageKind::Vbmeta));
         assert_eq!(kind_of(b"\x3a\xff\x26\xed sparse").unwrap(), None);
+    }
+
+    #[test]
+    fn a_super_image_is_told_by_the_geometry_past_its_first_page() {
+        let kind = kind_of(&super_image()).unwrap().expect("a super image");
+        assert_eq!(kind, ImageKind::Super);
+        assert_eq!(kind.partitions(), ["super"]);
+        assert_eq!(kind_of(&vec![0u8; 1 << 16]).unwrap(), None, "an erased partition");
+        assert_eq!(kind_of(&vec![0u8; SUPER_GEOMETRY_AT as usize + 2]).unwrap(), None, "too short to hold the geometry");
+        let mut moved = vec![0u8; 1 << 16];
+        moved[..4].copy_from_slice(&SUPER_GEOMETRY_MAGIC);
+        assert_eq!(kind_of(&moved).unwrap(), None, "the geometry where a super image keeps its first page clear");
+        // A sparse image's chunks hold anything at all, the geometry magic
+        // among it, and it is still no super image.
+        let mut sparse = vec![0u8; 1 << 16];
+        sparse[..4].copy_from_slice(SPARSE_MAGIC);
+        let at = SUPER_GEOMETRY_AT as usize;
+        sparse[at..at + 4].copy_from_slice(&SUPER_GEOMETRY_MAGIC);
+        assert_eq!(kind_of(&sparse).unwrap(), None);
+    }
+
+    #[test]
+    fn a_super_image_goes_to_the_one_partition_that_holds_both_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(partitions(ImageKind::Super, dir.path()).unwrap().is_empty(), "a phone with no super");
+        for name in ["super", "super_a", "super_b"] {
+            std::fs::File::create(dir.path().join(name)).unwrap();
+        }
+        assert_eq!(partitions(ImageKind::Super, dir.path()).unwrap(), ["super"]);
+        assert_eq!(super_device(dir.path()), dir.path().join("super"));
     }
 
     #[test]

@@ -42,6 +42,11 @@ zstd use to flash it, and an `unzip` whose `-p` streams the image as it reads it
 They also get `avbctl` and `resetprop`, to turn off verified boot's checks and to
 read and set properties.
 
+A raw super image is a package of its own: picked as a file or sent with
+`adb sideload`, it is written over the whole super partition, with no slot to
+pick. The logical partitions inside it are mapped anew at the next start, so the
+phone is restarted after one is flashed.
+
 ### Online updates
 
 ![Update the system and Skyward online](slides/en/out/05-updates.png)
@@ -125,8 +130,6 @@ this slot. There is no override.
 - Mount partitions, repair and format filesystems
 - WLAN, MTP file transfer, adb and fastbootd; a network joined once is
   remembered and can be forgotten from the list
-- A plugins page, listing the folders under `Skyward/plugins` and what their
-  `plugin.json` says — this release reads and lists, it runs nothing
 
 ### Without a system
 
