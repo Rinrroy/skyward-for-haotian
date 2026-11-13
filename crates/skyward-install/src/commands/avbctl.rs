@@ -971,9 +971,19 @@ mod tests {
         let a = dir.path().join("vbmeta_a");
         fs::write(&a, vbmeta(0)).unwrap();
         let phone = Phone { by_name: dir.path(), suffix: "_a", locked: false, ab: true };
+        // The slot that has an image is already what it must be, so the reading
+        // comes to the other one — which has none — before anything is opened
+        // for writing, and says so as a reading that failed.
+        let (code, output, errors) = ran(&["enable-verity"], &phone);
+        assert_eq!((code, output.as_str()), (70, ""), "the other slot has nothing to read");
+        assert!(errors.ends_with("Error getting whether verity is enabled.\n"), "{errors}");
+        assert_eq!(fs::read(&a).unwrap(), vbmeta(0), "and the slot that has one is as it was");
+        // And asked for a change the booted slot does not hold yet, the change
+        // is planned before it is written: the empty slot is found there, and
+        // the one that could have been changed is left alone.
         let (code, output, errors) = ran(&["disable-verity"], &phone);
         assert_eq!((code, output.as_str()), (70, ""), "the other slot has nothing to change");
-        assert!(errors.ends_with("Error getting whether verity is enabled.\n"), "{errors}");
+        assert!(errors.ends_with("Error setting verity.\n"), "{errors}");
         assert_eq!(fs::read(&a).unwrap(), vbmeta(0), "and the slot that has one is as it was");
     }
 
