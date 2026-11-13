@@ -337,6 +337,36 @@ fn from_root(folder: &str) -> String {
     }
 }
 
+/// Take the display back after a payload has had it.
+///
+/// The card is free as soon as the payload's last process is gone, but the
+/// kernel is not obliged to hand it over in that same instant, and the plain
+/// open would end the run on the first refusal. A few tries over a second cost
+/// nothing at a hand-over that happens once per browser session, and a phone
+/// whose screen stays dark because its own recovery gave up is the worst of the
+/// outcomes here.
+#[cfg(target_os = "android")]
+fn take_surface(fastest: bool) -> Result<KmsSurface> {
+    match KmsSurface::open("/dev/dri/card0", fastest) {
+        Ok(surface) => Ok(surface),
+        Err(first) => {
+            let _ = skyward_sys::kmsg(&format!("the display would not come back at once: {first:#}"));
+            let mut last = first;
+            for attempt in 1..=8 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                match KmsSurface::open("/dev/dri/card0", fastest) {
+                    Ok(surface) => {
+                        let _ = skyward_sys::kmsg(&format!("the display came back on try {attempt}"));
+                        return Ok(surface);
+                    }
+                    Err(e) => last = e,
+                }
+            }
+            Err(last)
+        }
+    }
+}
+
 /// Read a folder for the file manager, as it is now. A folder of a user
 /// whose own files are still closed says so in place of its entries: the
 /// names in it cannot be read until that user's credential is given.
@@ -2584,6 +2614,13 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             bcb::clear(&misc)?;
                             kept = false;
                         }
+                        // Everything written has to be on the medium before the
+                        // phone goes down: the kernel's own restart walks every
+                        // block device, and a device with dirty pages still
+                        // queued behind it is a restart that can hang. It costs
+                        // a moment here and it is the one place that knows the
+                        // phone is about to stop.
+                        unsafe { libc::sync() };
                         power(target)?
                     }
                     Effect::Dismiss => {
@@ -2876,7 +2913,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     Effect::OpenBrowser { image, program } => {
                         drop(surface);
                         let outcome = crate::browser::open(Path::new(&image), &program);
-                        surface = KmsSurface::open("/dev/dri/card0", cfg.display.fastest_refresh)?;
+                        surface = take_surface(cfg.display.fastest_refresh)?;
                         let said = match outcome {
                             Ok(end) => match end.code {
                                 Some(0) => app.state.lang.pick([

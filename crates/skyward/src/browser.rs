@@ -174,13 +174,77 @@ fn attach(image: &Path) -> Result<String> {
     Ok(device)
 }
 
+/// Let the loop device go, and keep asking until it goes.
+///
+/// The image can still be held for a moment after the last process that had it
+/// has ended, so one try is not always enough. This matters more than it looks:
+/// a loop device left attached over a file on a mounted partition is the shape
+/// of a phone that never finishes rebooting, because the kernel's own device
+/// shutdown walks into a block device with I/O still queued behind it.
 fn detach(device: &str) {
-    let _ = Command::new("/system/bin/losetup")
-        .args(["-d", device])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    for attempt in 1..=6 {
+        let gone = Command::new("/system/bin/losetup")
+            .args(["-d", device])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if gone {
+            return;
+        }
+        let _ = skyward_sys::kmsg(&format!("the loop device {device} is still held; asking again ({attempt})"));
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let _ = skyward_sys::kmsg(&format!("the loop device {device} would not come off"));
+}
+
+/// End everything the payload started, not only the process that ended.
+///
+/// The payload is started as the leader of its own process group for this
+/// reason: the script that starts a browser is not the only thing it starts,
+/// and a compositor left in the background keeps DRM master and keeps the
+/// image's loop device busy. One negative signal reaches the whole group.
+fn end_group(id: u32) {
+    let group = -i32::try_from(id).unwrap_or(i32::MAX);
+    for (signal, named) in [(libc::SIGTERM, "term"), (libc::SIGKILL, "kill")] {
+        if unsafe { libc::kill(group, signal) } != 0 {
+            let wrong = os_error();
+            // Nothing left to signal is the state being asked for, not a fault.
+            if wrong.raw_os_error() != Some(libc::ESRCH) {
+                let _ = skyward_sys::kmsg(&format!("the browser's group would not take a {named}: {wrong}"));
+            }
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// What a browser's own children do to escape a process group.
+///
+/// A browser puts its renderers and its zygote in process groups of their own,
+/// so one negative signal does not reach them, and a renderer that survives
+/// keeps the image's folders busy. What they cannot change is where their root
+/// is: every process still running with this chroot as its root is a process of
+/// the payload and nothing else, so that is how they are found. Returns how many
+/// were signalled.
+fn kill_inside(root: &Path) -> usize {
+    let Ok(entries) = fs::read_dir("/proc") else { return 0 };
+    let mut ended = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_string_lossy().parse::<i32>().ok() else { continue };
+        // A process of ours is one whose root is the image's folder. Our own
+        // root is "/", so nothing here can name this process.
+        if fs::read_link(entry.path().join("root")).ok().as_deref() != Some(root) {
+            continue;
+        }
+        if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
+            ended += 1;
+        }
+    }
+    ended
 }
 
 /// What filesystem an image holds, read from the image itself.
@@ -218,6 +282,57 @@ fn set_enforce(value: &str) {
     let _ = fs::write("/sys/fs/selinux/enforce", value);
 }
 
+/// Take apart what a session that ended without its drop left behind.
+///
+/// The release build aborts on a panic, and an aborted process runs no
+/// destructors, so a session that died that way leaves the image mounted on its
+/// loop device. That is not only untidy: a loop device still attached over a
+/// file on a mounted partition is the shape of a phone whose reboot never
+/// finishes, because the kernel's own device shutdown walks into a block device
+/// with I/O still queued behind it. So anything under the work folder comes off,
+/// and any loop device backed by a file of ours is detached, before a new
+/// session is laid out — which also means the folder can be removed at all,
+/// since a mount point cannot be.
+fn clear_leftovers() {
+    if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+        // Collected first: unmounting while reading the file that describes the
+        // mounts reads a list that is changing underneath.
+        let stale: Vec<String> = mounts
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .filter(|at| at.starts_with(WORK))
+            .map(|at| at.replace("\\040", " "))
+            .collect();
+        for at in stale {
+            let Ok(target) = cstr(Path::new(&at)) else { continue };
+            if unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) } == 0 {
+                let _ = skyward_sys::kmsg(&format!("a mount left by an earlier browser session ({at}) came off"));
+            } else {
+                let _ = skyward_sys::kmsg(&format!("a mount left by an earlier browser session ({at}) would not come off: {}", os_error()));
+            }
+        }
+    }
+    let Ok(blocks) = fs::read_dir("/sys/block") else { return };
+    for entry in blocks.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy().into_owned();
+        if !name.starts_with("loop") {
+            continue;
+        }
+        let Ok(file) = fs::read_to_string(entry.path().join("loop/backing_file")) else { continue };
+        // Only ours: the recovery attaches loops for other work too, and
+        // detaching someone else's device would be a fault of its own.
+        if !(file.contains("/Skyward/") || file.contains("/skyward/")) {
+            continue;
+        }
+        detach(&format!("/dev/block/{name}"));
+        let _ = skyward_sys::kmsg(&format!(
+            "the loop device {name}, left on {} by an earlier browser session, is detached",
+            file.trim()
+        ));
+    }
+}
+
 impl Lay {
     /// Lay the image out. Every step that mounts something records it first,
     /// so a failure half way leaves nothing behind.
@@ -225,6 +340,7 @@ impl Lay {
         if !image.is_file() {
             bail!("{} is not a file", image.display());
         }
+        clear_leftovers();
         let root = Path::new(WORK).join("root");
         let _ = fs::remove_dir_all(WORK);
         fs::create_dir_all(&root).with_context(|| format!("make {}", root.display()))?;
@@ -350,6 +466,9 @@ impl Lay {
             });
         }
         let started = Instant::now();
+        // Its own process group, so that what the payload leaves running in the
+        // background can be ended with it.
+        cmd.process_group(0);
         let mut child = cmd.spawn().with_context(|| format!("start {program}"))?;
         let code = loop {
             if let Some(status) = child.try_wait().context("ask after the browser")? {
@@ -363,6 +482,19 @@ impl Lay {
             }
             std::thread::sleep(Duration::from_millis(200));
         };
+        // The process that ended is not always the last one holding something:
+        // the payload's script starts its compositor in the background, and a
+        // survivor keeps the DRM card and the image's loop device. Nothing the
+        // payload started outlives it.
+        end_group(child.id());
+        child.wait().context("reap the browser")?;
+        // And a process that moved itself out of that group — a browser's own
+        // children do — is found by where its root is: anything still running
+        // inside this chroot is ours to end.
+        let left = kill_inside(&self.root);
+        if left > 0 {
+            let _ = skyward_sys::kmsg(&format!("{left} process(es) the browser left inside its image were ended"));
+        }
         // A browser that ended at once is a browser that failed; what it said
         // before it did is the only way to know why from the kernel log.
         if !matches!(code, Some(0) | None) {
@@ -388,6 +520,11 @@ impl Drop for Lay {
             }
         }
         if let Some(device) = &self.device {
+            // Everything written through the image and the bound partitions has
+            // to be on the medium before the device goes. A phone rebooted with
+            // dirty pages over a loop device is a phone whose kernel can hang in
+            // its own shutdown, which is exactly what a browser must not cause.
+            unsafe { libc::sync() };
             detach(device);
         }
         if let Some(enforce) = &self.enforce {
