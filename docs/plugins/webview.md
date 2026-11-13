@@ -97,10 +97,44 @@ DRM master), the child opens `/dev/dri/card0` itself, and on exit Skyward opens
 the card again and redraws. Nothing is shared, nothing is proxied; the browser
 owns the panel while it runs.
 
-Input comes from `/dev/input/event*`, which is bound into the chroot. Chromium's
-DRM platform finds devices through libinput, and libinput wants udev: the payload
-runs its own `systemd-udevd` against the bound `/sys` and a private `/run`, which
-is also what makes hotplug and the touchscreen's properties appear.
+Which process opens the card is decided by two facts about this phone, both
+measured rather than assumed:
+
+- **The kernel is built with `# CONFIG_VT is not set`.** libseat marks a session
+  active by opening `tty0`, so with no virtual terminal a session can never
+  become active, and every compositor that goes through libseat — weston, cage,
+  anything wlroots-shaped — dies before it creates its socket. Weston's own log
+  says it: `Could not open tty0 to update VT`, `Could not open device: Operation
+  not permitted`, `no drm device found`, `fatal: failed to create compositor
+  backend`. Chromium then reports `Failed to connect to Wayland display`, which
+  is a symptom, not the fault.
+- **Debian's Chromium has no DRM ozone platform.** `grep -a -o
+  "ozone_platform_[a-z_]*" /usr/lib/chromium/chromium | sort -u` gives exactly
+  `ozone_platform_wayland` and `ozone_platform_x`, so the browser cannot be told
+  to take the card itself.
+
+What is left is an **X server**, which needs no seat at all: its `modesetting`
+driver opens `/dev/dri` itself and `-sharevts` keeps it out of VT handling
+entirely. So the payload starts `Xorg :0 -sharevts -novtswitch`, waits for
+`/tmp/.X11-unix/X0`, and starts Chromium with `--ozone-platform=x11` at the
+panel's own geometry (there is no window manager to place it).
+
+Input comes from `/dev/input/event*`, which is bound into the chroot. X's
+libinput driver finds devices through udev, so the payload starts its own
+`systemd-udevd` — by `/usr/lib/systemd/systemd-udevd`, because in this suite
+that name is a link to the multicall `udevadm` and is not on `PATH`. `udevadm`
+refuses to trigger inside a chroot (`Running in chroot, ignoring request`), so
+the kernel is told about each device directly: `echo add >
+/sys/class/input/event*/uevent`.
+
+Typing needs a keyboard on the glass: `xvkbd` is started after the browser so
+that it is mapped on top of it, which is what makes a captive portal answerable.
+
+Two other things the phone taught, both now in the payload's script: the binary
+to run is `/usr/lib/chromium/chromium`, because `/usr/bin/chromium` is a shell
+wrapper that fails under dash at its ninth line; and everything the payload
+prints has to go to a file on the data partition, because the recovery's only
+record otherwise is an exit code.
 
 ### Video and audio — what is honest
 
@@ -239,18 +273,27 @@ one.
 
 ## What is not known yet — to be probed on the phone
 
-1. Is `/data` mounted `noexec`? (Decides whether the payload can be executed
-   from a mounted image or must be mounted with `exec`.)
-2. Does `/dev/dri/card0` come back cleanly after being closed and reopened while
-   the panel is on? (Decides whether the handover is a release or needs a mode
-   reset.)
-3. Are `/dev/input/event*` readable from the `recovery` domain, and does the
-   touchscreen report through evdev with usable axes?
-4. How much RAM is free while Skyward is up? (Chromium wants ~400 MB idle.)
-5. Does the kernel mount our image at all, and do loop devices work from the
-   recovery? (`losetup` is already used for images, so probably yes; erofs is
-   chosen so the filesystem side of this is not a gamble.)
-6. Is `/dev/snd` present and does a plain ALSA open work?
+Answered so far, all from the phone with `adb`:
+
+1. ~~Is `/data` mounted `noexec`?~~ No: `/data` and `/sdcard` are one `dm-8`
+   f2fs mounted `rw,nosuid,nodev`, and the payload runs from a loop-mounted
+   read-only image, so this never mattered.
+2. ~~Does `/dev/dri/card0` come back cleanly?~~ Yes — the card is dropped before
+   the payload starts and reopened after it exits, and the page redraws.
+3. ~~Are `/dev/input/event*` readable?~~ Yes, `event0`…`event7` are there and
+   readable as root.
+5. ~~Does the kernel mount the image, and do loop devices work?~~ Yes: erofs
+   mounts with `losetup -r`, and the image's own superblock checks out
+   (`blocks × 4096` equals the file size exactly).
+6. Is `/dev/snd` present and does a plain ALSA open work? Still open — and with
+   no vendor HAL in the chroot, sound is expected to be silent.
+
+Still open:
+
+4. How much RAM is free while Skyward is up? (Chromium wants ~400 MB idle, and
+   X plus Chromium together more.)
+7. Does Xorg's `modesetting` driver take this card under `-sharevts`, and does
+   Chromium draw a page through it? This is what payload 1.3 exists to answer.
 
 ## Risks
 
