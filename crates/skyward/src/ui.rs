@@ -337,6 +337,28 @@ fn from_root(folder: &str) -> String {
     }
 }
 
+/// Ask the kernel for a plain restart.
+///
+/// `RESTART` is what the kernel calls when nothing else is asked of it; it does
+/// not involve init, and that is the point. Init's shutdown stops every service
+/// and unmounts every filesystem in a queue with waits in it, and a phone that
+/// has run a payload can be left in a shape that queue waits on for ever — a
+/// black screen and a USB port that is not there any more. Nothing is lost by
+/// skipping it here: the caller has already put every write on the medium, and
+/// the bootloader boots the system without being told.
+///
+/// The numbers are the kernel's own interface (include/uapi/linux/reboot.h):
+/// `LINUX_REBOOT_CMD_RESTART`, which is also the value of glibc's `RB_AUTOBOOT`.
+/// They are written out because the `libc` crate does not expose either of them
+/// for Android.
+unsafe fn restart() {
+    const LINUX_REBOOT_CMD_RESTART: libc::c_int = 0x0123_4567;
+    unsafe extern "C" {
+        fn reboot(how: libc::c_int) -> libc::c_int;
+    }
+    let _ = unsafe { reboot(LINUX_REBOOT_CMD_RESTART) };
+}
+
 /// What the phone was still holding when it went down, kept where the next boot
 /// can read it.
 ///
@@ -2676,6 +2698,19 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         // a moment here and it is the one place that knows the
                         // phone is about to stop.
                         unsafe { libc::sync() };
+                        // A plain restart is asked of the kernel directly. Init's
+                        // shutdown is a queue of its own -- stop every service,
+                        // unmount every filesystem, wait for each one -- and
+                        // anything a payload left in a shape it does not expect
+                        // is waited on there, which is what a phone that goes
+                        // black and does not come back looks like. Everything
+                        // written is already on the medium (the sync above) and
+                        // the bootloader needs nothing from init to boot.
+                        if matches!(target, Target::System) {
+                            let _ = skyward_sys::kmsg("restarting through the kernel, without asking init to shut down");
+                            unsafe { restart() };
+                            let _ = skyward_sys::kmsg("the kernel would not restart; asking init instead");
+                        }
                         power(target)?
                     }
                     Effect::Dismiss => {
