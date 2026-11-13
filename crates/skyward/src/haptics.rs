@@ -24,19 +24,19 @@ const NOMINAL_HZ: f32 = 172.4;
 /// waveform it keeps for as long as that one is; either way the click is
 /// taken away once its length has passed.
 ///
-/// Eight milliseconds of a swing at about two hundred hertz is two swings and
-/// twenty is four or so, which is what a linear motor's click is made of.
-/// Held for much longer the same sine stops being a click and becomes a buzz:
-/// the finger is given enough swings in a row to feel the vibration rather
-/// than the tap.
+/// Twelve milliseconds of a swing at about two hundred hertz is two or three
+/// swings and twenty-six is five or so, which is what a linear motor's click
+/// is made of. Held for much longer the same sine stops being a click and
+/// becomes a buzz: the finger is given enough swings in a row to feel the
+/// vibration rather than the tap.
 ///
 /// The length carries the slider as well as the strength does, because a
 /// driver that keeps its own waveform need not make anything of the strength
 /// an effect is given: what a finger reads as how strong a click is, is how
 /// much of a swing it got, and half the swings at the same amplitude is half
 /// of that.
-const LIGHT_CLICK_MS: u16 = 8;
-const HEAVY_CLICK_MS: u16 = 20;
+const LIGHT_CLICK_MS: u16 = 12;
+const HEAVY_CLICK_MS: u16 = 26;
 
 /// How long the click takes to come up, in whole milliseconds. A swing that
 /// starts at its full strength cracks; one that starts over a millisecond is
@@ -44,7 +44,7 @@ const HEAVY_CLICK_MS: u16 = 20;
 const ATTACK_MS: u16 = 1;
 
 /// How long a click of `length` takes to go away again: two fifths of it,
-/// which is three milliseconds of the light click and six of the heavy one.
+/// which is five milliseconds of the light click and ten of the heavy one.
 fn fade_of(length: u16) -> u16 {
     u16::max(2, length * 2 / 5)
 }

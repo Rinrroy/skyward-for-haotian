@@ -292,7 +292,12 @@ firmware = [
     { name = "cs40l26-dbc.bin", path = "/odm/firmware/cs40l26-dbc.bin" },
     { name = "cs40l26-a2h.bin", path = "/odm/firmware/cs40l26-a2h.bin" },
 ]
-strength = { lightest = 0.25, strongest = 0.75 }
+# From four tenths to the whole of what the waveform drives the motor with:
+# the owner tried the click at the old three quarters and found both ends of
+# the slider too weak, so the ceiling is the driver's own top now. If the
+# motor rattles at the top end, that is where the rattle is, and it is the
+# ceiling that comes down rather than the slider's reach.
+strength = { lightest = 0.4, strongest = 1.0 }
 
 # The panel's own doze, as the system's always-on display uses it, tried by
 # hand in the recovery.
