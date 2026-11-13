@@ -67,9 +67,9 @@ const DNS: [&str; 2] = ["223.5.5.5", "119.29.29.29"];
 const LONGEST: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// The framebuffer the payload's display server keeps, as a file this can read:
-/// `Xvfb :0 -screen 0 1440x3200x24 -fbdir /data/skyward/browser/fb` writes every
-/// pixel it holds there, and the recovery is what those pixels reach the panel
-/// through.
+/// `Xvfb :0 -screen 0 1440x3200x24 -fbdir /run/skyward/fb` writes every pixel it
+/// holds there — a folder of the recovery's own memory, bound into the image —
+/// and the recovery is what those pixels reach the panel through.
 ///
 /// This is the third answer to "who draws on this phone", and the first two were
 /// measured rather than guessed: a Wayland compositor cannot take a seat because
@@ -79,10 +79,15 @@ const LONGEST: Duration = Duration::from_secs(2 * 60 * 60);
 /// been taken off the card entirely: it draws into its own memory, and this
 /// module copies that memory onto the panel with the card the recovery already
 /// holds.
-const MIRROR: &str = "/data/skyward/browser/fb/Xvfb_screen0";
+const MIRROR: &str = "/skyward/run/browser/fb/Xvfb_screen0";
+
+/// The folder that file lives in, on this side of the chroot; the payload sees
+/// the same folder as `/run/skyward/fb`.
+const FB_DIR: &str = "/skyward/run/browser/fb";
 
 /// What the payload's display server was told to be. A framebuffer file carries
-/// no shape of its own, so the shape has to be agreed on both sides.
+/// its own shape in its header, and this is what is assumed only until that
+/// header has been read.
 const MIRROR_SHAPE: (u32, u32) = (1440, 3200);
 
 /// Where one line per finger goes, for the payload to turn into a pointer
@@ -90,8 +95,9 @@ const MIRROR_SHAPE: (u32, u32) = (1440, 3200);
 /// of a display server that never sees it.
 const TOUCH: &str = "/data/skyward/browser/touch.fifo";
 
-/// How often the panel is offered a new frame. Thirty a second is more than a
-/// page being read needs and less than a finger can feel the lack of.
+/// How often a finger on the panel is looked at. The panel itself is written
+/// far less often than this (see `PRESENT_EVERY`), but a touch that waits for a
+/// frame to be built is a touch that feels late.
 const FRAME: Duration = Duration::from_millis(33);
 
 /// How the browser ended, for the page that started it.
@@ -192,24 +198,77 @@ enum Disc {
     Keyboard,
 }
 
+/// How often the panel is offered a new frame at most.
+///
+/// A page being read changes nothing most of the time, and a page being drawn
+/// changes something every frame; fifteen frames a second is smooth enough for
+/// both and leaves the rest of the phone its own time. The phone this runs on
+/// has one display, and every frame is eighteen megabytes written twice — once
+/// into a canvas and once into the panel's buffer.
+const PRESENT_EVERY: Duration = Duration::from_millis(66);
+
+/// The file the display server writes, mapped rather than copied: it is already
+/// in memory, and copying eighteen megabytes out of it every frame to look at is
+/// work this phone cannot spare while a browser is drawing.
+struct Mapping {
+    at: *mut libc::c_void,
+    len: usize,
+}
+
+impl Mapping {
+    fn of(file: &fs::File, len: usize) -> Option<Self> {
+        if len == 0 {
+            return None;
+        }
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(file);
+        let at = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
+        if at == libc::MAP_FAILED {
+            return None;
+        }
+        Some(Self { at, len })
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // Safety: the mapping is this long and alive for as long as the struct
+        // is; the payload only ever writes into it.
+        unsafe { std::slice::from_raw_parts(self.at as *const u8, self.len) }
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.at, self.len);
+        }
+    }
+}
+
 /// The payload's framebuffer, on its way to the panel.
 ///
-/// Each pass reads the file the display server writes and puts on the panel only
+/// Each pass looks at what the display server holds and puts on the panel only
 /// the rows that changed since the pass before, so a page being read costs
-/// almost nothing and a page being drawn costs one blit.
+/// almost nothing and a page being drawn costs one blit. Nothing in here says
+/// anything to the kernel log more than once a second: a fault that repeats
+/// every frame is what fills the log, and a full log stops the phone.
 struct Mirror {
     /// What the panel is given: the same shape as the panel, in the byte order
     /// the drawing canvas uses.
     canvas: Canvas,
-    /// The payload's pixels as they were read this time, and as they were the
-    /// time before, to know what to send.
-    now: Vec<u8>,
+    /// The file, mapped, and the pixels as they were the pass before, to know
+    /// what to send.
+    map: Option<Mapping>,
     was: Vec<u8>,
     /// What the last frame read said about itself, and what it is assumed to be
     /// while the file has not been read yet.
     dump: Dump,
     /// Whether anything has ever been sent, so the first frame always goes.
     shown: bool,
+    /// Whether a frame is waiting for the next one that may be sent, when the
+    /// last one went, and how far apart frames are being put while the panel
+    /// keeps up.
+    pending: bool,
+    last_present: Instant,
+    every: Duration,
     /// Whether the payload has been asked for its keyboard, and whether the
     /// discs on the panel were drawn in the state they are now in.
     keyboard: bool,
@@ -219,6 +278,14 @@ struct Mirror {
     /// Said once: the header was not one this understands, so the frame is
     /// guessed at, which is worse but still shows something.
     guessed: bool,
+    /// The last time anything was said to the kernel log, so a fault that
+    /// happens every frame cannot fill it.
+    said: Instant,
+    /// What the frames have been doing, for the log that outlives a freeze.
+    frames: u64,
+    presents: u64,
+    worst: Duration,
+    tick: Instant,
 }
 
 impl Mirror {
@@ -226,17 +293,46 @@ impl Mirror {
         let (w, h) = size;
         let (sw, sh) = MIRROR_SHAPE;
         let assumed = Dump { width: sw, height: sh, stride: (sw as usize) * 4, offset: 0, order: 0 };
-        let _ = (w, h);
         Self {
             canvas: Canvas::unfilled(w, h, 0..h),
-            now: Vec::new(),
+            map: None,
             was: Vec::new(),
             dump: assumed,
             shown: false,
+            pending: false,
+            last_present: Instant::now(),
+            every: PRESENT_EVERY,
             keyboard: false,
             drawn: false,
             missed: 0,
             guessed: false,
+            said: Instant::now() - Duration::from_secs(2),
+            frames: 0,
+            presents: 0,
+            worst: Duration::ZERO,
+            tick: Instant::now(),
+        }
+    }
+
+    /// Say something, but not more often than once a second.
+    fn say(&mut self, line: impl FnOnce() -> String) {
+        if self.said.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.said = Instant::now();
+        let _ = skyward_sys::kmsg(&line());
+    }
+
+    /// Add a line to the log that survives a freeze, next to the payload's own.
+    fn note(&mut self, line: &str) {
+        let Some(dir) = log_path().parent().map(|p| p.to_path_buf()) else { return };
+        let at = dir.join("mirror.log");
+        // A log this writes is only useful while it is small enough to read.
+        if fs::metadata(&at).map(|m| m.len() > 512 * 1024).unwrap_or(false) {
+            let _ = fs::remove_file(&at);
+        }
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&at) {
+            let _ = writeln!(file, "{line}");
         }
     }
 
@@ -288,8 +384,10 @@ impl Mirror {
         }
     }
 
-    /// One frame: read what the payload holds, and send it if it is new.
+    /// One frame: look at what the payload holds, and send it if it is new.
     fn show(&mut self, surface: &mut dyn Surface) -> Result<()> {
+        let began = Instant::now();
+        self.frames = self.frames.saturating_add(1);
         let (w, h) = (self.canvas.w, self.canvas.h);
         let file = match fs::File::open(MIRROR) {
             Ok(file) => file,
@@ -298,37 +396,56 @@ impl Mirror {
                 // first frame is not due yet.
                 self.missed = self.missed.saturating_add(1);
                 if self.missed == 1 || self.missed.is_multiple_of(50) {
-                    let _ = skyward_sys::kmsg(&format!("the browser's framebuffer is not there yet ({e})"));
+                    self.say(|| format!("the browser's framebuffer is not there yet ({e})"));
                 }
                 return Ok(());
             }
         };
-        match Dump::of(&file) {
-            Some(dump) => self.dump = dump,
-            None => {
-                if !self.guessed {
-                    self.guessed = true;
-                    let _ = skyward_sys::kmsg("the browser's framebuffer does not say what shape it is; it is being guessed at");
+        let len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+        // The shape is read when the file is first mapped and whenever what the
+        // file holds is not what it held before, because a display server that
+        // was restarted writes a new file.
+        if self.map.as_ref().map(|m| m.len) != Some(len) {
+            match Dump::of(&file) {
+                Some(dump) => self.dump = dump,
+                None => {
+                    if !self.guessed {
+                        self.guessed = true;
+                        self.say(|| "the browser's framebuffer does not say what shape it is; it is being guessed at".into());
+                    }
                 }
             }
+            self.map = Mapping::of(&file, len);
+            let need = self.dump.len();
+            if self.was.len() != need {
+                self.was.resize(need, 0);
+            }
+            self.shown = false;
+        }
+        if self.map.is_none() {
+            self.say(|| format!("the browser's framebuffer at {MIRROR} cannot be mapped"));
+            return Ok(());
         }
         let Dump { width: sw, height: sh, stride, offset, order } = self.dump;
         if sw == 0 || sh == 0 {
             return Ok(());
         }
         let need = self.dump.len();
-        if self.now.len() != need {
-            self.now.resize(need, 0);
-            self.was.resize(need, 0);
-            self.shown = false;
+        let have = self.map.as_ref().map(|m| m.len).unwrap_or(0);
+        if have < need {
+            // The file is shorter than what its own header says: the server is
+            // still writing it out. Saying so every frame would fill the log.
+            self.say(|| format!("the browser's framebuffer is {have} bytes and its header says {need}"));
+            return Ok(());
         }
-        file.read_exact_at(&mut self.now, 0).with_context(|| format!("read {MIRROR}"))?;
+        let Some(map) = self.map.as_ref() else { return Ok(()) };
+        let pixels = map.bytes();
         let mut changed = false;
         for y in 0..h {
             let sy = if sh == h { y } else { y.saturating_mul(sh) / h.max(1) };
             let src = offset + (sy as usize) * stride;
             let dst = (y as usize) * (w as usize) * 4;
-            let row = &self.now[src..src + (sw as usize) * 4];
+            let row = &pixels[src..src + (sw as usize) * 4];
             if self.shown && row == &self.was[src..src + (sw as usize) * 4] {
                 continue;
             }
@@ -355,7 +472,7 @@ impl Mirror {
                 }
             }
         }
-        self.was.copy_from_slice(&self.now);
+        self.was.copy_from_slice(&pixels[..need]);
         // The discs are drawn after the page so a frame that changed under them
         // cannot rub them out, and a change of keyboard state is a frame of its
         // own: the page below it goes on being unchanged.
@@ -365,10 +482,47 @@ impl Mirror {
             changed = true;
         }
         if changed {
+            self.pending = true;
+        }
+        // One frame in fifteen, and the first one always: a page animating at
+        // its own speed must not decide how often the panel is written. A panel
+        // that turns out to be slower than that is given more room rather than
+        // being asked again at the same pace.
+        if self.pending && (self.presents == 0 || self.last_present.elapsed() >= self.every) {
+            let sending = Instant::now();
             surface.present(&self.canvas).context("put the browser's frame on the panel")?;
-            self.shown = true;
+            let sending = sending.elapsed();
+            self.presented();
+            if sending > Duration::from_millis(250) {
+                // Writing the panel is taking longer than the phone can spare.
+                // Asking less often is the difference between a browser that is
+                // a little behind and one that holds the phone still.
+                self.every = (self.every * 2).min(Duration::from_millis(500));
+                self.note(&format!("sending a frame took {} ms; frames are {} ms apart now", sending.as_millis(), self.every.as_millis()));
+            }
+        }
+        let took = began.elapsed();
+        self.worst = self.worst.max(took);
+        if self.tick.elapsed() >= Duration::from_secs(1) {
+            self.tick = Instant::now();
+            let line = format!(
+                "frames {} in a second, presented {}, worst frame {} ms",
+                self.frames,
+                self.presents,
+                self.worst.as_millis()
+            );
+            self.frames = 0;
+            self.worst = Duration::ZERO;
+            self.note(&line);
         }
         Ok(())
+    }
+
+    fn presented(&mut self) {
+        self.presents = self.presents.saturating_add(1);
+        self.last_present = Instant::now();
+        self.pending = false;
+        self.shown = true;
     }
 }
 
@@ -728,6 +882,16 @@ impl Lay {
             let data = format!("mode={mode}");
             lay.onto(None, &at, Some("tmpfs"), libc::MS_NOSUID | libc::MS_NODEV, Some(&data))?;
         }
+        // The framebuffer the display server writes is eighteen megabytes
+        // rewritten many times a second. Left in the phone's own storage that is
+        // a writeback storm the browser spends every frame paying for; given to
+        // it from memory it costs the memory and nothing else. It is a folder of
+        // ours, bound where the payload expects to find it.
+        let fb = Path::new(FB_DIR);
+        fs::create_dir_all(fb).with_context(|| format!("make {}", fb.display()))?;
+        let seen = lay.root.join("run/skyward/fb");
+        fs::create_dir_all(&seen).with_context(|| format!("make {}", seen.display()))?;
+        lay.onto(Some(fb), &seen, None, libc::MS_BIND | libc::MS_REC, None)?;
         lay.resolver()?;
         lay.data()?;
         lay.enforce = enforce_now();
@@ -852,13 +1016,9 @@ impl Lay {
                 let _ = child.kill();
                 break None;
             }
-            // Drawing first: a finger answered before the frame that shows where
-            // it landed is answered blind.
-            if let Err(e) = mirror.show(surface) {
-                // A frame that will not go to the panel is worth a line and no
-                // more: the browser is still running and may yet be usable.
-                let _ = skyward_sys::kmsg(&format!("a frame from the browser was not shown: {e:#}"));
-            }
+            // A finger first, every pass: the panel is written a few times a
+            // second, and a touch that waited for a frame to be built would be
+            // felt as a touch that did not happen.
             if let Ok(events) = inputs.read() {
                 finger.set_shape(mirror.shape());
                 for event in events {
@@ -882,6 +1042,11 @@ impl Lay {
                         crate::input::Event::Key(_, _) => {}
                     }
                 }
+            }
+            if let Err(e) = mirror.show(surface) {
+                // A frame that will not go to the panel is worth a line and no
+                // more: the browser is still running and may yet be usable.
+                let _ = skyward_sys::kmsg(&format!("a frame from the browser was not shown: {e:#}"));
             }
             std::thread::sleep(FRAME);
         };
