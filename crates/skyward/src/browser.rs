@@ -28,6 +28,7 @@
 use anyhow::{bail, Context, Result};
 use skyward_ui::app::{Key, Touch};
 use skyward_ui::canvas::Canvas;
+use skyward_ui::color::Rgba;
 use skyward_ui::surface::Surface;
 use std::ffi::CString;
 use std::fs;
@@ -113,6 +114,84 @@ struct Lay {
     enforce: Option<String>,
 }
 
+/// What the payload's display server puts in its framebuffer file.
+///
+/// The file is not raw pixels. `Xvfb -fbdir` writes an XWD image: a header of
+/// `header_size` bytes, then a colour table of `ncolors` entries of twelve
+/// bytes, and only then the picture, row by row with `bytes_per_line` in a row.
+/// Read from the first byte instead, that header lands on the panel as if it
+/// were the top of the page and every row below it is shifted — which is what a
+/// page wearing a seam, drawn twice, is made of.
+struct Dump {
+    width: u32,
+    height: u32,
+    /// Bytes from the start of one row to the start of the next.
+    stride: usize,
+    /// Where the first pixel is.
+    offset: usize,
+    /// 0 when the pixels are least significant byte first, 1 when they are not.
+    order: u32,
+}
+
+/// The first hundred bytes are enough: twenty-five big-endian words describe the
+/// image, and the colour table that follows is counted rather than read.
+const XWD_HEAD: usize = 100;
+
+/// The version of the dump format this understands.
+const XWD_VERSION: u32 = 7;
+
+fn word(head: &[u8; XWD_HEAD], at: usize) -> u32 {
+    u32::from_be_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]])
+}
+
+impl Dump {
+    /// What a header says, or nothing when it is not a header this understands.
+    fn parse(head: &[u8; XWD_HEAD]) -> Option<Self> {
+        if word(head, 4) != XWD_VERSION {
+            return None;
+        }
+        let header = word(head, 0) as usize;
+        let colours = word(head, 76) as usize;
+        let width = word(head, 16);
+        let height = word(head, 20);
+        let order = word(head, 28);
+        let bits = word(head, 44);
+        let stride = word(head, 48) as usize;
+        if !(XWD_HEAD..=8192).contains(&header) || colours > 65_536 {
+            return None;
+        }
+        if width == 0 || height == 0 || width > 16_384 || height > 16_384 || order > 1 {
+            return None;
+        }
+        // Four-byte pixels are the only shape a canvas can take, and a row
+        // shorter than its pixels would read past each row into the next.
+        if bits != 32 || stride < (width as usize) * 4 {
+            return None;
+        }
+        Some(Self { width, height, stride, offset: header + colours * 12, order })
+    }
+
+    fn of(file: &fs::File) -> Option<Self> {
+        let mut head = [0u8; XWD_HEAD];
+        file.read_exact_at(&mut head, 0).ok()?;
+        Self::parse(&head)
+    }
+
+    /// How much of the file holds the picture.
+    fn len(&self) -> usize {
+        self.offset + self.stride * self.height as usize
+    }
+}
+
+/// Which of the two discs a finger landed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disc {
+    /// Leave the browser: the page has no way out of its own.
+    Back,
+    /// Ask the payload for its keyboard, or put it away again.
+    Keyboard,
+}
+
 /// The payload's framebuffer, on its way to the panel.
 ///
 /// Each pass reads the file the display server writes and puts on the panel only
@@ -126,23 +205,92 @@ struct Mirror {
     /// time before, to know what to send.
     now: Vec<u8>,
     was: Vec<u8>,
+    /// What the last frame read said about itself, and what it is assumed to be
+    /// while the file has not been read yet.
+    dump: Dump,
     /// Whether anything has ever been sent, so the first frame always goes.
     shown: bool,
+    /// Whether the payload has been asked for its keyboard, and whether the
+    /// discs on the panel were drawn in the state they are now in.
+    keyboard: bool,
+    drawn: bool,
     /// Reads that found nothing yet, counted so the log says it once.
     missed: u32,
+    /// Said once: the header was not one this understands, so the frame is
+    /// guessed at, which is worse but still shows something.
+    guessed: bool,
 }
 
 impl Mirror {
     fn new(size: (u32, u32)) -> Self {
         let (w, h) = size;
-        Self { canvas: Canvas::unfilled(w, h, 0..h), now: Vec::new(), was: Vec::new(), shown: false, missed: 0 }
+        let (sw, sh) = MIRROR_SHAPE;
+        let assumed = Dump { width: sw, height: sh, stride: (sw as usize) * 4, offset: 0, order: 0 };
+        let _ = (w, h);
+        Self {
+            canvas: Canvas::unfilled(w, h, 0..h),
+            now: Vec::new(),
+            was: Vec::new(),
+            dump: assumed,
+            shown: false,
+            keyboard: false,
+            drawn: false,
+            missed: 0,
+            guessed: false,
+        }
+    }
+
+    /// The shape the payload's page is drawn in, which is what a finger on the
+    /// panel has to be said in.
+    fn shape(&self) -> (u32, u32) {
+        (self.dump.width, self.dump.height)
+    }
+
+    /// The two discs, in panel pixels, at the bottom corners where a page keeps
+    /// nothing worth reading.
+    fn discs(&self) -> [(Disc, f32, f32); 2] {
+        let (w, h) = (self.canvas.w as f32, self.canvas.h as f32);
+        let edge = (w / 36.0).round();
+        let at = (h - edge, edge);
+        [(Disc::Back, at.1, at.0), (Disc::Keyboard, w - at.1, at.0)]
+    }
+
+    /// Which disc, if any, a point of the panel is on.
+    fn disc_at(&self, x: f32, y: f32) -> Option<Disc> {
+        let (w, _) = (self.canvas.w as f32, self.canvas.h as f32);
+        let reach = w / 18.0;
+        self.discs().into_iter().find(|(_, cx, cy)| (x - cx).powi(2) + (y - cy).powi(2) <= reach * reach).map(|(disc, _, _)| disc)
+    }
+
+    /// Draw the two discs into a finished frame.
+    fn draw_discs(&mut self) {
+        let reach = (self.canvas.w as f32 / 18.0).round();
+        let ink = Rgba::rgb(16, 16, 18).with_alpha(150);
+        let face = Rgba::rgb(255, 255, 255).with_alpha(235);
+        for (disc, cx, cy) in self.discs() {
+            self.canvas.fill_circle(cx, cy, reach, ink);
+            self.canvas.stroke_circle(cx, cy, reach, (reach / 18.0).max(2.0), face);
+            match disc {
+                Disc::Back => {
+                    self.canvas.line(cx + reach * 0.22, cy - reach * 0.34, cx - reach * 0.22, cy, (reach / 9.0).max(3.0), face);
+                    self.canvas.line(cx - reach * 0.22, cy, cx + reach * 0.22, cy + reach * 0.34, (reach / 9.0).max(3.0), face);
+                }
+                Disc::Keyboard => {
+                    let wide = reach * 0.9;
+                    let tall = reach * 0.62;
+                    self.canvas.stroke_round_rect(cx - wide / 2.0, cy - tall / 2.0, wide, tall, reach * 0.16, (reach / 14.0).max(2.0), face);
+                    for dot in [-0.28, 0.0, 0.28] {
+                        self.canvas.fill_circle(cx + wide * dot, cy - tall * 0.16, (reach / 14.0).max(2.0), face);
+                    }
+                    self.canvas.line(cx - wide * 0.3, cy + tall * 0.2, cx + wide * 0.3, cy + tall * 0.2, (reach / 14.0).max(2.0), face);
+                }
+            }
+        }
     }
 
     /// One frame: read what the payload holds, and send it if it is new.
     fn show(&mut self, surface: &mut dyn Surface) -> Result<()> {
         let (w, h) = (self.canvas.w, self.canvas.h);
-        let (sw, sh) = MIRROR_SHAPE;
-        let need = (sw as usize) * (sh as usize) * 4;
         let file = match fs::File::open(MIRROR) {
             Ok(file) => file,
             Err(e) => {
@@ -155,15 +303,30 @@ impl Mirror {
                 return Ok(());
             }
         };
+        match Dump::of(&file) {
+            Some(dump) => self.dump = dump,
+            None => {
+                if !self.guessed {
+                    self.guessed = true;
+                    let _ = skyward_sys::kmsg("the browser's framebuffer does not say what shape it is; it is being guessed at");
+                }
+            }
+        }
+        let Dump { width: sw, height: sh, stride, offset, order } = self.dump;
+        if sw == 0 || sh == 0 {
+            return Ok(());
+        }
+        let need = self.dump.len();
         if self.now.len() != need {
             self.now.resize(need, 0);
             self.was.resize(need, 0);
+            self.shown = false;
         }
         file.read_exact_at(&mut self.now, 0).with_context(|| format!("read {MIRROR}"))?;
         let mut changed = false;
         for y in 0..h {
             let sy = if sh == h { y } else { y.saturating_mul(sh) / h.max(1) };
-            let src = (sy as usize) * (sw as usize) * 4;
+            let src = offset + (sy as usize) * stride;
             let dst = (y as usize) * (w as usize) * 4;
             let row = &self.now[src..src + (sw as usize) * 4];
             if self.shown && row == &self.was[src..src + (sw as usize) * 4] {
@@ -171,27 +334,36 @@ impl Mirror {
             }
             changed = true;
             let out = &mut self.canvas.data[dst..dst + (w as usize) * 4];
+            let pixel_of = |from: &[u8]| -> [u8; 4] {
+                // The server keeps its pixels in one byte order and the canvas
+                // holds another; the fourth byte is padding either way.
+                if order == 0 {
+                    [from[2], from[1], from[0], 0xFF]
+                } else {
+                    [from[1], from[2], from[3], 0xFF]
+                }
+            };
             if sw == w {
                 for (pixel, from) in out.as_chunks_mut::<4>().0.iter_mut().zip(row.as_chunks::<4>().0) {
-                    // The server keeps its pixels in one byte order and the
-                    // canvas holds another; the fourth byte is not shown.
-                    pixel[0] = from[2];
-                    pixel[1] = from[1];
-                    pixel[2] = from[0];
-                    pixel[3] = 0xFF;
+                    *pixel = pixel_of(from);
                 }
             } else {
                 let last = row.len() - 4;
                 for (x, pixel) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     let from = &row[((x * (sw as usize)) / (w as usize).max(1) * 4).min(last)..];
-                    pixel[0] = from[2];
-                    pixel[1] = from[1];
-                    pixel[2] = from[0];
-                    pixel[3] = 0xFF;
+                    *pixel = pixel_of(from);
                 }
             }
         }
         self.was.copy_from_slice(&self.now);
+        // The discs are drawn after the page so a frame that changed under them
+        // cannot rub them out, and a change of keyboard state is a frame of its
+        // own: the page below it goes on being unchanged.
+        self.draw_discs();
+        if self.drawn != self.keyboard {
+            self.drawn = self.keyboard;
+            changed = true;
+        }
         if changed {
             surface.present(&self.canvas).context("put the browser's frame on the panel")?;
             self.shown = true;
@@ -209,11 +381,20 @@ struct Finger {
     to: Option<fs::File>,
     /// Whether the pipe has been looked for already, so its absence is said once.
     told_about: bool,
+    /// The shape the page is drawn in, which is what a point of the panel has to
+    /// be said in.
+    shape: (u32, u32),
 }
 
 impl Finger {
     fn new() -> Self {
-        Self { to: None, told_about: false }
+        Self { to: None, told_about: false, shape: MIRROR_SHAPE }
+    }
+
+    fn set_shape(&mut self, shape: (u32, u32)) {
+        if shape.0 > 0 && shape.1 > 0 {
+            self.shape = shape;
+        }
     }
 
     fn open(&mut self) -> bool {
@@ -239,7 +420,7 @@ impl Finger {
 
     /// A finger at a point on the panel, said in the payload's own pixels.
     fn at(&mut self, what: &str, x: f32, y: f32, size: (u32, u32)) {
-        let (sw, sh) = MIRROR_SHAPE;
+        let (sw, sh) = self.shape;
         let sx = (x.max(0.0) as u32).min(size.0.saturating_sub(1)).saturating_mul(sw) / size.0.max(1);
         let sy = (y.max(0.0) as u32).min(size.1.saturating_sub(1)).saturating_mul(sh) / size.1.max(1);
         self.say(&format!("{what} {sx} {sy}"));
@@ -679,13 +860,22 @@ impl Lay {
                 let _ = skyward_sys::kmsg(&format!("a frame from the browser was not shown: {e:#}"));
             }
             if let Ok(events) = inputs.read() {
+                finger.set_shape(mirror.shape());
                 for event in events {
                     match event {
-                        crate::input::Event::Touch(Touch::Down(x, y), _) => finger.at("down", x, y, surface.size()),
+                        crate::input::Event::Touch(Touch::Down(x, y), _) => match mirror.disc_at(x, y) {
+                            // The page has no window manager and no tab strip, so
+                            // the two things it cannot offer are drawn on top of it.
+                            Some(Disc::Back) => finger.key("Escape"),
+                            Some(Disc::Keyboard) => {
+                                mirror.keyboard = !mirror.keyboard;
+                                finger.say(if mirror.keyboard { "kbd on" } else { "kbd off" });
+                            }
+                            None => finger.at("down", x, y, surface.size()),
+                        },
                         crate::input::Event::Touch(Touch::Move(x, y), _) => finger.at("move", x, y, surface.size()),
                         crate::input::Event::Touch(Touch::Up, _) => finger.at("up", 0.0, 0.0, surface.size()),
-                        // The page has no window manager and no tab strip, so
-                        // the phone's own buttons are what it has: back is
+                        // The phone's own buttons are what the page has: back is
                         // escape, and the power button ends the browser.
                         crate::input::Event::Key(Key::Back, true) => finger.key("Escape"),
                         crate::input::Event::Key(Key::Power, true) => closed = true,
@@ -880,6 +1070,66 @@ mod tests {
         let cut = last_words(chinese, 13);
         assert!(chinese.ends_with(&cut), "{cut}");
         assert!(cut.chars().all(|c| chinese.contains(c)), "{cut}");
+    }
+
+    #[test]
+    fn a_frame_dump_says_where_its_pixels_begin() {
+        // The header the phone's own display server wrote when payload 1.8 was
+        // asked to draw a 1440x3200 page: 160 bytes of header, a colour table
+        // of 256 entries, then 5760 bytes a row.
+        let mut head = [0u8; XWD_HEAD];
+        let words: [(usize, u32); 13] = [
+            (0, 160),      // header size
+            (4, 7),        // file version
+            (8, 2),        // ZPixmap
+            (12, 24),      // depth
+            (16, 1440),    // width
+            (20, 3200),    // height
+            (28, 0),       // LSBFirst
+            (44, 32),      // bits per pixel
+            (48, 5760),    // bytes per line
+            (56, 0xFF0000), // red
+            (60, 0xFF00),  // green
+            (64, 0xFF),    // blue
+            (76, 256),     // colours in the table
+        ];
+        for (at, value) in words {
+            head[at..at + 4].copy_from_slice(&value.to_be_bytes());
+        }
+        let dump = Dump::parse(&head).expect("a header the display server writes");
+        assert_eq!((dump.width, dump.height), (1440, 3200));
+        assert_eq!(dump.stride, 5760);
+        assert_eq!(dump.offset, 160 + 256 * 12);
+        assert_eq!(dump.len(), dump.offset + 5760 * 3200);
+        assert_eq!(dump.order, 0);
+
+        // A file that is not a dump is not read as one: guessing shows
+        // something, and the caller falls back to what it assumed.
+        assert!(Dump::parse(&[0u8; XWD_HEAD]).is_none());
+        let mut wrong = head;
+        wrong[4..8].copy_from_slice(&3u32.to_be_bytes());
+        assert!(Dump::parse(&wrong).is_none(), "another version");
+        let mut short_row = head;
+        short_row[48..52].copy_from_slice(&1440u32.to_be_bytes());
+        assert!(Dump::parse(&short_row).is_none(), "a row shorter than its pixels");
+        let mut odd = head;
+        odd[44..48].copy_from_slice(&24u32.to_be_bytes());
+        assert!(Dump::parse(&odd).is_none(), "pixels that are not four bytes");
+    }
+
+    #[test]
+    fn the_discs_are_on_the_panel_and_a_finger_finds_them() {
+        let mirror = Mirror::new((1440, 3200));
+        let [(back, bx, by), (keyboard, kx, ky)] = mirror.discs();
+        assert_eq!(back, Disc::Back);
+        assert_eq!(keyboard, Disc::Keyboard);
+        // Bottom left and bottom right, and inside the panel.
+        assert!(bx < 1440.0 / 2.0 && bx > 0.0 && by > 0.0 && by < 3200.0);
+        assert!(kx > 1440.0 / 2.0 && kx < 1440.0 && ky > 0.0 && ky < 3200.0);
+        assert_eq!(mirror.disc_at(bx, by), Some(Disc::Back));
+        assert_eq!(mirror.disc_at(kx, ky), Some(Disc::Keyboard));
+        // The middle of the page is the page's.
+        assert_eq!(mirror.disc_at(720.0, 1600.0), None);
     }
 
     #[test]
