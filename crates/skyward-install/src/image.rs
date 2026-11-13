@@ -12,7 +12,7 @@ use skyward_vab::Slot;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const BOOT_MAGIC: &[u8] = b"ANDROID!";
 const VENDOR_BOOT_MAGIC: &[u8] = b"VNDRBOOT";
@@ -298,11 +298,13 @@ pub fn flash<R: Read + Seek>(image: &mut R, len: u64, devices: &[PathBuf], progr
     // diagnostic may never be able to fail the feature it describes — so the
     // failure is only told, once, of the first partition it failed on.
     let mut undiscarded: Option<(&Path, anyhow::Error)> = None;
+    let discarding = Instant::now();
     for (path, ..) in &outs {
         if let Err(e) = skyward_block::erase::discard_range(path, 0, end) {
             undiscarded.get_or_insert((path.as_path(), e));
         }
     }
+    let discarded = discarding.elapsed();
     if let Some((path, e)) = undiscarded {
         let _ = kmsg(&format!("{}: written without a discard first: {e:#}", path.display()));
     }
@@ -322,35 +324,77 @@ pub fn flash<R: Read + Seek>(image: &mut R, len: u64, devices: &[PathBuf], progr
     let mut at = 0;
     let started = Instant::now();
     let mut told = 0;
+    // How long of that was spent waiting for the image and how long writing
+    // it: a flash that is slow for reading is a different thing from one that
+    // is slow for writing, and the owner can only say which by the numbers.
+    let mut reading = Duration::ZERO;
+    let mut writing = Duration::ZERO;
     while at < end {
         let n = (end - at).min(CHUNK as u64) as usize;
+        let read = Instant::now();
         source.read_exact(&mut buf[..n]).context("read the image")?;
+        reading += read.elapsed();
         hash_at(&mut parts, at, &buf[..n]);
+        let write = Instant::now();
         for (path, f, _) in &mut outs {
             f.write_all(&buf[..n]).with_context(|| format!("write {}", path.display()))?;
             done += n as u64;
             progress(done, total);
         }
+        writing += write.elapsed();
         at += n as u64;
         // How fast the write goes, once per GiB, so that the owner can tell
         // from the phone's own log how long a super image took and at what
-        // rate; nothing here may fail the write.
+        // rate, and which of reading and writing it waited on; nothing here
+        // may fail the write.
         if at / RATE_EVERY > told {
             told = at / RATE_EVERY;
-            let secs = started.elapsed().as_secs_f64();
-            let rate = if secs > 0.0 { (at as f64 / 1e6 / secs) as u64 } else { 0 };
-            let _ = kmsg(&format!("{name}: {} of {} MiB, {rate} MB/s", at >> 20, end >> 20));
+            let _ = kmsg(&format!(
+                "{name}: {} of {} MiB, {:.0} MB/s, reading {} MB/s, writing {} MB/s",
+                at >> 20,
+                end >> 20,
+                rate(at, started.elapsed()),
+                rate(at, reading),
+                rate(at, writing)
+            ));
         }
     }
     let digests: Vec<(u64, u64, Vec<u8>)> = parts.into_iter().map(|(at, len, hasher)| (at, len, hasher.finalize().to_vec())).collect();
+    let flushing = Instant::now();
     for (path, f, _) in &mut outs {
         f.sync_all().with_context(|| format!("flush {}", path.display()))?;
         drop_cache(f).with_context(|| format!("drop the cached pages of {}", path.display()))?;
     }
+    let flushed = flushing.elapsed();
+    let checking = Instant::now();
     for (path, f, _) in &mut outs {
         verify(f, path, &digests, &mut buf, &mut done, total, &mut *progress)?;
     }
+    // Where the time went, in the phone's own log: what a phone that is still
+    // slow for flashing says instead of the owner having to guess.
+    let _ = kmsg(&format!(
+        "{name}: {} MiB written in {:.1} s, {:.0} MB/s; reading {} MB/s, writing {} MB/s, discarded in {:.0} ms, flushed in {:.0} ms, checked in {:.0} ms",
+        end >> 20,
+        started.elapsed().as_secs_f64(),
+        rate(end, started.elapsed()),
+        rate(end, reading),
+        rate(end, writing),
+        discarded.as_secs_f64() * 1e3,
+        flushed.as_secs_f64() * 1e3,
+        checking.elapsed().as_secs_f64() * 1e3
+    ));
     Ok(())
+}
+
+/// `bytes` of `spent` as a rate in megabytes a second, or nothing where no
+/// time was spent at all.
+fn rate(bytes: u64, spent: Duration) -> f64 {
+    let secs = spent.as_secs_f64();
+    if secs > 0.0 {
+        bytes as f64 / 1e6 / secs
+    } else {
+        0.0
+    }
 }
 
 /// The parts of an image `end` bytes long that are read back once it is

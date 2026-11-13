@@ -146,7 +146,7 @@ impl Installer {
         let (commands, command_rx) = mpsc::channel();
         let shared = Arc::new(Shared::default());
         let mut ctx =
-            Context { events: event_tx, signal, commands: command_rx, shared: shared.clone(), detach: Some(detach), options, origin };
+            Context { events: event_tx, signal, commands: command_rx, shared: shared.clone(), detach: Some(detach), options, origin, local: None };
         let thread = thread::Builder::new()
             .name("installer".into())
             .spawn(move || {
@@ -251,6 +251,11 @@ struct Context {
     detach: Option<Detach>,
     options: Options,
     origin: Origin,
+    /// Where a package the phone holds lies, when it is a file the phone can
+    /// read: what the install reads, so that it does not read it through the
+    /// mount this binary serves. Nothing is here for a package the computer
+    /// sends or one left on a partition: those exist only as what is served.
+    local: Option<PathBuf>,
 }
 
 impl Context {
@@ -259,6 +264,20 @@ impl Context {
             // A full pipe already wakes the screen.
             unsafe { libc::write(self.signal.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
         }
+    }
+
+    /// Where the bytes of the package are to be read from: the file the phone
+    /// holds, where the package is one, and the mount it is served at where it
+    /// is not.
+    ///
+    /// Reading a package the phone holds through the mount is reading it
+    /// through this binary's own serving loop, one request at a time and 64 KiB
+    /// to a request: nine gigabytes is a hundred and forty thousand of those,
+    /// and a write that could have taken seconds takes minutes. What the
+    /// computer sends has no other way to be read, and neither has a package
+    /// left on a partition, so those are read as they are served.
+    fn source<S>(&self, mount: &Mount<S>) -> PathBuf {
+        self.local.clone().unwrap_or_else(|| mount.path().to_path_buf())
     }
 }
 
@@ -360,6 +379,10 @@ fn run_file(ctx: &mut Context, path: &Path) -> Outcome {
         Err(e) => return Outcome::Failed(Failure::Unreadable(format!("{e:#}"))),
     };
     let _ = kmsg(&format!("install: {}, {} bytes", path.display(), offer.size));
+    // The package is where the owner put it, and can be read from there: what
+    // arrives through the computer, or as the map of a partition's blocks,
+    // cannot.
+    ctx.local = Some(path.to_owned());
     serve_local(ctx, file, offer, path, name_of(path))
 }
 
@@ -959,7 +982,11 @@ fn flash_super<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<()> 
 /// Write `size` bytes of the package being served to `devices`, telling the
 /// screen how far it is.
 fn flash_to<S>(ctx: &Context, mount: &Mount<S>, size: u64, devices: &[PathBuf]) -> Result<()> {
-    let mut file = BufReader::with_capacity(1 << 20, File::open(mount.path()).context("open the package")?);
+    let path = ctx.source(mount);
+    if ctx.local.is_some() {
+        let _ = kmsg(&format!("install: the image is read where it lies, {}", path.display()));
+    }
+    let mut file = BufReader::with_capacity(1 << 20, File::open(&path).with_context(|| format!("open {}", path.display()))?);
     let mut told: Option<Instant> = None;
     image::flash(&mut file, size, devices, &mut |done, total| {
         if done == total || told.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
@@ -1069,7 +1096,10 @@ fn post_avb(ctx: &mut Context, slot: Result<skyward_vab::Slot>) -> Result<()> {
 fn verify_signature<S>(ctx: &Context, mount: &Mount<S>, size: u64) -> Result<Verdict> {
     let certificates = File::open(signature::CERTIFICATES).with_context(|| format!("open {}", signature::CERTIFICATES))?;
     let keys = signature::keys(BufReader::new(certificates)).with_context(|| format!("read {}", signature::CERTIFICATES))?;
-    let package = File::open(mount.path()).context("open the package")?;
+    // The whole of the package is read to check it, so where it lies is read
+    // rather than what is served of it.
+    let path = ctx.source(mount);
+    let package = File::open(&path).with_context(|| format!("open {}", path.display()))?;
     let mut told: Option<Instant> = None;
     let verdict = signature::verify(package, size, &keys, |done, total| {
         if done == total || told.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
