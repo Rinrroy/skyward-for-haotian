@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Skyward Tap",
+  "version": "1.0",
+  "description": "Turns a Skyward tap into a click in the full browser.",
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["tap.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

@@ -6,11 +6,12 @@ use skyward_net::download::{Failure as DownloadFailure, Progress};
 use skyward_net::github::{Build, Newest};
 use skyward_net::reach::Reach;
 use skyward_net::release::{Release, Unanswered};
+use skyward_net::web::{Block as WebBlock, Page as WebPage, Style};
 use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Bands, Joined, Link, Network, Power, Stage as Joining, Traffic, Wlan};
 use skyward_systems::{Named, Other, Overview, Who};
 use skyward_ui::app::{
-    Action, Adding, App, Asked, Asking, BackupAt, BackupEnd, BackupEntry, BackupJob, BackupRefusal, Choice, Clip, Damage, Data, DownloadEnd,
+    Action, Adding, App, Asked, Asking, BackupAt, BackupEnd, BackupEntry, BackupJob, BackupRefusal, BrowserFull, BrowserView, Choice, Clip, Damage, Data, DownloadEnd,
     DownloadJob, EraseStop, Field, FileKind, FileOp, FileRow, FileTask, FsAction, FsRow, Have, Held, Install, ItemEnd, JobEnd, Key, Keys,
     MountFailure, MountRow, Part, PartKind, PartStop, Pick, Place, Screen, SkywardEnd, SkywardJob, SkywardStage, Source, Starter,
     SystemChoice, SystemsWork, TermEnd, Touch, UsbDrive, UsbLink, SCREEN_OFF,
@@ -404,7 +405,7 @@ fn main() -> Result<()> {
     let adding = |app: &mut App, name: &str, security: Security, field: Field, choosing: bool| {
         app.state.adding = Some(Adding { name: name.into(), security, field, choosing });
     };
-    let pages: [PageShot; 185] = [
+    let pages: [PageShot; 190] = [
         ("11-install-light-locked", Screen::Install, false, &|app| {
             app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false };
         }),
@@ -1058,6 +1059,43 @@ fn main() -> Result<()> {
             app.erase_started(false, false, vec![Part::AppData, Part::AppCaches]);
             app.erase_ended(Err(EraseStop::Locked(vec![0, 999])), 0);
         }),
+        ("182-browser-home-light", Screen::Browser, false, &|app| {
+            online(app);
+            app.state.browser.history = vec![
+                "https://github.com/kirklin/skyward/releases".into(),
+                "https://download.lineageos.org/devices/aurora".into(),
+                "https://www.bing.com/search?format=rss&q=skyward+recovery".into(),
+            ];
+            app.state.browser.at = 2;
+        }),
+        ("183-browser-read-light", Screen::Browser, false, &|app| {
+            online(app);
+            let page = browser_page();
+            let b = &mut app.state.browser;
+            b.url = page.url.clone();
+            b.address = page.url.clone();
+            b.history = vec![page.url.clone()];
+            b.at = 0;
+            b.view = BrowserView::Page(page);
+        }),
+        ("184-browser-read-dark", Screen::Browser, true, &|app| {
+            online(app);
+            let page = browser_page();
+            let b = &mut app.state.browser;
+            b.url = page.url.clone();
+            b.address = page.url.clone();
+            b.history = vec![page.url.clone()];
+            b.at = 0;
+            b.view = BrowserView::Page(page);
+        }),
+        ("186-browser-address-light", Screen::BrowserAddress, false, &|app| {
+            online(app);
+            app.state.browser.address = "https://github.com/guobaoji-122/skyward-for-aurora".into();
+        }),
+        ("187-browser-full-light", Screen::BrowserFull, false, &|app| {
+            online(app);
+            app.state.browser.full = BrowserFull::Absent("插件尚未安装".into());
+        }),
     ];
     for (name, screen, dark, set) in pages {
         let mut app = opened(screen, w, h, ppd);
@@ -1523,6 +1561,51 @@ fn newest() -> Release {
 fn online(app: &mut App) {
     app.state.update_server = true;
     app.state.wlan = Some(joined(Joining::Connected(router_link())));
+}
+
+/// A page as the browser reads it: a release note with a download link.
+fn browser_page() -> WebPage {
+    let url = "https://github.com/guobaoji-122/skyward-for-aurora/releases/tag/aurora-v0.3.4";
+    WebPage {
+        url: url.into(),
+        title: "Skyward 0.3.4 · 小米 14 Ultra (aurora)".into(),
+        site: "github.com".into(),
+        description: Some("A recovery written in Rust. 本次加入图片、基础 CSS、表单与 Cookie。".into()),
+        blocks: vec![
+            WebBlock::Heading { level: 2, text: "更新内容".into(), style: Style { bold: true, ..Style::default() } },
+            WebBlock::Bullet { text: "浏览器支持图片、基础 CSS、表单和 Cookie。".into(), style: Style::default() },
+            WebBlock::Bullet { text: "下载 zip 和镜像后可以直接安装。".into(), style: Style::default() },
+            WebBlock::Heading { level: 2, text: "下载".into(), style: Style::default() },
+            WebBlock::Paragraph { text: "完整镜像，解压后按下面的命令刷入 recovery 分区。".into(), style: Style::default() },
+            WebBlock::Link {
+                label: "skyward-aurora-v0.3.4-OS3.0.308.0.WNACNXM.zip".into(),
+                url: "https://github.com/guobaoji-122/skyward-for-aurora/releases".into(),
+                download: true,
+                style: Style::default(),
+            },
+            WebBlock::Heading { level: 2, text: "刷入".into(), style: Style::default() },
+            WebBlock::Paragraph {
+                text: "解锁 bootloader 后，在电脑上执行：".into(),
+                style: Style { color: Some(0xcc3333), ..Style::default() },
+            },
+            WebBlock::Code {
+                text: "fastboot flash recovery skyward-aurora-v0.3.4.img\nfastboot reboot recovery".into(),
+                style: Style::default(),
+            },
+            WebBlock::Quote { text: "刷入 recovery 不会清除用户数据，但仍建议先备份。".into(), style: Style::default() },
+            WebBlock::Image {
+                alt: "Skyward 主界面".into(),
+                url: "https://example.com/skyward.png".into(),
+                data: None,
+                width: 0,
+                height: 0,
+                style: Style::default(),
+            },
+        ],
+        forms: Vec::new(),
+        cookies: Vec::new(),
+        truncated: false,
+    }
 }
 
 /// A newer release of Skyward than the one running, as GitHub tells of it,

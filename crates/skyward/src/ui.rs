@@ -1,4 +1,6 @@
 use crate::backup;
+use crate::browser;
+use crate::magisk;
 use crate::decrypt::{self, Decryptor};
 use crate::filework;
 use crate::haptics::Haptics;
@@ -1532,6 +1534,9 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // Asking GitHub for Skyward's newest release, and updating to it.
     let mut skyward_checker: Option<updates::Worker> = None;
     let mut skyward_updater: Option<updates::Worker> = None;
+    // Reading a web page, and saving a file the browser offers.
+    let mut reader: Option<browser::Worker> = None;
+    let mut saver: Option<browser::Worker> = None;
     // The phone sleeps while its screen is off and nothing needs it awake.
     let sleeper = Sleeper::start()?;
     // A uevent may be a charger or a computer attached or taken away: the
@@ -1778,6 +1783,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             || downloader.is_some()
             || skyward_checker.is_some()
             || skyward_updater.is_some()
+            || reader.is_some()
+            || saver.is_some()
             || local_send.is_some()
             || systems_busy;
         let joining = app.state.wlan.as_ref().and_then(|w| w.joined.as_ref()).is_some_and(|j| matches!(j.stage, Joining::Joining | Joining::Addressing));
@@ -1845,6 +1852,12 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         }
         if let Some(u) = &skyward_updater {
             fds.push(u.fd());
+        }
+        if let Some(r) = &reader {
+            fds.push(r.fd());
+        }
+        if let Some(s) = &saver {
+            fds.push(s.fd());
         }
         if let Some(s) = &systems_worker {
             fds.push(s.fd());
@@ -2308,6 +2321,46 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         if updated {
             skyward_updater = None;
         }
+        let mut read = false;
+        if let Some(worker) = &reader {
+            for ev in worker.events() {
+                match ev {
+                    browser::Event::Opened(opened) => {
+                        app.browser_opened(opened);
+                        read = true;
+                    }
+                    browser::Event::Saved(_) | browser::Event::Ended(_) => unreachable!("reading a page saves nothing"),
+                    browser::Event::Installed(ended) => {
+                        app.browser_plugin_installed(ended);
+                        read = true;
+                    }
+                    browser::Event::Shot(shot) => {
+                        app.browser_plugin_shot(shot);
+                        read = true;
+                    }
+                }
+            }
+        }
+        if read {
+            reader = None;
+        }
+        let mut saved = false;
+        if let Some(worker) = &saver {
+            for ev in worker.events() {
+                match ev {
+                    browser::Event::Saved(progress) => app.browser_saved(progress.done, progress.total),
+                    browser::Event::Ended(ended) => {
+                        app.browser_save_ended(ended, now);
+                        saved = true;
+                    }
+                    browser::Event::Opened(_) => unreachable!("saving a file reads no page"),
+                    browser::Event::Installed(_) | browser::Event::Shot(_) => unreachable!("saving a file runs no plugin"),
+                }
+            }
+        }
+        if saved {
+            saver = None;
+        }
         if let Some(ended) = decryptor.as_ref().and_then(Decryptor::ended) {
             decryptor = None;
             match ended {
@@ -2628,6 +2681,13 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         }
                         list(&mut app, folder)?
                     }
+                    Effect::ReadUsbDir(folder) => {
+                        if let Err(e) = host_port(true) {
+                            skyward_sys::kmsg(&format!("the USB port is left as it was: {e:#}"))?;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1200));
+                        list(&mut app, folder)?
+                    }
                     Effect::ReadPlace(place, folder) => {
                         if let Err(e) = host_port(place == Place::UsbDrive) {
                             skyward_sys::kmsg(&format!("the USB port is left as it was: {e:#}"))?;
@@ -2693,6 +2753,39 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     Effect::StopRelabel => relabeler.as_ref().context("there is no relabeling to stop")?.stop(),
                     // Partitions that cannot be read are the page's to say.
                     Effect::ReadFilesystems => app.set_filesystems(read_filesystems().map_err(|e| format!("{e:#}"))),
+                    Effect::ReadMagisk => {
+                        if !app.state.data.storage_open() {
+                            app.set_magisk(skyward_ui::app::MagiskRoot::Locked, Ok(Vec::new()));
+                        } else {
+                            let (root, modules) = magisk::read();
+                            app.set_magisk(root, modules.map_err(|e| format!("{e:#}")));
+                        }
+                    }
+                    Effect::ToggleMagisk { id, path, enabled } => {
+                        let result = magisk::toggle(&path, enabled);
+                        if let Err(e) = &result {
+                            app.report(&format!("{id}: {e:#}"), now);
+                        }
+                        let (root, modules) = magisk::read();
+                        app.set_magisk(root, modules.map_err(|e| format!("{e:#}")));
+                    }
+                    Effect::RemoveMagisk { id, path } => {
+                        let result = magisk::remove(&path);
+                        if let Err(e) = &result {
+                            app.report(&format!("{id}: {e:#}"), now);
+                        }
+                        let (root, modules) = magisk::read();
+                        app.set_magisk(root, modules.map_err(|e| format!("{e:#}")));
+                    }
+                    Effect::InstallMagiskModule(zip) => {
+                        let result = magisk::install(&zip);
+                        app.report(&match result {
+                            Ok(()) => "模块已解压，重启后生效".into(),
+                            Err(e) => format!("安装模块失败：{e:#}"),
+                        }, now);
+                        let (root, modules) = magisk::read();
+                        app.set_magisk(root, modules.map_err(|e| format!("{e:#}")));
+                    }
                     // The data partition made afresh as another filesystem
                     // is a factory reset, as the system asks for one; the
                     // rest is work on one partition. Opening the data
@@ -2935,6 +3028,69 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         skyward_updater = Some(updates::Worker::start(task, servers.clone())?);
                     }
                     Effect::StopSkywardUpdate => skyward_updater.as_ref().context("Skyward is not being updated")?.stop(),
+                    Effect::BrowserOpen { url, cookie } => {
+                        if let Some(worker) = reader.take() {
+                            worker.stop();
+                        }
+                        match browser::Worker::start(browser::Task::Open { url, cookie }, servers.clone()) {
+                            Ok(worker) => reader = Some(worker),
+                            Err(e) => app.browser_opened(Err(format!("{e:#}"))),
+                        }
+                    }
+                    Effect::BrowserDownload { url, path, .. } => {
+                        ensure!(saver.is_none(), "a file is being saved already");
+                        let task = browser::Task::Save { url, path: PathBuf::from(path) };
+                        match browser::Worker::start(task, servers.clone()) {
+                            Ok(worker) => saver = Some(worker),
+                            Err(e) => app.browser_save_ended(Err(format!("{e:#}")), now),
+                        }
+                    }
+                    Effect::StopBrowser => {
+                        if let Some(worker) = &reader {
+                            worker.stop();
+                        }
+                        if let Some(worker) = &saver {
+                            worker.stop();
+                        }
+                    }
+                    Effect::BrowserSubmit { url, fields, post, cookie } => {
+                        if let Some(worker) = reader.take() {
+                            worker.stop();
+                        }
+                        let task = browser::Task::Submit { url, fields, post, cookie };
+                        match browser::Worker::start(task, servers.clone()) {
+                            Ok(worker) => reader = Some(worker),
+                            Err(e) => app.browser_opened(Err(format!("{e:#}"))),
+                        }
+                    }
+                    Effect::BrowserPluginInstall { archive, dir } => {
+                        if let Some(worker) = reader.take() {
+                            worker.stop();
+                        }
+                        let task = browser::Task::Install { archive: PathBuf::from(archive), dir: PathBuf::from(dir) };
+                        match browser::Worker::start(task, servers.clone()) {
+                            Ok(worker) => reader = Some(worker),
+                            Err(e) => app.browser_plugin_installed(Err(format!("{e:#}"))),
+                        }
+                    }
+                    Effect::BrowserPluginStart { dir, url, out } => {
+                        if let Some(worker) = reader.take() {
+                            worker.stop();
+                        }
+                        let task = browser::Task::Full { dir: PathBuf::from(dir), url, out: PathBuf::from(out) };
+                        match browser::Worker::start(task, servers.clone()) {
+                            Ok(worker) => reader = Some(worker),
+                            Err(e) => app.browser_plugin_shot(Err(format!("{e:#}"))),
+                        }
+                    }
+                    Effect::BrowserPluginStop => {
+                        if let Some(worker) = &reader {
+                            worker.stop();
+                        }
+                    }
+                    Effect::BrowserPluginRemove { dir } => {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
                     // Logs that cannot be saved are the page's to report;
                     // the recovery carries on.
                     Effect::ExportLogs { recovery, kernel, storage } => {

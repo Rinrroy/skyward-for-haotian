@@ -1,0 +1,27 @@
+[package]
+name = "jpeg-decoder"
+version = "0.3.2"
+edition = "2021"
+
+rust-version = "1.61.0"
+
+license = "MIT OR Apache-2.0"
+description = "JPEG decoder"
+authors = ["The image-rs Developers"]
+readme = "README.md"
+
+documentation = "https://docs.rs/jpeg-decoder"
+repository = "https://github.com/image-rs/jpeg-decoder"
+keywords = ["jpeg", "jpg", "decoder", "image"]
+exclude = ["/tests/*", "!/tests/*.rs"]
+
+[lib]
+doctest = false
+
+[dependencies]
+rayon = { version = "1.5.1", optional = true }
+
+[features]
+default = ["rayon"]
+platform_independent = []
+nightly_aarch64_neon = []

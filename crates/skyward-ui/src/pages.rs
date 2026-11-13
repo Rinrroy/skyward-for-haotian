@@ -1,6 +1,6 @@
 use crate::app::{
     Action, Asking, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop,
-    Field, FileKind, FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick,
+    Field, FileKind, FileOp, FileRow, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick,
     Place, Rows, Screen, Slider, Source, SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, State, Switch, SystemsWork, Target, UsbDrive,
     UsbLink, Wipe, ADDABLE, BACKUP_PARTS, BACKUP_RESTORABLE, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF,
     TARGETS, TIME_ZONES, USB_DRIVE_UNREADABLE, USB_DRIVE_WANTED, WIPES, installs, starting,
@@ -82,6 +82,8 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::BackupJob => backup_job(cx),
         Screen::Advanced => advanced(cx),
         Screen::Files => files(cx),
+        Screen::FilesSearch => files_search(cx),
+        Screen::Magisk => crate::magisk::screen(cx),
         Screen::FileInfo => file_info(cx),
         Screen::Permissions => permissions(cx),
         Screen::Editor => editor(cx),
@@ -113,6 +115,13 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::WlanPassword => wlan_password(cx),
         Screen::WlanNetwork => wlan_network(cx),
         Screen::WlanAdd => wlan_add(cx),
+        Screen::Browser => crate::browser::screen(cx),
+        Screen::BrowserAddress => crate::browser::address(cx),
+        Screen::BrowserDownloads => crate::browser::downloads(cx),
+        Screen::BrowserForm => crate::browser::form(cx),
+        Screen::BrowserFull => crate::browser::full(cx),
+        Screen::BrowserTabs => crate::browser::tabs(cx),
+        Screen::BrowserQuick => crate::browser::quick(cx),
     }
 }
 
@@ -195,6 +204,7 @@ const SCREEN_TIMEOUT: Text = ["息屏时间", "螢幕自動關閉", "Screen time
 const UPDATE: Text = ["系统更新", "系統更新", "System update"];
 const SKYWARD_UPDATE: Text = ["Skyward 更新", "Skyward 更新", "Skyward update"];
 const FILES: Text = ["文件管理", "檔案管理", "File manager"];
+const BROWSER: Text = ["浏览器", "瀏覽器", "Browser"];
 const TERMINAL: Text = ["终端", "終端機", "Terminal"];
 const LANGUAGE: Text = ["语言", "語言", "Language"];
 const TIME_ZONE: Text = ["时区", "時區", "Time zone"];
@@ -297,6 +307,12 @@ pub fn home(cx: &Ctx) -> Frame {
         rows.push(Row::new(l.pick(WLAN)).icon(BLUE, Icon::Wlan).trail(Trail::Value(fmt::wlan_value(l, w))));
         opens.push(Action::Open(Screen::Wlan));
     }
+    rows.push(
+        Row::new(l.pick(BROWSER))
+            .icon(BLUE, Icon::Globe)
+            .subtitle(l.pick(["网页、搜索和下载", "網頁、搜尋和下載", "Pages, search and downloads"])),
+    );
+    opens.push(Action::Open(Screen::Browser));
     let starts = systems_value(cx);
     if cx.state.offers(Screen::Systems) {
         let row = Row::new(l.pick(DUAL_BOOT)).icon(PURPLE, Icon::Systems);
@@ -2327,6 +2343,7 @@ pub fn advanced(cx: &Ctx) -> Frame {
     let top = t.m.content_top;
     let tools = widgets::list(&mut c, t, f, top, &[
         Row::new(l.pick(FILES)).icon(BLUE, Icon::Folder),
+        Row::new(l.pick(["Magisk 模块", "Magisk 模組", "Magisk modules"])).icon(GREEN, Icon::Shield),
         Row::new(l.pick(TERMINAL)).icon(SLATE, Icon::Terminal),
         Row::new(l.pick(RELABEL)).icon(PURPLE, Icon::Shield),
         Row::new(l.pick(AVB)).icon(SLATE, Icon::Lock).trail(Trail::Value(avb_value(cx))),
@@ -2337,6 +2354,7 @@ pub fn advanced(cx: &Ctx) -> Frame {
     ]);
     let out = hits(&tools.rows, &[
         Action::Open(Screen::Files),
+        Action::OpenMagisk,
         Action::Open(Screen::Terminal),
         Action::Open(Screen::Relabel),
         Action::Open(Screen::Avb),
@@ -3687,13 +3705,100 @@ pub fn files(cx: &Ctx) -> Frame {
         });
         let (canvas, rects) = widgets::dock_bar(t, f, files::page(t), &[l.pick(CANCEL), go]);
         Dock { canvas, hits: hits(&rects, &[Action::Unpick, Action::Paste]) }
+    }).or_else(|| {
+        let (canvas, rects) = widgets::dock_bar(t, f, files::page(t), &[l.pick(["浏览 OTG", "瀏覽 OTG", "Browse OTG"])]);
+        Some(Dock { canvas, hits: hits(&rects, &[Action::OpenOtg]) })
     });
     let button = Some((widgets::Glyph::Terminal, Action::TerminalHere));
     let root = l.pick(["根目录", "根目錄", "Root"]);
-    Frame { dock, button, ..listing(cx, &s.files, root, None, l.pick(["暂无文件", "沒有檔案", "No files"]), Action::OpenEntry, l.pick(FILES)) }
+    let mut frame = listing(cx, &s.files, root, None, l.pick(["暂无文件", "沒有檔案", "No files"]), Action::OpenEntry, l.pick(FILES));
+    // The search box sits where the list starts, like the home page's, and
+    // the file rows move down under it.
+    let search = Rect::new(t.m.margin, t.m.dp(files::ROWS_TOP_DP), t.m.w as f32 - t.m.margin * 2.0, t.m.search_h);
+    widgets::search_capsule(&mut frame.canvas, t, f, search, l.pick(["搜索当前文件夹", "搜尋目前資料夾", "Search this folder"]));
+    frame.hits.push(Hit { rect: search, action: Action::FilesSearch });
+    let shift = t.m.search_h + t.m.dp(10.0);
+    if let Some(rows) = frame.rows.as_mut() {
+        for edge in &mut rows.edges {
+            *edge += shift;
+        }
+    }
+    frame.dock = dock;
+    frame.button = button;
+    frame
 }
 
 const CANCEL: Text = ["取消", "取消", "Cancel"];
+
+/// Search the file manager's current folder by name: its own letters, or a
+/// Chinese name's pinyin or pinyin initials. Only this folder is searched.
+pub fn files_search(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let m = &t.m;
+    let mut c = page(cx);
+    let mut out = Vec::new();
+    let (at, cancel) = widgets::search_layout(t);
+    let field = widgets::search_field(&mut c, t, f, at.x, at.w, at.y + at.h / 2.0, &s.files_search, l.pick(["搜索文件名", "搜尋檔案名稱", "Search names"]));
+    widgets::cancel_button(&mut c, t, cancel);
+    out.push(Hit { rect: cancel, action: Action::Back });
+    let top = field.field.y + field.field.h + m.dp(12.0);
+    let kb_top = m.h as f32 - widgets::keyboard_height(t);
+    if s.files_search.trim().is_empty() {
+        widgets::footnote(
+            &mut c,
+            t,
+            f,
+            top,
+            l.pick([
+                "只搜索当前文件夹中的文件和文件夹名称；中文可输入拼音全拼或首字母，例如 wx 可找到「微信」。",
+                "只搜尋目前資料夾中的檔案和資料夾名稱；中文可輸入拼音全拼或首字母，例如 wx 可找到「微信」。",
+                "Searches only the names in this folder. Chinese names match pinyin or pinyin initials, such as wx for 微信.",
+            ]),
+        );
+    } else {
+        match s.files.entries.as_ref() {
+            Err(why) => {
+                files::note(&mut c, t, f, l.pick(["无法读取该文件夹", "無法讀取這個資料夾", "This folder can't be read"]), Some(why));
+            }
+            Ok(entries) => {
+                let found: Vec<(usize, &FileRow)> = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| search::file_matches(&e.name, &s.files_search))
+                    .collect();
+                if found.is_empty() {
+                    widgets::list(&mut c, t, f, top, &[Row::new(l.pick(["没有匹配的名称", "沒有符合的名稱", "No matching names"])).trail(Trail::None)]);
+                } else {
+                    let rows: Vec<Row> = found
+                        .iter()
+                        .map(|(_, e)| {
+                            let sub = match &e.kind {
+                                FileKind::Folder { .. } | FileKind::Link { folder: true, .. } => l.pick(["文件夹", "資料夾", "Folder"]),
+                                _ => l.pick(["文件", "檔案", "File"]),
+                            };
+                            Row::new(&e.name).subtitle(sub)
+                        })
+                        .collect();
+                    let list = widgets::list(&mut c, t, f, top, &rows);
+                    out.extend(
+                        list.rows
+                            .iter()
+                            .zip(&found)
+                            .filter(|(r, _)| r.y + r.h <= kb_top)
+                            .map(|(&rect, (i, _))| Hit { rect, action: Action::OpenEntry(*i) }),
+                    );
+                }
+            }
+        }
+    }
+    let find = l.pick(["搜索", "搜尋", "Search"]);
+    keyboard_hits(&mut c, t, f, s, find, &mut out);
+    if let Some(rect) = field.clear {
+        out.push(Hit { rect, action: Action::ClearFilesSearch });
+    }
+    Frame { back: false, header: false, caret: Some(field.caret), ..Frame::new(t, c, out, find, 0.0) }
+}
+
 
 /// A place's folders and the files in them that can be installed, to
 /// choose one. A USB drive's page waits for one to be plugged in, and the
@@ -3766,6 +3871,7 @@ pub fn row(screen: Screen, cx: &Ctx, i: usize, c: &mut Canvas) {
             let work = cx.state.part_work.as_ref().expect("the page of partition work shows work");
             widgets::output_row(c, cx.t, cx.f, &work.output, i)
         }
+        Screen::Browser => crate::browser::row(cx, i, c),
         other => unreachable!("{other:?} draws no list row by row"),
     }
 }

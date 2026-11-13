@@ -1,4 +1,44 @@
 use crate::app::Screen;
+use pinyin::ToPinyin;
+
+/// The pinyin initials of a name, with Latin letters and digits kept: 微信
+/// gives `wx`, `WeChat` gives `wechat`.
+pub fn initials(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if let Some(py) = ch.to_pinyin() {
+            out.push_str(&py.first_letter().to_ascii_lowercase());
+        } else if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+/// The pinyin of a name, without tones, with Latin letters and digits kept.
+fn plain(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if let Some(py) = ch.to_pinyin() {
+            out.push_str(py.plain());
+        } else if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+/// Whether a file or folder name matches `query`, by its own letters or by
+/// its Chinese name's pinyin or pinyin initials.
+pub fn file_matches(name: &str, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let lower = name.to_lowercase();
+    lower.contains(&query) || initials(name).contains(&query) || plain(name).contains(&query)
+}
+
 use crate::lang::{Lang, Text};
 
 /// A feature or partition the search finds, and the page it opens.
@@ -51,6 +91,12 @@ pub const ENTRIES: &[Entry] = &[
     entry(["清除数据", "清除資料", "Wipe data"], HOME, Screen::Wipe, &["qingchushuju", "qcsj", "wipe", "format", "geshihua", "gsh"]),
     entry(ADVANCED, HOME, Screen::Advanced, &["gaoji", "gj", "advanced"]),
     entry(["文件管理", "檔案管理", "File manager"], ADVANCED, Screen::Files, &["wenjianguanli", "wjgl", "files", "file"]),
+    entry(
+        ["浏览器", "瀏覽器", "Browser"],
+        ADVANCED,
+        Screen::Browser,
+        &["liulanqi", "llq", "browser", "wangye", "web", "shangwang", "xiazai", "download", "http"],
+    ),
     entry(["终端", "終端機", "Terminal"], ADVANCED, Screen::Terminal, &["zhongduan", "zd", "terminal", "shell"]),
     entry(
         ["修复 SELinux 上下文", "修復 SELinux 上下文", "Fix SELinux contexts"],
@@ -169,6 +215,16 @@ pub fn find_on(query: &str, l: Lang, offers: impl Fn(Screen) -> bool) -> Vec<&'s
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_chinese_name_matches_its_pinyin_and_initials() {
+        assert_eq!(initials("微信"), "wx");
+        assert!(file_matches("微信", "wx"));
+        assert!(file_matches("微信", "weixin"));
+        assert!(file_matches("微信", "微"));
+        assert!(file_matches("WeChat", "wechat"));
+        assert!(!file_matches("微信", "qq"));
+    }
+
     fn titles(query: &str) -> Vec<&'static str> {
         find(query, Lang::Hans).iter().map(|e| Lang::Hans.pick(e.title)).collect()
     }
@@ -206,7 +262,7 @@ mod tests {
         assert_eq!(titles("wifi"), ["WLAN"]);
         assert_eq!(find_on("wlan", Lang::Hans, |_| true).iter().map(|e| e.title[0]).collect::<Vec<_>>(), ["WLAN"]);
         assert!(find_on("wlan", Lang::Hans, |s| s != Screen::Wlan).is_empty());
-        assert_eq!(titles("xiazai"), ["系统更新", "Skyward 更新"]);
+        assert_eq!(titles("xiazai"), ["浏览器", "系统更新", "Skyward 更新"]);
     }
 
     #[test]

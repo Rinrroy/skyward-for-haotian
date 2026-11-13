@@ -67,6 +67,12 @@ fn kept(n: usize) -> Vec<u8> {
 // Drawing primitives take geometry plus style as plain arguments.
 #[allow(clippy::too_many_arguments)]
 impl Canvas {
+    /// A canvas holding `w` by `h` pixels of RGBA, as a picture decodes.
+    pub fn from_rgba(w: u32, h: u32, data: Vec<u8>) -> Canvas {
+        assert_eq!(data.len(), w as usize * h as usize * 4, "a picture has four bytes a pixel");
+        Canvas { w, h, data, top: 0, bottom: h, left: 0, span: w }
+    }
+
     pub fn new(w: u32, h: u32) -> Self {
         Self::filled(w, h, Rgba { r: 0, g: 0, b: 0, a: 0 })
     }
