@@ -9347,9 +9347,28 @@ mod tests {
         assert!(app.preview.is_some(), "the page under comes in with the finger");
         app.compose(&mut c, &f, &i, "12:00", 10010);
         let mid = shot(&c);
-        for y in [H / 3, H / 2, H - 200] {
+        // The rows checked are away from the finger, where the `<` stands.
+        for y in [H / 8, H - 800, H - 200] {
             check_slide(&mid, &mount, &home, y, preview_at(150.0));
         }
+    }
+
+    #[test]
+    fn the_back_cue_stays_with_the_finger_while_the_page_under_is_pulled_in() {
+        let (f, i) = (fonts(), info());
+        let (mut app, _, _) = opened_over_home(&f, &i);
+        let mut c = Canvas::new(W, H);
+        app.touch(Touch::Down(10.0, 1600.0), &f, 4000);
+        app.touch(Touch::Move(160.0, 1600.0), &f, 4010);
+        assert!(app.preview.is_some(), "the page under comes in with the finger");
+        app.compose(&mut c, &f, &i, "12:00", 4010);
+
+        // The cue is drawn over the page pulled in, at the height of the
+        // finger: its fill is rgb(48, 48, 48), which nothing else on the
+        // screen at that column is.
+        let y = 1600.0 - app.theme().m.dp(CUE_LIFT_DP);
+        let got = grey_at(&c, 10.0, y);
+        assert!(got <= 50, "the cue is drawn over the page pulled in: {got}");
     }
 
     #[test]
@@ -9366,7 +9385,8 @@ mod tests {
         assert!(app.preview.is_some(), "the page under comes in with the finger");
         app.compose(&mut c, &f, &i, "12:00", 4010);
         let mid = shot(&c);
-        for y in [H / 3, H / 2, H - 200] {
+        // The rows checked are away from the finger, where the `<` stands.
+        for y in [H / 8, H - 800, H - 200] {
             check_slide(&mid, &mount, &home, y, preview_at(150.0));
         }
 
@@ -9397,7 +9417,8 @@ mod tests {
         app.touch(Touch::Move(810.0, 1600.0), &f, 4010);
         app.compose(&mut c, &f, &i, "12:00", 4010);
         let mid = shot(&c);
-        for y in [H / 3, H / 2, H - 200] {
+        // The rows checked are away from the finger, where the `<` stands.
+        for y in [H / 8, H - 800, H - 200] {
             check_slide(&mid, &mount, &home, y, preview_at(800.0));
         }
 
