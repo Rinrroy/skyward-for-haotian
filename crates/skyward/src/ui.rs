@@ -337,6 +337,55 @@ fn from_root(folder: &str) -> String {
     }
 }
 
+/// What the phone was still holding when it went down, kept where the next boot
+/// can read it.
+///
+/// A phone that never comes back is diagnosed from what survived it. The
+/// recovery's own log does not survive — it is on a tmpfs, and the kernel's ring
+/// buffer goes with the power — while internal storage does. So the tail of the
+/// log, the mounts that are still on, and every attached loop device with the
+/// file behind it are written there before the phone stops. Nothing in here may
+/// fail the reboot: it is a note, and the only thing worse than a phone that
+/// will not start is one that will not start and would not say why.
+fn keep_leaving_notes() {
+    let storage = Path::new(skyward_crypto::data::SDCARD).join("Skyward");
+    if std::fs::create_dir_all(&storage).is_err() {
+        return;
+    }
+    let mut text = String::from("--- what the recovery said last\n");
+    if let Ok(log) = std::fs::read_to_string(skyward_sys::LOG) {
+        let lines: Vec<&str> = log.lines().collect();
+        let from = lines.len().saturating_sub(200);
+        text.push_str(&lines[from..].join("\n"));
+        text.push('\n');
+    }
+    text.push_str("\n--- what was mounted\n");
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        for line in mounts.lines() {
+            let Some(at) = line.split_whitespace().nth(1) else { continue };
+            if at.starts_with("/skyward") || at.starts_with("/data") || at.starts_with("/mnt") {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+    }
+    text.push_str("\n--- loop devices\n");
+    if let Ok(blocks) = std::fs::read_dir("/sys/block") {
+        for entry in blocks.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("loop") {
+                continue;
+            }
+            let file = std::fs::read_to_string(entry.path().join("loop/backing_file")).unwrap_or_default();
+            text.push_str(&format!("{name} -> {}\n", file.trim()));
+        }
+    }
+    let into = storage.join("last-recovery.log");
+    if std::fs::write(&into, text).is_ok() {
+        let _ = skyward_sys::kmsg(&format!("what the phone was still holding is kept at {}", into.display()));
+    }
+}
+
 /// Take the display back after a payload has had it.
 ///
 /// The card is free as soon as the payload's last process is gone, but the
@@ -2614,6 +2663,12 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             bcb::clear(&misc)?;
                             kept = false;
                         }
+                        // A phone that does not come back is diagnosed from what
+                        // survived it, and the recovery's own log does not: it
+                        // lives on a tmpfs and the kernel's ring buffer goes with
+                        // the power. Internal storage does survive, so what was
+                        // still holding a device is written there first.
+                        keep_leaving_notes();
                         // Everything written has to be on the medium before the
                         // phone goes down: the kernel's own restart walks every
                         // block device, and a device with dirty pages still

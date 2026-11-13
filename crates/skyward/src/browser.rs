@@ -506,6 +506,7 @@ impl Lay {
                 ));
             }
         }
+        keep_logs(&log);
         Ok(Ended { code, ran: started.elapsed() })
     }
 }
@@ -549,6 +550,35 @@ fn log_path() -> PathBuf {
         Path::new("/data/skyward/browser/logs").join("start.log")
     } else {
         Path::new("/tmp").join("skyward-browser.log")
+    }
+}
+
+/// Keep what the browser said where a phone that came back up can read it.
+///
+/// The log this module writes lives under the data partition, which Android
+/// will not let a plain shell read, so a browser that will not start is a
+/// question with no answer while the phone is booted. Internal storage is
+/// readable; a copy costs little and is the difference between "it exits" and
+/// why. Never fatal: this is a diagnostic.
+fn keep_logs(log: &Path) {
+    let storage = Path::new(skyward_crypto::data::SDCARD).join("Skyward");
+    if let Err(e) = fs::create_dir_all(&storage) {
+        let _ = skyward_sys::kmsg(&format!("the browser's log has nowhere to be kept at {}: {e}", storage.display()));
+        return;
+    }
+    for (from, name) in [(log.to_path_buf(), "browser.log"), (log.with_file_name("xorg.log"), "browser-xorg.log")] {
+        if !from.is_file() {
+            continue;
+        }
+        let into = storage.join(name);
+        match fs::copy(&from, &into) {
+            Ok(bytes) => {
+                let _ = skyward_sys::kmsg(&format!("the browser's log is kept at {} ({bytes} bytes)", into.display()));
+            }
+            Err(e) => {
+                let _ = skyward_sys::kmsg(&format!("the browser's log would not be kept at {}: {e}", into.display()));
+            }
+        }
     }
 }
 
