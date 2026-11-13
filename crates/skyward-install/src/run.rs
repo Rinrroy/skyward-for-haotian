@@ -40,9 +40,13 @@ pub type Detach = Box<dyn FnOnce() -> Result<()> + Send>;
 const METADATA: &str = "/metadata";
 const DATA: &str = "/data";
 
-/// Where a zip's install script is put to run, as Android's recovery puts
-/// it, and the version of the interface the script is told it runs under.
-const BINARY: &str = "/tmp/update-binary";
+/// Where a zip's install script is put to run, and the version of the
+/// interface the script is told it runs under. Android's recovery puts it in
+/// /tmp, which is where a script goes looking for what it copied there; but a
+/// script that clears /tmp before it starts would take the binary running it
+/// down with the rest, so it is kept beside the recovery's own logs, which
+/// nothing a package runs is told about.
+const BINARY: &str = "/skyward/run/update-binary";
 const API_VERSION: &str = "3";
 const RETRY: &str = "retry";
 
