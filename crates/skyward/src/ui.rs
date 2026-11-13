@@ -413,21 +413,20 @@ fn keep_leaving_notes() {
 /// The card is free as soon as the payload's last process is gone, but the
 /// kernel is not obliged to hand it over in that same instant, and the plain
 /// open would end the run on the first refusal. A few tries over a second cost
-/// nothing at a hand-over that happens once per browser session, and a phone
-/// whose screen stays dark because its own recovery gave up is the worst of the
-/// outcomes here.
+/// nothing, and a phone whose screen stays dark because its own recovery gave up
+/// is the worst of the outcomes here.
 #[cfg(target_os = "android")]
 fn take_surface(fastest: bool) -> Result<KmsSurface> {
     match KmsSurface::open("/dev/dri/card0", fastest) {
         Ok(surface) => Ok(surface),
         Err(first) => {
-            let _ = skyward_sys::kmsg(&format!("the display would not come back at once: {first:#}"));
+            let _ = skyward_sys::kmsg(&format!("the display did not open at once: {first:#}"));
             let mut last = first;
             for attempt in 1..=8 {
                 std::thread::sleep(std::time::Duration::from_millis(250));
                 match KmsSurface::open("/dev/dri/card0", fastest) {
                     Ok(surface) => {
-                        let _ = skyward_sys::kmsg(&format!("the display came back on try {attempt}"));
+                        let _ = skyward_sys::kmsg(&format!("the display opened on try {attempt}"));
                         return Ok(surface);
                     }
                     Err(e) => last = e,
@@ -1307,7 +1306,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     }
     let mut info = skyward_info::collect(cfg)?;
     let fonts = Fonts::load(font, 0, mono)?;
-    let mut surface = KmsSurface::open("/dev/dri/card0", cfg.display.fastest_refresh)?;
+    let mut surface = take_surface(cfg.display.fastest_refresh)?;
     // What the display was told is worth having in the kernel log even when
     // the pages come up: it says which subpixel block, if any, went out.
     let _ = skyward_sys::kmsg(&format!("the display is {}", surface.describe()));
@@ -2994,16 +2993,15 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         // one the page should still show.
                         app.set_plugins(crate::plugins::read(app.state.lang));
                     }
-                    // The phone changes hands: the display is the plugin's
-                    // while it runs, so the card is let go before the payload
-                    // is laid out and taken back when it is done. Every way
-                    // the payload can fail is a sentence on the plugins page;
-                    // only a display that cannot be taken back ends the run,
-                    // because there is nothing left to show it on.
+                    // The phone changes hands, but not the display: the payload
+                    // draws into its own memory, so the card stays here and the
+                    // browser's frames are put on the panel from this thread
+                    // while it runs. Every way the payload can fail is a
+                    // sentence on the plugins page; only a frame that cannot be
+                    // shown ends the run, because there is nothing left to show
+                    // it on.
                     Effect::OpenBrowser { image, program } => {
-                        drop(surface);
-                        let outcome = crate::browser::open(Path::new(&image), &program);
-                        surface = take_surface(cfg.display.fastest_refresh)?;
+                        let outcome = crate::browser::open(Path::new(&image), &program, &mut inputs, &mut surface);
                         let said = match outcome {
                             Ok(end) => match end.code {
                                 Some(0) => app.state.lang.pick([

@@ -89,46 +89,62 @@ Three restrictions are named in the request, and one design answers all three.
 
 ### Display and input
 
-Skyward draws with DRM/KMS: it opens a card, sets up atomic modesetting with
-dumb buffers, and commits frames. The payload's Chromium wants the same card.
+Three arrangements have been tried on this phone. Only the third works, and the
+first two failed for reasons worth keeping written down, because each one looked
+reasonable from the outside.
 
-The handover is therefore a **release**: Skyward closes its DRM card (dropping
-DRM master), the child opens `/dev/dri/card0` itself, and on exit Skyward opens
-the card again and redraws. Nothing is shared, nothing is proxied; the browser
-owns the panel while it runs.
+**First: a Wayland compositor.** Impossible here. The kernel is built with
+`# CONFIG_VT is not set`; libseat marks a session active by opening `tty0`, so
+no session ever becomes active and every libseat-based compositor — weston,
+cage, anything wlroots-shaped — dies before it creates its socket. Weston's own
+log says it: `Could not open tty0 to update VT`, `Could not open device:
+Operation not permitted`, `no drm device found`, `fatal: failed to create
+compositor backend`. Chromium then reports `Failed to connect to Wayland
+display`, which is the symptom, not the fault.
 
-Which process opens the card is decided by two facts about this phone, both
-measured rather than assumed:
+**Second: Xorg with the modesetting driver.** It needs no seat — it opens
+`/dev/dri` itself and `-sharevts` keeps it out of VT handling — and it got far
+enough to prove that. Then it segfaulted during screen initialisation, and gdb
+said exactly where:
 
-- **The kernel is built with `# CONFIG_VT is not set`.** libseat marks a session
-  active by opening `tty0`, so with no virtual terminal a session can never
-  become active, and every compositor that goes through libseat — weston, cage,
-  anything wlroots-shaped — dies before it creates its socket. Weston's own log
-  says it: `Could not open tty0 to update VT`, `Could not open device: Operation
-  not permitted`, `no drm device found`, `fatal: failed to create compositor
-  backend`. Chromium then reports `Failed to connect to Wayland display`, which
-  is a symptom, not the fault.
-- **Debian's Chromium has no DRM ozone platform.** `grep -a -o
-  "ozone_platform_[a-z_]*" /usr/lib/chromium/chromium | sort -u` gives exactly
-  `ozone_platform_wayland` and `ozone_platform_x`, so the browser cannot be told
-  to take the card itself.
+```
+#0 modesetting_drv.so
+#1 RRChangeOutputProperty ()
+#3 xf86RandR12Init ()
+#4 xf86CrtcScreenInit ()
+#6 AddScreen ()
+x0 = 0x0        the null that is dereferenced
+```
 
-What is left is an **X server**, which needs no seat at all: its `modesetting`
-driver opens `/dev/dri` itself and `-sharevts` keeps it out of VT handling
-entirely. So the payload starts `Xorg :0 -sharevts -novtswitch`, waits for
-`/tmp/.X11-unix/X0`, and starts Chromium with `--ozone-platform=x11` at the
-panel's own geometry (there is no window manager to place it).
+It died while describing the card's outputs to RandR. The card advertises four
+connectors — the panel on `DSI-1`, plus `DP-1` and two vendor `Virtual-*` ones
+for screen recording — and none of the obvious measures helped: ignoring three of
+the four in `xorg.conf.d` (which keeps them out of the screen but not out of
+RandR), `ShadowFB`, `AccelMethod none`, software cursor, `-nocursor`, glamor, and
+`ZaphodHeads` on the panel each crashed at the same address. So the fault is in
+the driver's own description of this card, not in the configuration.
 
-Input comes from `/dev/input/event*`, which is bound into the chroot. X's
-libinput driver finds devices through udev, so the payload starts its own
-`systemd-udevd` — by `/usr/lib/systemd/systemd-udevd`, because in this suite
-that name is a link to the multicall `udevadm` and is not on `PATH`. `udevadm`
-refuses to trigger inside a chroot (`Running in chroot, ignoring request`), so
-the kernel is told about each device directly: `echo add >
-/sys/class/input/event*/uevent`.
+**Third, what ships: the payload draws into its own memory, and Skyward puts
+that memory on the panel.** The payload runs `Xvfb :0 -screen 0 1440x3200x24
+-fbdir /data/skyward/browser/fb`, which never opens the card at all; Xvfb writes
+its framebuffer to `fb/Xvfb_screen0` as a plain file. Skyward keeps DRM master,
+reads that file thirty times a second, copies the rows that changed into its own
+canvas (swizzling the server's byte order into the canvas's), and presents. Over
+a page being read this costs almost nothing, because nothing changed.
 
-Typing needs a keyboard on the glass: `xvkbd` is started after the browser so
-that it is mapped on top of it, which is what makes a captive portal answerable.
+Input then runs the other way round: Skyward owns the touch screen, so it writes
+one line per event into a named pipe — `down x y`, `move x y`, `up x y`,
+`key Name` — and a loop in the payload turns each line into an `xdotool`
+command. The phone's back button is `Escape`; its power button ends the browser.
+
+What this arrangement costs: the panel updates at the rate the copy and the
+commit allow rather than at the display's own rate, and video will look like a
+sequence of frames rather than a moving picture. What it buys is a browser that
+starts at all on a phone whose display driver refuses every compositor that asks
+it directly.
+
+Typing still needs a keyboard on the glass: `xvkbd` is started inside the payload
+(in its own Xvfb display), which is what makes a captive portal answerable.
 
 Two other things the phone taught, both now in the payload's script: the binary
 to run is `/usr/lib/chromium/chromium`, because `/usr/bin/chromium` is a shell

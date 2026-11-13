@@ -26,10 +26,14 @@
 //! recovery exactly as it was, mounts and all.
 
 use anyhow::{bail, Context, Result};
+use skyward_ui::app::{Key, Touch};
+use skyward_ui::canvas::Canvas;
+use skyward_ui::surface::Surface;
 use std::ffi::CString;
 use std::fs;
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -61,6 +65,34 @@ const DNS: [&str; 2] = ["223.5.5.5", "119.29.29.29"];
 /// browser that is closed under someone.
 const LONGEST: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// The framebuffer the payload's display server keeps, as a file this can read:
+/// `Xvfb :0 -screen 0 1440x3200x24 -fbdir /data/skyward/browser/fb` writes every
+/// pixel it holds there, and the recovery is what those pixels reach the panel
+/// through.
+///
+/// This is the third answer to "who draws on this phone", and the first two were
+/// measured rather than guessed: a Wayland compositor cannot take a seat because
+/// the kernel is built without `CONFIG_VT`, and Xorg's modesetting driver
+/// segfaults inside itself while describing the card's outputs to RandR, with
+/// one output or four, glamor or shadow, a cursor or none. So the payload has
+/// been taken off the card entirely: it draws into its own memory, and this
+/// module copies that memory onto the panel with the card the recovery already
+/// holds.
+const MIRROR: &str = "/data/skyward/browser/fb/Xvfb_screen0";
+
+/// What the payload's display server was told to be. A framebuffer file carries
+/// no shape of its own, so the shape has to be agreed on both sides.
+const MIRROR_SHAPE: (u32, u32) = (1440, 3200);
+
+/// Where one line per finger goes, for the payload to turn into a pointer
+/// event: the recovery owns the touch screen, and the page is on the other side
+/// of a display server that never sees it.
+const TOUCH: &str = "/data/skyward/browser/touch.fifo";
+
+/// How often the panel is offered a new frame. Thirty a second is more than a
+/// page being read needs and less than a finger can feel the lack of.
+const FRAME: Duration = Duration::from_millis(33);
+
 /// How the browser ended, for the page that started it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ended {
@@ -79,6 +111,155 @@ struct Lay {
     mounted: Vec<PathBuf>,
     /// SELinux was permissive before, or this is what it was.
     enforce: Option<String>,
+}
+
+/// The payload's framebuffer, on its way to the panel.
+///
+/// Each pass reads the file the display server writes and puts on the panel only
+/// the rows that changed since the pass before, so a page being read costs
+/// almost nothing and a page being drawn costs one blit.
+struct Mirror {
+    /// What the panel is given: the same shape as the panel, in the byte order
+    /// the drawing canvas uses.
+    canvas: Canvas,
+    /// The payload's pixels as they were read this time, and as they were the
+    /// time before, to know what to send.
+    now: Vec<u8>,
+    was: Vec<u8>,
+    /// Whether anything has ever been sent, so the first frame always goes.
+    shown: bool,
+    /// Reads that found nothing yet, counted so the log says it once.
+    missed: u32,
+}
+
+impl Mirror {
+    fn new(size: (u32, u32)) -> Self {
+        let (w, h) = size;
+        Self { canvas: Canvas::unfilled(w, h, 0..h), now: Vec::new(), was: Vec::new(), shown: false, missed: 0 }
+    }
+
+    /// One frame: read what the payload holds, and send it if it is new.
+    fn show(&mut self, surface: &mut dyn Surface) -> Result<()> {
+        let (w, h) = (self.canvas.w, self.canvas.h);
+        let (sw, sh) = MIRROR_SHAPE;
+        let need = (sw as usize) * (sh as usize) * 4;
+        let file = match fs::File::open(MIRROR) {
+            Ok(file) => file,
+            Err(e) => {
+                // Not a failure: the payload is still unpacking itself and the
+                // first frame is not due yet.
+                self.missed = self.missed.saturating_add(1);
+                if self.missed == 1 || self.missed.is_multiple_of(50) {
+                    let _ = skyward_sys::kmsg(&format!("the browser's framebuffer is not there yet ({e})"));
+                }
+                return Ok(());
+            }
+        };
+        if self.now.len() != need {
+            self.now.resize(need, 0);
+            self.was.resize(need, 0);
+        }
+        file.read_exact_at(&mut self.now, 0).with_context(|| format!("read {MIRROR}"))?;
+        let mut changed = false;
+        for y in 0..h {
+            let sy = if sh == h { y } else { y.saturating_mul(sh) / h.max(1) };
+            let src = (sy as usize) * (sw as usize) * 4;
+            let dst = (y as usize) * (w as usize) * 4;
+            let row = &self.now[src..src + (sw as usize) * 4];
+            if self.shown && row == &self.was[src..src + (sw as usize) * 4] {
+                continue;
+            }
+            changed = true;
+            let out = &mut self.canvas.data[dst..dst + (w as usize) * 4];
+            if sw == w {
+                for (pixel, from) in out.as_chunks_mut::<4>().0.iter_mut().zip(row.as_chunks::<4>().0) {
+                    // The server keeps its pixels in one byte order and the
+                    // canvas holds another; the fourth byte is not shown.
+                    pixel[0] = from[2];
+                    pixel[1] = from[1];
+                    pixel[2] = from[0];
+                    pixel[3] = 0xFF;
+                }
+            } else {
+                let last = row.len() - 4;
+                for (x, pixel) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    let from = &row[((x * (sw as usize)) / (w as usize).max(1) * 4).min(last)..];
+                    pixel[0] = from[2];
+                    pixel[1] = from[1];
+                    pixel[2] = from[0];
+                    pixel[3] = 0xFF;
+                }
+            }
+        }
+        self.was.copy_from_slice(&self.now);
+        if changed {
+            surface.present(&self.canvas).context("put the browser's frame on the panel")?;
+            self.shown = true;
+        }
+        Ok(())
+    }
+}
+
+/// The way a finger gets from the panel to the page.
+///
+/// It is a named pipe, because the two sides are two processes with only the
+/// data partition in common: a line per event, `down x y`, `move x y`, `up x y`
+/// or `key Name`, which the payload turns into an xdotool command.
+struct Finger {
+    to: Option<fs::File>,
+    /// Whether the pipe has been looked for already, so its absence is said once.
+    told_about: bool,
+}
+
+impl Finger {
+    fn new() -> Self {
+        Self { to: None, told_about: false }
+    }
+
+    fn open(&mut self) -> bool {
+        if self.to.is_some() {
+            return true;
+        }
+        // Opening a pipe for writing waits for a reader that may not be there;
+        // a non-blocking open says whether it is.
+        match fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(TOUCH) {
+            Ok(file) => {
+                self.to = Some(file);
+                true
+            }
+            Err(e) => {
+                if !self.told_about {
+                    self.told_about = true;
+                    let _ = skyward_sys::kmsg(&format!("no one is listening for touches at {TOUCH} ({e})"));
+                }
+                false
+            }
+        }
+    }
+
+    /// A finger at a point on the panel, said in the payload's own pixels.
+    fn at(&mut self, what: &str, x: f32, y: f32, size: (u32, u32)) {
+        let (sw, sh) = MIRROR_SHAPE;
+        let sx = (x.max(0.0) as u32).min(size.0.saturating_sub(1)).saturating_mul(sw) / size.0.max(1);
+        let sy = (y.max(0.0) as u32).min(size.1.saturating_sub(1)).saturating_mul(sh) / size.1.max(1);
+        self.say(&format!("{what} {sx} {sy}"));
+    }
+
+    fn key(&mut self, name: &str) {
+        self.say(&format!("key {name}"));
+    }
+
+    fn say(&mut self, line: &str) {
+        if !self.open() {
+            return;
+        }
+        let Some(file) = &mut self.to else { return };
+        // A pipe whose reader has gone fails rather than blocks, and the next
+        // attempt opens it again.
+        if file.write_all(format!("{line}\n").as_bytes()).is_err() {
+            self.to = None;
+        }
+    }
 }
 
 fn cstr(path: &Path) -> Result<CString> {
@@ -421,7 +602,7 @@ impl Lay {
     }
 
     /// Run the payload's own program inside the chroot and wait for it.
-    fn run(&self, program: &str) -> Result<Ended> {
+    fn run(&self, program: &str, inputs: &mut crate::input::Inputs, surface: &mut dyn Surface) -> Result<Ended> {
         let root = cstr(&self.root)?;
         let mut cmd = Command::new(program);
         cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
@@ -470,6 +651,12 @@ impl Lay {
         // background can be ended with it.
         cmd.process_group(0);
         let mut child = cmd.spawn().with_context(|| format!("start {program}"))?;
+        // While it runs, the phone belongs to it twice over: the payload's pixels
+        // are put on the panel by this thread, and a finger on the panel is put
+        // in the payload's hand.
+        let mut mirror = Mirror::new(surface.size());
+        let mut finger = Finger::new();
+        let mut closed = false;
         let code = loop {
             if let Some(status) = child.try_wait().context("ask after the browser")? {
                 break status.code();
@@ -480,7 +667,33 @@ impl Lay {
                 let _ = skyward_sys::kmsg("the browser was closed after two hours; the recovery has the phone back");
                 break None;
             }
-            std::thread::sleep(Duration::from_millis(200));
+            if closed {
+                let _ = child.kill();
+                break None;
+            }
+            // Drawing first: a finger answered before the frame that shows where
+            // it landed is answered blind.
+            if let Err(e) = mirror.show(surface) {
+                // A frame that will not go to the panel is worth a line and no
+                // more: the browser is still running and may yet be usable.
+                let _ = skyward_sys::kmsg(&format!("a frame from the browser was not shown: {e:#}"));
+            }
+            if let Ok(events) = inputs.read() {
+                for event in events {
+                    match event {
+                        crate::input::Event::Touch(Touch::Down(x, y), _) => finger.at("down", x, y, surface.size()),
+                        crate::input::Event::Touch(Touch::Move(x, y), _) => finger.at("move", x, y, surface.size()),
+                        crate::input::Event::Touch(Touch::Up, _) => finger.at("up", 0.0, 0.0, surface.size()),
+                        // The page has no window manager and no tab strip, so
+                        // the phone's own buttons are what it has: back is
+                        // escape, and the power button ends the browser.
+                        crate::input::Event::Key(Key::Back, true) => finger.key("Escape"),
+                        crate::input::Event::Key(Key::Power, true) => closed = true,
+                        crate::input::Event::Key(_, _) => {}
+                    }
+                }
+            }
+            std::thread::sleep(FRAME);
         };
         // The process that ended is not always the last one holding something:
         // the payload's script starts its compositor in the background, and a
@@ -614,13 +827,14 @@ fn starter(program: &str) -> String {
 
 /// Hand the phone to the browser at `image`, running `program` inside it.
 ///
-/// The caller must have released the display: the browser's compositor takes
-/// the DRM card as its own master, and a recovery that still holds it would
-/// leave the panel black.
-pub fn open(image: &Path, program: &str) -> Result<Ended> {
+/// The recovery keeps the display: the payload draws into its own memory, and
+/// this puts those pixels on the panel and hands it the touches, so `surface`
+/// must be the one the recovery itself draws with and must stay open the whole
+/// time the browser runs.
+pub fn open(image: &Path, program: &str, inputs: &mut crate::input::Inputs, surface: &mut dyn Surface) -> Result<Ended> {
     let program = starter(program);
     let lay = Lay::of(image).with_context(|| format!("lay out {}", image.display()))?;
-    lay.run(&program)
+    lay.run(&program, inputs, surface)
 }
 
 #[cfg(test)]
