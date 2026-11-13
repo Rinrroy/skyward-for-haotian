@@ -22,7 +22,20 @@ const NOMINAL_HZ: f32 = 172.4;
 /// How long a click runs. The driver plays a sine for the effect's replay
 /// length, and a waveform it keeps for as long as that one is; either way
 /// the click is taken away once this has passed.
-const NOMINAL_CLICK: Duration = Duration::from_millis(30);
+///
+/// Twelve milliseconds of a swing at about two hundred hertz is three swings,
+/// which is what a linear motor's click is made of. Held for longer the same
+/// sine stops being a click and becomes a buzz: the finger is given enough
+/// swings in a row to feel the vibration rather than the tap.
+const CLICK_LENGTH: Duration = Duration::from_millis(12);
+
+/// How long the click takes to come up, and to go away again, in whole
+/// milliseconds of its twelve. A swing that starts at its full strength
+/// cracks; one that starts over a millisecond and fades over six is the tick
+/// of a motor that is being told to stop, which is what these phones' own
+/// system plays.
+const ATTACK_MS: u16 = 1;
+const FADE_MS: u16 = 6;
 
 /// How strongly the phone's own system plays the two ticks of the screen
 /// going off, whatever the slider says.
@@ -245,8 +258,17 @@ fn takes_periodic(dev: &RawDevice) -> bool {
 }
 
 /// The share of the click's full strength at the slider's `position`.
+///
+/// The slider moves the strength in equal steps of the swing itself: from a
+/// quarter to three quarters of it, every tenth of the slider is a twentieth
+/// more of the swing. A factor per step, which is what this used to be, is
+/// the same number of decibels between every pair of neighbours, and a finger
+/// does not read a click's strength in decibels: it reads how far the motor
+/// throws the glass. Equal steps of the swing are what makes the slider's
+/// halves tell apart.
 fn share(strength: &Strength, position: f32) -> f32 {
-    strength.lightest * (strength.strongest / strength.lightest).powf(position.clamp(0.0, 1.0))
+    let at = position.clamp(0.0, 1.0);
+    strength.lightest + (strength.strongest - strength.lightest) * at
 }
 
 /// What these motors swing at, from the slowest to the fastest a linear
@@ -307,6 +329,12 @@ struct Loaded {
 /// period and the strength. Samples handed over as FIFO data are read as a
 /// wavetable the driver makes up itself, which this motor's firmware refuses
 /// ("Invalid OWT index: -1" in the kernel log), so none are handed over.
+///
+/// The envelope is what makes the sine a click rather than a buzz: the swing
+/// comes up over a millisecond and fades over six of its twelve, where a sine
+/// held at one strength for the whole length is a vibration the finger reads
+/// as a rumble and not as a tap. A waveform the driver keeps has a shape of
+/// its own and takes no envelope from here.
 fn upload(dev: &File, click: &Click, share: f32) -> Result<Loaded> {
     let mut kept: [i16; 2] = [0; 2];
     let (waveform, period, len, data) = match click {
@@ -325,7 +353,10 @@ fn upload(dev: &File, click: &Click, share: f32) -> Result<Loaded> {
         magnitude: (share.clamp(0.0, 1.0) * f32::from(i16::MAX)).round() as i16,
         offset: 0,
         phase: 0,
-        envelope: libc::ff_envelope { attack_length: 0, attack_level: 0, fade_length: 0, fade_level: 0 },
+        // From nothing up to the strength over the attack, and down to
+        // nothing over the fade: a level at either end other than nothing
+        // would leave the swing turning on and off at its full throw.
+        envelope: libc::ff_envelope { attack_length: ATTACK_MS, attack_level: 0, fade_length: FADE_MS, fade_level: 0 },
         custom_len: len as u32,
         custom_data: data,
     };
@@ -334,7 +365,7 @@ fn upload(dev: &File, click: &Click, share: f32) -> Result<Loaded> {
         id: -1,
         direction: 0,
         trigger: libc::ff_trigger { button: 0, interval: 0 },
-        replay: libc::ff_replay { length: NOMINAL_CLICK.as_millis() as u16, delay: 0 },
+        replay: libc::ff_replay { length: CLICK_LENGTH.as_millis() as u16, delay: 0 },
         u: [0; 4],
     };
     // The union holds the periodic effect; it is exactly as large.
@@ -346,7 +377,7 @@ fn upload(dev: &File, click: &Click, share: f32) -> Result<Loaded> {
     if unsafe { libc::ioctl(dev.as_raw_fd(), request as _, &mut effect) } < 0 {
         return Err(io::Error::last_os_error().into());
     }
-    Ok(Loaded { slot: effect.id, length: NOMINAL_CLICK })
+    Ok(Loaded { slot: effect.id, length: CLICK_LENGTH })
 }
 
 /// Start the loaded effect in slot `id`.
@@ -379,11 +410,20 @@ mod tests {
     }
 
     #[test]
-    fn the_slider_spans_the_strengths_each_step_the_same_factor() {
+    fn the_slider_moves_the_strength_in_equal_steps() {
         let s = Strength { lightest: 0.25, strongest: 1.0 };
         assert_eq!((share(&s, 0.0), share(&s, 1.0)), (0.25, 1.0));
-        assert!((share(&s, 0.5) - 0.5).abs() < 1e-6);
-        assert!((share(&s, 0.25) / share(&s, 0.0) - share(&s, 1.0) / share(&s, 0.75)).abs() < 1e-6, "each step the same factor");
+        assert!((share(&s, 0.5) - 0.625).abs() < 1e-6, "halfway is halfway in between");
+        for step in 0..10 {
+            let (here, next) = (share(&s, step as f32 / 10.0), share(&s, (step + 1) as f32 / 10.0));
+            assert!((next - here - 0.075).abs() < 1e-6, "every tenth of the slider is the same step: {here} to {next}");
+        }
         assert_eq!((share(&s, -1.0), share(&s, 2.0)), (0.25, 1.0), "no further than its ends");
+    }
+
+    #[test]
+    fn a_click_comes_up_and_goes_away_within_the_time_it_plays() {
+        assert!(CLICK_LENGTH.as_millis() as u16 >= ATTACK_MS + FADE_MS, "the envelope fits in the click");
+        assert!(CLICK_LENGTH.as_millis() < 30, "a click that long is a buzz");
     }
 }
