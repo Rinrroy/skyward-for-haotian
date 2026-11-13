@@ -13,9 +13,10 @@ use std::str::FromStr;
 /// Version of this build, shown on the About page.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Who made this build, shown beside its version on the About page's list of
-/// everything the recovery can read.
-pub const BUILT_BY: &str = "澪洛依";
+/// Who made this build, shown beside its version on the specs page's Recovery
+/// version card. Set at build time from `SKYWARD_BUILDER` by `build.rs`;
+/// absent when the build did not name anyone, and then the row is not shown.
+pub const BUILDER: Option<&str> = option_env!("SKYWARD_BUILDER");
 
 const CPU: &str = "/sys/devices/system/cpu";
 const POWER_SUPPLY: &str = "/sys/class/power_supply";

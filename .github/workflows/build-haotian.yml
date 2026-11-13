@@ -56,6 +56,10 @@ jobs:
     # only leaves an artifact and needs no more than to read it.
     permissions:
       contents: write
+    # The name the built image shows as its builder: whoever owns the
+    # repository the image is built from. Unset, the row is left off the page.
+    env:
+      SKYWARD_BUILDER: ${{ github.repository_owner }}
     steps:
       - uses: actions/checkout@v4
 

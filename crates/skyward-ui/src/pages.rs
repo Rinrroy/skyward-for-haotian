@@ -19,7 +19,7 @@ use crate::theme::Theme;
 use crate::tr;
 use crate::icons::{self, Icon};
 use crate::widgets::{self, Caption, Detail, Fact, Outline, Row, Spec, SystemCard, SystemMark, Tone, Trail};
-use skyward_info::{DeviceInfo, VERSION};
+use skyward_info::{BUILDER, DeviceInfo, VERSION};
 use skyward_install::{Outcome, Reflash, Refusal, Stage};
 use skyward_net::download::Progress;
 use skyward_net::supplicant::Security;
@@ -741,10 +741,16 @@ pub fn specs(cx: &Ctx) -> Frame {
     if let Some(r) = &i.android {
         y = widgets::info_card(&mut c, t, f, y + gap, &[(l.pick(ANDROID_VERSION), fmt::android(l, r, i.security_patch.as_ref()))]);
     }
-    y = widgets::info_card(&mut c, t, f, y + gap, &[
+    let mut versions = vec![
         (l.pick(["Recovery 版本", "Recovery 版本", "Recovery version"]), format!("Skyward {VERSION}")),
         (l.pick(["内核版本", "核心版本", "Kernel version"]), i.kernel.clone()),
-    ]);
+    ];
+    // Only a build that named someone has this row; the const is absent when
+    // the variable was not set at build time.
+    if let Some(builder) = BUILDER {
+        versions.push((l.pick(["构建者", "建置者", "Built by"]), builder.to_string()));
+    }
+    y = widgets::info_card(&mut c, t, f, y + gap, &versions);
 
     let mut boot = Vec::new();
     if let Some(s) = i.slot {
