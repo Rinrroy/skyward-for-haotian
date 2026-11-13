@@ -7,10 +7,12 @@ use abootimg_oxide::binrw::BinRead;
 use abootimg_oxide::{Header, VendorHeader};
 use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
+use skyward_sys::kmsg;
 use skyward_vab::Slot;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const BOOT_MAGIC: &[u8] = b"ANDROID!";
 const VENDOR_BOOT_MAGIC: &[u8] = b"VNDRBOOT";
@@ -44,7 +46,25 @@ const RECOVERY_PROGRAMS: [&str; 2] = ["system/bin/recovery", "sbin/recovery"];
 const FOOTER_MAGIC: &[u8] = b"AVBf";
 const FOOTER_LEN: u64 = 64;
 
-const CHUNK: usize = 1 << 20;
+/// How much of an image is moved per call: one buffer, reused, large enough
+/// that the storage has the next write ready before it is done with this one.
+const CHUNK: usize = 4 << 20;
+
+/// The longest image whose whole is read back once it is written. A boot
+/// image, a dtbo, a vbmeta is small, so reading it back costs nothing worth
+/// saving and the whole of it being compared is worth more. A super image is
+/// many gigabytes, and reading all of it back doubles the I/O on storage
+/// whose flash translation layer is still busy with the write, so only
+/// windows of it are compared instead.
+const VERIFY_MOST: u64 = 256 << 20;
+
+/// How wide one such window is: one at the start of the image, one at its
+/// middle, and one at its end are read back and compared.
+const WINDOW: u64 = 1 << 20;
+
+/// How much is written between two lines telling the rate, so that how fast
+/// a super image went can be read off the phone's own log afterwards.
+const RATE_EVERY: u64 = 1 << 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageKind {
@@ -241,11 +261,12 @@ fn has_partition(kind: ImageKind, dir: &Path, name: &str) -> Result<bool> {
     Ok(has)
 }
 
-/// Write `len` bytes of `image` to all of `devices` in one pass, then read
-/// each back and compare. A signed image smaller than its partition gets
-/// its footer moved to the partition's end, with zeros between, as
-/// fastboot does. `progress` hears the bytes written and read back so far,
-/// of all.
+/// Write `len` bytes of `image` to all of `devices` in one pass, discarding
+/// each partition's range first, then read each back and compare: the whole
+/// of a short image, and a window at the start, the middle, and the end of a
+/// long one. A signed image smaller than its partition gets its footer moved
+/// to the partition's end, with zeros between, as fastboot does. `progress`
+/// hears the bytes written and read back so far, of all.
 pub fn flash<R: Read + Seek>(image: &mut R, len: u64, devices: &[PathBuf], progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
     ensure!(!devices.is_empty(), "no partition to write");
     let mut outs = Vec::with_capacity(devices.len());
@@ -268,42 +289,116 @@ pub fn flash<R: Read + Seek>(image: &mut R, len: u64, devices: &[PathBuf], progr
     image.seek(SeekFrom::Start(0)).context("rewind the image")?;
     let (gap, tail): (u64, &[u8]) = if moved { (size - len - FOOTER_LEN, &footer) } else { (0, &[]) };
     let end = len + gap + tail.len() as u64;
-    let total = end * outs.len() as u64 * 2;
+
+    // Every byte of this range is about to be written over, so what the
+    // storage held there is of no use: discarding it first tells the storage
+    // that those blocks need not be copied away before they are written, as
+    // TWRP does before it writes a partition. A phone whose storage or kernel
+    // offers no discard is flashed all the same — this is a hint, and a
+    // diagnostic may never be able to fail the feature it describes — so the
+    // failure is only told, once, of the first partition it failed on.
+    let mut undiscarded: Option<(&Path, anyhow::Error)> = None;
+    for (path, ..) in &outs {
+        if let Err(e) = skyward_block::erase::discard_range(path, 0, end) {
+            undiscarded.get_or_insert((path.as_path(), e));
+        }
+    }
+    if let Some((path, e)) = undiscarded {
+        let _ = kmsg(&format!("{}: written without a discard first: {e:#}", path.display()));
+    }
+
+    // What is read back once written: the whole of a short image, and three
+    // windows of a long one, each hashed as it is written out.
+    let whole = end <= VERIFY_MOST;
+    let spans = spans(end, whole, WINDOW);
+    let mut parts: Vec<(u64, u64, Sha256)> = spans.iter().map(|&(at, len)| (at, len, Sha256::new())).collect();
+    let read_back = spans.iter().map(|(_, len)| *len).sum::<u64>() * outs.len() as u64;
+    let total = end * outs.len() as u64 + read_back;
+    let name = outs.first().and_then(|(path, ..)| path.file_name()).map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     let mut source = image.take(len).chain(io::repeat(0).take(gap)).chain(tail);
 
     let mut buf = vec![0u8; CHUNK];
-    let mut written = Sha256::new();
     let mut done = 0;
     let mut at = 0;
+    let started = Instant::now();
+    let mut told = 0;
     while at < end {
         let n = (end - at).min(CHUNK as u64) as usize;
         source.read_exact(&mut buf[..n]).context("read the image")?;
-        written.update(&buf[..n]);
+        hash_at(&mut parts, at, &buf[..n]);
         for (path, f, _) in &mut outs {
             f.write_all(&buf[..n]).with_context(|| format!("write {}", path.display()))?;
             done += n as u64;
             progress(done, total);
         }
         at += n as u64;
+        // How fast the write goes, once per GiB, so that the owner can tell
+        // from the phone's own log how long a super image took and at what
+        // rate; nothing here may fail the write.
+        if at / RATE_EVERY > told {
+            told = at / RATE_EVERY;
+            let secs = started.elapsed().as_secs_f64();
+            let rate = if secs > 0.0 { (at as f64 / 1e6 / secs) as u64 } else { 0 };
+            let _ = kmsg(&format!("{name}: {} of {} MiB, {rate} MB/s", at >> 20, end >> 20));
+        }
     }
-    let written = written.finalize();
+    let digests: Vec<(u64, u64, Vec<u8>)> = parts.into_iter().map(|(at, len, hasher)| (at, len, hasher.finalize().to_vec())).collect();
     for (path, f, _) in &mut outs {
         f.sync_all().with_context(|| format!("flush {}", path.display()))?;
         drop_cache(f).with_context(|| format!("drop the cached pages of {}", path.display()))?;
     }
     for (path, f, _) in &mut outs {
-        f.seek(SeekFrom::Start(0)).with_context(|| format!("rewind {}", path.display()))?;
+        verify(f, path, &digests, &mut buf, &mut done, total, &mut *progress)?;
+    }
+    Ok(())
+}
+
+/// The parts of an image `end` bytes long that are read back once it is
+/// written: the whole of it where `whole`, and otherwise a `window` at its
+/// start, one at its middle, and one at its end. No window reaches past the
+/// image's end, and an image too short to hold three of them is read whole.
+fn spans(end: u64, whole: bool, window: u64) -> Vec<(u64, u64)> {
+    if whole || end <= window.saturating_mul(3) {
+        return vec![(0, end)];
+    }
+    vec![(0, window), (end / 2 - window / 2, window), (end - window, window)]
+}
+
+/// Feed `bytes`, the image's bytes from `at` on, to the hash of every part
+/// they touch: the parts are hashed as the image is written, so that what a
+/// window is compared against is what went to the storage, without the image
+/// being kept.
+fn hash_at(parts: &mut [(u64, u64, Sha256)], at: u64, bytes: &[u8]) {
+    let end = at + bytes.len() as u64;
+    for (part_at, part_len, hasher) in parts {
+        let (from, to) = ((*part_at).max(at), (*part_at + *part_len).min(end));
+        if from < to {
+            if let Some(touched) = bytes.get((from - at) as usize..(to - at) as usize) {
+                hasher.update(touched);
+            }
+        }
+    }
+}
+
+/// Read each part of what was written back from `f` and compare it with what
+/// those bytes hashed to as they were written; `what` names the partition in
+/// the errors. `done` and `total` are the progress of the whole flash, and
+/// `buf` is the buffer the write used, reused here.
+fn verify(f: &mut File, what: &Path, parts: &[(u64, u64, Vec<u8>)], buf: &mut [u8], done: &mut u64, total: u64, progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
+    ensure!(!buf.is_empty(), "a buffer to read back into");
+    for (at, len, want) in parts {
+        f.seek(SeekFrom::Start(*at)).with_context(|| format!("seek to {at} of {}", what.display()))?;
         let mut back = Sha256::new();
-        let mut left = end;
+        let mut left = *len;
         while left > 0 {
-            let n = left.min(CHUNK as u64) as usize;
-            f.read_exact(&mut buf[..n]).with_context(|| format!("read back {}", path.display()))?;
+            let n = left.min(buf.len() as u64) as usize;
+            f.read_exact(&mut buf[..n]).with_context(|| format!("read back {}", what.display()))?;
             back.update(&buf[..n]);
             left -= n as u64;
-            done += n as u64;
-            progress(done, total);
+            *done += n as u64;
+            progress(*done, total);
         }
-        ensure!(back.finalize() == written, "{} reads back different from what was written", path.display());
+        ensure!(back.finalize().to_vec() == *want, "{} reads back different from what was written", what.display());
     }
     Ok(())
 }
@@ -570,5 +665,63 @@ mod tests {
         let err = flash_all(&[1u8; 4097], &slots).unwrap_err();
         assert!(err.to_string().contains("4097"), "{err}");
         assert!(std::fs::read(&slots[0]).unwrap().iter().all(|&b| b == 0xaa));
+    }
+
+    /// What `bytes` hash to, as a part of a written image is compared.
+    fn digest_of(bytes: &[u8]) -> Vec<u8> {
+        Sha256::digest(bytes).to_vec()
+    }
+
+    #[test]
+    fn a_long_image_is_read_back_as_three_windows_and_a_short_one_whole() {
+        assert_eq!(spans(3 << 20, false, WINDOW), [(0, WINDOW), ((3 << 20) / 2 - WINDOW / 2, WINDOW), ((3 << 20) - WINDOW, WINDOW)], "a window at each end and the middle");
+        assert_eq!(spans(9 << 30, true, WINDOW), [(0, 9 << 30)], "a whole read-back is one part");
+        assert_eq!(spans(20, false, 8), [(0, 20)], "too short to hold three windows");
+        assert_eq!(spans(0, false, 8), [(0, 0)], "an empty image");
+    }
+
+    #[test]
+    fn the_windows_of_an_image_are_hashed_as_it_is_written() {
+        let data: Vec<u8> = (0..100u32).map(|i| (i * 7) as u8).collect();
+        let spans = spans(data.len() as u64, false, 8);
+        let mut parts: Vec<(u64, u64, Sha256)> = spans.iter().map(|&(at, len)| (at, len, Sha256::new())).collect();
+        let mut at = 0;
+        for chunk in data.chunks(7) {
+            hash_at(&mut parts, at, chunk);
+            at += chunk.len() as u64;
+        }
+        assert_eq!(at as usize, data.len(), "the whole image was fed in");
+        for ((at, len, hasher), (want_at, want_len)) in parts.into_iter().zip(spans) {
+            assert_eq!((at, len), (want_at, want_len));
+            let want = digest_of(data.get(at as usize..(at + len) as usize).unwrap_or_default());
+            assert_eq!(hasher.finalize().to_vec(), want, "the window at {at}");
+        }
+    }
+
+    #[test]
+    fn a_read_back_that_differs_from_what_was_written_fails_the_flash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("super");
+        let data: Vec<u8> = (0..64u32).map(|i| (i * 5) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let parts = |data: &[u8]| -> Vec<(u64, u64, Vec<u8>)> {
+            spans(data.len() as u64, false, 8).into_iter().map(|(at, len)| (at, len, digest_of(&data[at as usize..(at + len) as usize]))).collect()
+        };
+        let total = parts(&data).iter().map(|(_, len, _)| *len).sum::<u64>();
+        let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut buf = vec![0u8; 16];
+        let mut done = 0;
+        verify(&mut f, &path, &parts(&data), &mut buf, &mut done, total, &mut |_, _| {}).unwrap();
+        assert_eq!(done, total, "only the windows were read");
+
+        // A byte under no window is never read back, so what changed there is
+        // not noticed; a byte under a window is compared and fails the write.
+        f.seek(SeekFrom::Start(20)).unwrap();
+        f.write_all(&[0xff]).unwrap();
+        verify(&mut f, &path, &parts(&data), &mut buf, &mut 0u64, total, &mut |_, _| {}).unwrap();
+        f.seek(SeekFrom::Start(30)).unwrap();
+        f.write_all(&[0xee]).unwrap();
+        let err = verify(&mut f, &path, &parts(&data), &mut buf, &mut 0u64, total, &mut |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("different from what was written"), "{err}");
     }
 }
