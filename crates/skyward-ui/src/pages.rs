@@ -2162,6 +2162,8 @@ pub fn backup(cx: &Ctx) -> Frame {
         "xbl、abl、tz、hyp、uefi 等 23 個分割區，兩個槽位，約 220 MB。只作留存，不能寫回",
         "xbl, abl, tz, hyp, uefi and 19 more, both slots, about 220 MB. Kept only, never written back",
     ]);
+    // The bootloader chain is kept as well, but it can never be written
+    // back, so it is not one of the parts the page offers.
     let subs = [boot, system, data, modem, chain];
     let rows: Vec<Row> = BACKUP_PARTS
         .iter()
@@ -2170,7 +2172,7 @@ pub fn backup(cx: &Ctx) -> Frame {
         .map(|(k, (name, sub))| Row::new(l.pick(*name)).subtitle(sub).trail(Trail::Check(s.backup[k])))
         .collect();
     let parts = widgets::list(&mut c, t, f, y, &rows);
-    out.extend(hits(&parts.rows, &[0, 1, 2, 3, 4].map(Action::BackupPart)));
+    out.extend(hits(&parts.rows, &[0, 1, 2, 3].map(Action::BackupPart)));
     let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(["存放位置", "存放位置", "Save to"]));
     let storage = match (s.data.storage_open(), i.storage.free.map(fmt::gb)) {
         (true, Some(free)) => tr!(l, "剩余 {free}", "剩餘 {free}", "{free} free"),
@@ -2282,8 +2284,27 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
                     "這份備份來自其他裝置（{device}），無法還原到本機。",
                     "This backup is from another device ({device}) and can't be restored to this phone."
                 );
-                y = widgets::footnote(&mut c, t, f, y, &note);
+                widgets::footnote(&mut c, t, f, y, &note)
             } else {
+                let y = widgets::section(&mut c, t, f, y, l.pick(["恢复内容", "還原內容", "Contents"]));
+                let kept: Vec<usize> = (0..BACKUP_PARTS.len()).filter(|&k| held.parts[k]).collect();
+                let rows: Vec<Row> = kept.iter().map(|&k| Row::new(l.pick(BACKUP_PARTS[k])).trail(Trail::Check(chosen[k]))).collect();
+                let list = widgets::list(&mut c, t, f, y, &rows);
+                out.extend(list.rows.iter().zip(&kept).map(|(&rect, &k)| Hit { rect, action: Action::RestorePart(k) }));
+                let note = l.pick([
+                    "恢复后，所选内容的现有数据将被备份覆盖。",
+                    "還原後，所選內容的現有資料將被備份覆寫。",
+                    "Restoring writes the backup over what the parts chosen hold now.",
+                ]);
+                let mut y = widgets::footnote(&mut c, t, f, list.bottom, note);
+                if chosen[2] {
+                    let note = l.pick([
+                        "data 分区将恢复应用、账户和设置，内部存储、锁屏密码和指纹保持不变。恢复出厂设置后，无法再恢复此前的 data 分区备份。",
+                        "data 分割區將還原應用程式、帳戶和設定，內部儲存空間、螢幕鎖定密碼和指紋保持不變。恢復原廠設定後，無法再還原此前的 data 分割區備份。",
+                        "The data partition gets its apps, accounts and settings back, and internal storage, the screen lock and fingerprints stay as they are. After a factory reset, an earlier backup of the data partition can't be restored.",
+                    ]);
+                    y = widgets::footnote(&mut c, t, f, y, note);
+                }
                 // The boot partitions' vbmeta checks the system's: one of
                 // another version without the other may not start.
                 if let (Some(was), Some(now)) = (&held.system, &i.os_version)
@@ -2298,8 +2319,11 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
                     );
                     y = widgets::footnote(&mut c, t, f, y, &warn);
                 }
+                let (label, danger) = confirm_label(Confirm::Restore, cx.state);
+                let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
+                out.push(Hit { rect: track, action: Action::Confirm(Confirm::Restore) });
+                track.y + track.h
             }
-            y
         }
     };
     let delete = widgets::list(&mut c, t, f, y + t.m.dp(28.0), &[Row::new(l.pick(["删除备份", "刪除備份", "Delete backup"])).tint(t.pal.danger).trail(Trail::None)]);

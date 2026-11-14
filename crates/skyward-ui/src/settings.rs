@@ -59,9 +59,13 @@ pub struct Settings {
     pub aod_style: AodStyle,
     /// A computer connected over USB is offered internal storage.
     pub file_transfer: bool,
-    /// A double tap on the dark panel lights it.
+    /// A double tap on the dark panel lights it. A file written before
+    /// this setting existed keeps it on, which is what those phones did.
+    #[serde(default = "yes")]
     pub double_tap: bool,
-    /// A dark panel keeps a clock on the glass rather than being put out.
+    /// A dark panel keeps a clock on the glass rather than being put out,
+    /// and a file that names none keeps the clock it used to have.
+    #[serde(default = "yes")]
     pub always_on: bool,
     /// Turn both AVB checks off after a ROM is installed.
     pub disable_avb: bool,

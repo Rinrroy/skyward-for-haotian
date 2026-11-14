@@ -4384,6 +4384,11 @@ impl App {
     /// does. One that comes later than the window is a tap of its own and
     /// starts the count again.
     fn tap(&mut self, now: u64, x: f32, y: f32) {
+        if !self.state.double_tap {
+            // The gesture is off: a finger on the dark glass is nothing the
+            // phone acts on, as its own system has it when the switch is off.
+            return;
+        }
         let tap = Tap { x, y };
         let doubled =
             self.tapped.filter(|(first, at)| now.saturating_sub(*at) <= Tap::WINDOW_MS && first.doubles(&tap, self.w as f32));
@@ -8350,7 +8355,7 @@ impl App {
             Action::FilesSearch => {
                 self.state.files_search = true;
                 self.state.layer = Layer::Letters;
-                self.open(Screen::FilesSearch);
+                self.refresh();
             }
             Action::ClearFilesSearch => {
                 self.state.files_search = false;
@@ -11703,7 +11708,7 @@ mod tests {
         );
         // The second step has its own swipe, and that one writes.
         assert_eq!(
-            swipe(&mut app, &f, &i, Confirm::AvbDisable),
+            swiped(&mut app, &f, &i, Confirm::AvbDisable),
             vec![Effect::SetAvb { expected: state, check: avbctl::Check::Verification, disabled: true }],
             "the second step's swipe is the one that writes it"
         );
@@ -11721,7 +11726,7 @@ mod tests {
         assert!(app.act(Action::AvbToggle(avbctl::Check::Verification), 1000).is_empty());
         assert_eq!(app.state.avb_pending, Some((state.clone(), avbctl::Check::Verification, false)));
         assert_eq!(
-            swipe(&mut app, &f, &i, Confirm::Avb),
+            swiped(&mut app, &f, &i, Confirm::Avb),
             vec![Effect::SetAvb { expected: state, check: avbctl::Check::Verification, disabled: false }],
             "turning one on is the one direction that writes from a single swipe"
         );
@@ -12314,7 +12319,7 @@ mod tests {
         let y = track.centre().1 - app.top().1;
         app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
         app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
-        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Flash { partition: "super", pick: Pick::Current }]);
+        assert_eq!(acts(app.touch(Touch::Up, &f, 1000)), vec![Effect::Flash { partition: "super", pick: Pick::Current }]);
         assert_eq!(app.state.install, Install::Flashing { partition: "super", stage: None });
         // The installer ignores the pick and reports no slot, which the page
         // after it has to say without one.
@@ -13607,7 +13612,7 @@ mod tests {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Decrypt, W, H, PPD);
         app.data_waiting(Some((0, Keys::Digits)), Vec::new());
-        assert!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)).is_empty());
+        assert!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))).is_empty());
         assert_eq!(app.deadline(0), Some(TOAST_MS), "the page says to type one first");
     }
 
@@ -15091,7 +15096,7 @@ mod tests {
         let mut app = in_sdcard(&f, &i);
         hold_entry(&mut app, &f, &i, 1);
         tap(&mut app, &f, &i, Action::AskDelete);
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::DeleteEntry), vec![Effect::Delete("/sdcard/a.zip".into())]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::DeleteEntry), vec![Effect::Delete("/sdcard/a.zip".into())]);
         app.file_job_started(FileTask::Delete { path: "/sdcard/a.zip".into() });
         // The page that described the entry is gone with it.
         assert_eq!(app.state.file, None, "the work takes the entry it describes");
@@ -15502,10 +15507,12 @@ mod tests {
     fn the_double_tap_switch_is_kept_in_the_settings() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Settings, &f, &i);
-        assert!(app.state.double_tap);
-        assert!(tap_at(&mut app, &f, &i, Action::Toggle(Switch::DoubleTap), 1_000).is_empty());
+        // A start with no file yet has the gesture off: it costs the phone
+        // its suspend, so it is asked for rather than assumed.
         assert!(!app.state.double_tap);
-        assert!(!Settings::of(&app.state).double_tap);
+        assert!(tap_at(&mut app, &f, &i, Action::Toggle(Switch::DoubleTap), 1_000).is_empty());
+        assert!(app.state.double_tap);
+        assert!(Settings::of(&app.state).double_tap);
     }
 
     #[test]

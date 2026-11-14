@@ -18,3 +18,7 @@ notes/
 
 # Build scratch space used where the toolchain's own temp folder is not writable.
 .tmpbuild/
+.tmpbuild-host/
+
+# Working notes, unpacked images and one-off scripts, never part of a build.
+.tmp/
