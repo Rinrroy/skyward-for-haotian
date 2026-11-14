@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use skyward_net::http::{self, Servers};
 use skyward_net::web::{self, Opened, Saving};
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::ToSocketAddrs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
@@ -137,8 +137,11 @@ fn full_launch_script(dir: &Path, url: &str) -> String {
          # beside the plugin, so a tmpfs here does not hide it.\n\
          mkdir -p \"$D/tmp\" && /system/bin/mount -t tmpfs tmpfs \"$D/tmp\" 2>/dev/null || true\n\
          # The recovery's own PATH and temp folder are not in here, and a plugin\n\
-         # installed before this image still looks for both of them.\n\
-         exec /system/bin/env PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin TMPDIR=/tmp TMP=/tmp HOME=/root /system/bin/chroot \"$D\" /bin/sh /run.sh \"$SKYWARD_URL\" serve"
+         # installed before this image still looks for both of them. The root is\n\
+         # a Debian one, where Chromium's own libraries sit beside it in\n\
+         # /usr/lib/chromium and the rest in /usr/lib/aarch64-linux-gnu, and no\n\
+         # ldconfig has run here to say so: the second is told without it.\n\
+         exec /system/bin/env PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin TMPDIR=/tmp TMP=/tmp HOME=/root LD_LIBRARY_PATH=/usr/lib/chromium:/usr/lib/aarch64-linux-gnu /system/bin/chroot \"$D\" /bin/sh /run.sh \"$SKYWARD_URL\" serve"
     )
 }
 
@@ -185,9 +188,55 @@ fn full_page_shot(cdp: &mut Cdp) -> Result<Vec<u8>> {
     cdp.screenshot()
 }
 
+/// Whether the plugin's locale folder is there and empty of packs, in which
+/// case Chromium has no word to draw and stops in a way that says nothing.
+/// A root that keeps its packs elsewhere is not this, and says nothing.
+fn locales_empty(dir: &Path) -> bool {
+    std::fs::read_dir(dir.join("usr/lib/chromium/locales"))
+        .map(|entries| !entries.flatten().any(|entry| entry.path().extension().is_some_and(|ext| ext == "pak")))
+        .unwrap_or(false)
+}
+
 fn full_result(cdp: &mut Cdp) -> (Result<Vec<u8>, String>, bool) {
     let focus = cdp.focus_is_text();
     (full_page_shot(cdp).map_err(|e| format!("{e:#}")), focus)
+}
+
+/// What Chromium itself said last, for a page that has to say why the full
+/// mode would not start: its own last words rather than ours, so a plugin
+/// that is missing something names it. The bus it cannot reach is the
+/// recovery's ordinary noise and is left out, and so is everything before the
+/// end: a plugin that has run for a while says a great deal that is not the
+/// reason it stopped.
+fn chromium_said(dir: &Path) -> Option<String> {
+    /// The end of the log that is read, and the lines of it that are kept.
+    const TAIL: u64 = 64 * 1024;
+    const LINES: usize = 6;
+    let mut file = std::fs::File::open(dir.join("chromium.log")).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len > TAIL {
+        file.seek(SeekFrom::End(-(TAIL as i64))).ok()?;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut kept: Vec<&str> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.contains("dbus/") && !line.contains("object_proxy.cc") && !line.contains("Failed to call method"))
+        .collect();
+    // A read from the middle of the log starts in the middle of a line.
+    if len > TAIL && !kept.is_empty() {
+        kept.remove(0);
+    }
+    if kept.len() > LINES {
+        kept.drain(..kept.len() - LINES);
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    Some(kept.join("\n"))
 }
 
 pub struct Worker {
@@ -307,7 +356,17 @@ impl Worker {
                             }
                             Err(e) => {
                                 stop_full();
-                                tell(Event::Shot(Err(format!("{e:#}"))));
+                                let mut why = format!("{e:#}");
+                                if let Some(said) = chromium_said(&dir) {
+                                    note(&format!("the full browser said: {}", said.replace('\n', " ⏎ ")));
+                                    why.push_str("\n\n");
+                                    why.push_str(&said);
+                                }
+                                if locales_empty(&dir) {
+                                    note("the plugin has no locale pack under usr/lib/chromium/locales, which the full mode stops without");
+                                    why.push_str("\n\nusr/lib/chromium/locales has no .pak, and Chromium stops as soon as it wants a word: it needs the one that matches it");
+                                }
+                                tell(Event::Shot(Err(why)));
                             }
                         }
                     }
