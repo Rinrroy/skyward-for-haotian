@@ -610,6 +610,7 @@ impl Lay {
             .env("SKYWARD_USER_AGENT", USER_AGENT)
             .env("SKYWARD_DATA", storage())
             .env("SKYWARD_STORE", STORE)
+            .env("SKYWARD_DNS", name_servers())
             .env("SKYWARD_HOME", &home)
             .env("SKYWARD_LOG", &log)
             .stdin(Stdio::null());
@@ -766,6 +767,28 @@ fn storage() -> String {
     } else {
         String::new()
     }
+}
+
+/// Where a plugin is told the phone's name servers, comma separated, or nothing
+/// when the phone does not say.
+///
+/// This exists because a plugin has no `/etc/resolv.conf` to read: it is an
+/// ordinary Android program, and the resolver this program was given while it
+/// came up is the only one there is. Without it a plugin would have to guess a
+/// public resolver, which on a phone behind a captive portal or a home router
+/// with its own DNS answers nothing.
+fn name_servers() -> String {
+    let mut servers: Vec<String> = Vec::new();
+    for name in ["net.dns1", "net.dns2", "net.dns3", "net.dns4"] {
+        let Some(value) = skyward_sys::prop(name) else { continue };
+        let value = value.trim();
+        if value.is_empty() || servers.iter().any(|server| server == value) {
+            continue;
+        }
+        servers.push(value.to_string());
+    }
+    servers.truncate(3);
+    servers.join(",")
 }
 
 /// Keep what the plugin said where a phone that came back up can read it.

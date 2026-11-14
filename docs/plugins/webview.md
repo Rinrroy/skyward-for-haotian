@@ -41,8 +41,8 @@ plugin are its code, moved, not rewritten.
   stop it, unmount, clean up
 ```
 
-Neither side can see into the other. The recovery writes eight environment
-variables and a file; the plugin writes pixels and forty bytes of header. That
+Neither side can see into the other. The recovery writes a dozen environment
+variables and two files; the plugin writes pixels and a forty-byte header. That
 is the whole contract, and it is written down in
 [`skyward-plugins/webview/PROTOCOL.md`](https://github.com/Rinrroy/skyward-plugins)
 because two repositories implement it.
@@ -85,7 +85,7 @@ panel. The file is created by the recovery, `ftruncate`d to
 | 28 | 4 | `dirty_count`, 0…16 |
 | 32 | 256 | sixteen `{x, y, w, h}` rectangles |
 | 288 | 3808 | reserved |
-| 4096 | w×h×4 | pixels, BGRA8888, row major |
+| 4096 | w×h×4 | pixels, RGBA8888 straight alpha, row major |
 
 The plugin writes pixels first, then the dirty rectangles, then `dirty_count`,
 and only then `seq`, bumping it to odd while it is mid-frame and to even when
@@ -111,18 +111,22 @@ and the plugin reads `O_RDONLY|O_NONBLOCK`:
 
 ```
 down  <x> <y>              move  <x> <y>              up    <x> <y>
-swipe <x0> <y0> <x1> <y1> <ms>
-pinch <cx> <cy> <scale>
-key   <Name>               text  <escaped>            rotate <0|90|180|270>
-start                      reload                     stop
+key   <Name>               stop
 ```
 
-`key` carries device-independent names — `Back`, `Menu`, `Enter`, `VolumeUp`,
-`VolumeDown`, `Power`, `Escape`, and the four directions. `text` is what the
-recovery's own keyboard produced, with `\\` and `\n` escaped so a line is
-always a line. `stop` is the recovery asking the plugin to finish: it writes it,
-waits two seconds, and then kills the process group, so a plugin that hangs on
-the way out cannot hang the recovery.
+That is everything this build sends, because it is everything the recovery has:
+four hardware keys and a finger. `key` carries device-independent names — `Back`
+and `Power` are the two that do anything. `stop` is the recovery asking the
+plugin to finish: it writes it, waits two seconds, and then kills the process
+group, so a plugin that hangs on the way out cannot hang the recovery.
+
+The pipe also knows `swipe x0 y0 x1 y1 ms`, `pinch cx cy scale`,
+`text <escaped>`, `rotate 0|90|180|270`, `reload` and `start`. A plugin must
+ignore them, and this build never writes them: the recovery has no soft keyboard
+to type with, so **typing is the plugin's own work** — a plugin that wants text
+draws its own keyboard and turns the `down`/`move`/`up` it receives into
+keystrokes. Flings and pinches are the same story: the plugin sees raw touch and
+decides for itself what a gesture was.
 
 The recovery never blocks writing to the pipe. If the plugin is not reading, the
 line is dropped and the drop is logged; a stuck plugin degrades the input, not
@@ -176,8 +180,8 @@ rules are never consulted. But it is now the *plugin's* business:
 - the Chromium rootfs is installed as a separate payload, under
   `$SKYWARD_STORE/webview-chromium`, by the plugin's own page;
 - the plugin mounts `/dev`, `/proc`, `/sys` and a `/dev/shm` inside it, writes
-  `etc/resolv.conf` from the gateway it can see in `/proc/net/route`, and runs
-  `chroot … /bin/sh /run.sh <url> serve`;
+  `etc/resolv.conf` from what it was told (`$SKYWARD_DNS`) or from the gateway it
+  can see in `/proc/net/route`, and runs `chroot … /bin/sh /run.sh <url> serve`;
 - it talks to it over CDP — navigate, screenshot, focus test, touch, pinch,
   insert text, reload — exactly as `crates/skyward/src/cdp.rs` did;
 - the screenshot becomes the frame. The recovery does not know Chromium exists.
