@@ -206,6 +206,7 @@ const SPECS: Text = ["全部参数与信息", "全部規格與資訊", "All spec
 const LOGS: Text = ["导出日志", "匯出記錄", "Export logs"];
 const SCREEN_TIMEOUT: Text = ["息屏时间", "螢幕自動關閉", "Screen timeout"];
 const ALWAYS_ON: Text = ["息屏显示", "螢幕關閉顯示", "Always-on display"];
+const CLOCK_STYLE: Text = ["时钟样式", "時鐘樣式", "Clock style"];
 const DOUBLE_TAP: Text = ["双击亮屏", "連點兩下亮屏", "Double-tap to wake"];
 const REMEMBER_PASSWORD: Text = ["记住解密密码", "記住解密密碼", "Remember the decrypt password"];
 const AVB: Text = ["AVB 校验", "AVB 驗證", "AVB verification"];
@@ -462,8 +463,11 @@ pub fn settings(cx: &Ctx) -> Frame {
     if s.panel_dozes {
         y = widgets::section(&mut c, t, f, y, l.pick(["息屏显示", "螢幕關閉顯示", "Always-on display"]));
         let on = Row::new(l.pick(ALWAYS_ON)).switch(s.always_on);
-        let aod = widgets::list(&mut c, t, f, y, &[on]);
-        out.extend(hits(&aod.rows, &[Action::Toggle(Switch::AlwaysOn)]));
+        // The clock on a dark panel has three looks; the row cycles them, so
+        // the page keeps the panel's own doze out of the way of the choice.
+        let style = Row::new(l.pick(CLOCK_STYLE)).trail(Trail::Value(s.aod_style.name(l)));
+        let aod = widgets::list(&mut c, t, f, y, &[on, style]);
+        out.extend(hits(&aod.rows, &[Action::Toggle(Switch::AlwaysOn), Action::AodStyle]));
         let note = l.pick([
             "屏幕熄灭后仍显示时间、电量、槽位与解密状态，背光保持关闭。",
             "螢幕關閉後仍顯示時間、電量、槽位與解密狀態，背光保持關閉。",
