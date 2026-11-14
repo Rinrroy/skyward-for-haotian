@@ -419,10 +419,10 @@ fn hash_at(parts: &mut [(u64, u64, Sha256)], at: u64, bytes: &[u8]) {
     let end = at + bytes.len() as u64;
     for (part_at, part_len, hasher) in parts {
         let (from, to) = ((*part_at).max(at), (*part_at + *part_len).min(end));
-        if from < to {
-            if let Some(touched) = bytes.get((from - at) as usize..(to - at) as usize) {
-                hasher.update(touched);
-            }
+        if from < to
+            && let Some(touched) = bytes.get((from - at) as usize..(to - at) as usize)
+        {
+            hasher.update(touched);
         }
     }
 }

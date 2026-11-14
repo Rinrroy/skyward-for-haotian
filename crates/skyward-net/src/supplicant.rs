@@ -172,12 +172,6 @@ pub fn unescape(text: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Bytes as hex digits, the way a value the supplicant takes as it is,
-/// with nothing to escape, is written.
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// What sets up a network with id `id` to join it: its name, how it is
 /// protected and its password. The name and a WPA3 password go as hex,
 /// which takes any byte; a WPA2 password goes in quotes, which the
@@ -186,7 +180,7 @@ pub fn hex(bytes: &[u8]) -> String {
 /// for by name.
 pub fn network_commands(id: u32, ssid: &[u8], security: Security, password: &str, hidden: bool) -> Result<Vec<String>> {
     let set = |name: &str, value: String| format!("SET_NETWORK {id} {name} {value}");
-    let mut commands = vec![set("ssid", hex(ssid))];
+    let mut commands = vec![set("ssid", hex::encode(ssid))];
     if hidden {
         commands.push(set("scan_ssid", "1".into()));
     }
@@ -208,13 +202,13 @@ pub fn network_commands(id: u32, ssid: &[u8], security: Security, password: &str
         Security::Sae => {
             ensure!(!password.is_empty(), "a WPA3 password is not empty");
             commands.push(set("key_mgmt", "SAE".into()));
-            commands.push(set("sae_password", hex(password.as_bytes())));
+            commands.push(set("sae_password", hex::encode(password)));
             commands.push(set("ieee80211w", "2".into()));
         }
         Security::PskSae => {
             commands.push(set("key_mgmt", "WPA-PSK WPA-PSK-SHA256 SAE".into()));
             commands.push(set("psk", psk()?));
-            commands.push(set("sae_password", hex(password.as_bytes())));
+            commands.push(set("sae_password", hex::encode(password)));
             commands.push(set("ieee80211w", "1".into()));
         }
         Security::Wep | Security::Enterprise => bail!("the recovery does not join a network protected so"),
@@ -295,7 +289,7 @@ pub fn saved_text(kept: &[Saved]) -> String {
         if k.password.contains('\n') || k.password.contains('\r') {
             continue;
         }
-        out.push_str(&hex(&k.ssid));
+        out.push_str(&hex::encode(&k.ssid));
         out.push('\t');
         out.push_str(k.security.tag());
         out.push('\t');
@@ -370,7 +364,7 @@ pub fn config_text(sockets: &str, kept: &[Saved]) -> String {
     // was joined last: a phone that carried away from one network and back
     // to another joins what it can hear, as the phone's own system does.
     for k in kept.iter().filter(|k| k.security.joinable()) {
-        out.push_str(&format!("\nnetwork={{\n\tssid={}\n", hex(&k.ssid)));
+        out.push_str(&format!("\nnetwork={{\n\tssid={}\n", hex::encode(&k.ssid)));
         match k.security {
             Security::Open => out.push_str("\tkey_mgmt=NONE\n"),
             Security::Owe => out.push_str("\tkey_mgmt=OWE\n\tieee80211w=2\n"),
@@ -384,12 +378,12 @@ pub fn config_text(sockets: &str, kept: &[Saved]) -> String {
             }
             Security::Sae => {
                 out.push_str("\tkey_mgmt=SAE\n");
-                out.push_str(&format!("\tsae_password={}\n\tieee80211w=2\n", hex(k.password.as_bytes())));
+                out.push_str(&format!("\tsae_password={}\n\tieee80211w=2\n", hex::encode(k.password.as_bytes())));
             }
             Security::PskSae => {
                 out.push_str("\tkey_mgmt=WPA-PSK WPA-PSK-SHA256 SAE\n");
                 push_psk(&mut out, &k.password);
-                out.push_str(&format!("\tsae_password={}\n\tieee80211w=1\n", hex(k.password.as_bytes())));
+                out.push_str(&format!("\tsae_password={}\n\tieee80211w=1\n", hex::encode(k.password.as_bytes())));
             }
             // Nothing else is kept, and a record naming one is not one this
             // writes: the filter above leaves it out before its block opens.
@@ -614,7 +608,6 @@ mod tests {
         assert_eq!(unescape(r"\x00\xff").unwrap(), [0, 255]);
         assert!(unescape(r"\x4").is_err());
         assert!(unescape(r"\q").is_err());
-        assert_eq!(hex(b"ab\x00"), "616200");
     }
 
     #[test]
@@ -683,8 +676,8 @@ mod tests {
         let text = format!(
             "{}\nnot a record\ndeadbeeff\tpsk\tpw\n{}\tnosuch\tpw\n{}\tenterprise\tpw\n",
             saved_text(std::slice::from_ref(&good)),
-            hex(b"Good"),
-            hex(b"Good")
+            hex::encode(b"Good"),
+            hex::encode(b"Good")
         );
         assert_eq!(saved_read(&text), [good], "a line of each kind that cannot be read is left out");
     }

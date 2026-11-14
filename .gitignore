@@ -15,3 +15,6 @@ NOTES.md
 TODO.md
 *.draft.md
 notes/
+
+# Build scratch space used where the toolchain's own temp folder is not writable.
+.tmpbuild/

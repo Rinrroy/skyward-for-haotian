@@ -35,10 +35,10 @@ const LINGER: Duration = Duration::from_secs(1);
 pub(crate) fn wait_engine<T>(child: &mut Child, rx: &Receiver<T>, mut receive: impl FnMut(T)) -> Result<ExitStatus> {
     let mut ended = None;
     loop {
-        if ended.is_none() {
-            if let Some(status) = child.try_wait().context("check whether update_engine has exited")? {
-                ended = Some((status, Instant::now()));
-            }
+        if ended.is_none()
+            && let Some(status) = child.try_wait().context("check whether update_engine has exited")?
+        {
+            ended = Some((status, Instant::now()));
         }
         match rx.recv_timeout(PROGRESS_EVERY) {
             Ok(line) => receive(line),
@@ -47,10 +47,10 @@ pub(crate) fn wait_engine<T>(child: &mut Child, rx: &Receiver<T>, mut receive: i
             // ended: it may have handed them on and kept working.
             Err(RecvTimeoutError::Disconnected) => return child.wait().context("wait for update_engine"),
         }
-        if let Some((status, at)) = ended {
-            if at.elapsed() >= LINGER {
-                return Ok(status);
-            }
+        if let Some((status, at)) = ended
+            && at.elapsed() >= LINGER
+        {
+            return Ok(status);
         }
     }
 }

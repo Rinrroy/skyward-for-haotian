@@ -2346,9 +2346,9 @@ pub enum Effect {
     /// List the folder at this path for the file manager.
     ReadDir(String),
     /// Look through the folders below `root` for the entries `query` names,
-    /// telling what it found with [`App::found_files`] against search `gen`
+    /// telling what it found with [`App::found_files`] against search `generation`
     /// so that an answer to a query already typed over is dropped.
-    FindFiles { root: String, query: String, gen: u64, sort: SortKey },
+    FindFiles { root: String, query: String, generation: u64, sort: SortKey },
     /// List the folder at this path from the top of a place, to choose a
     /// file to install in, telling what it holds with [`App::set_place`].
     ReadPlace(Place, String),
@@ -3348,17 +3348,15 @@ impl App {
         // An entry of the file manager held long enough, under a finger or
         // the power key, opens what can be done with it, a folder as much as
         // a file, with a tap of the motor.
-        if let Drag::Press { action: Some(Action::OpenEntry(i)), at, .. } = self.drag {
-            if now >= at + LONG_PRESS_MS {
-                self.drag = Drag::Held;
-                fx.extend(self.held_entry(i));
-            }
+        if let Drag::Press { action: Some(Action::OpenEntry(i)), at, .. } = self.drag
+            && now >= at + LONG_PRESS_MS {
+            self.drag = Drag::Held;
+            fx.extend(self.held_entry(i));
         }
-        if let Some((key, Press::Power { spot: Spot { stop: Stop::Hit(Action::OpenEntry(i)), .. }, at })) = self.button {
-            if now >= at + LONG_PRESS_MS {
-                self.button = Some((key, Press::Spent));
-                fx.extend(self.held_entry(i));
-            }
+        if let Some((key, Press::Power { spot: Spot { stop: Stop::Hit(Action::OpenEntry(i)), .. }, at })) = self.button
+            && now >= at + LONG_PRESS_MS {
+            self.button = Some((key, Press::Spent));
+            fx.extend(self.held_entry(i));
         }
         let active = *self.active.get_or_insert(now);
         if let (true, Some(after)) = (self.display_on, SCREEN_OFF[self.state.screen_off]) {
@@ -3472,11 +3470,10 @@ impl App {
         }
         // A volume key held moves the light on and on, once the page it
         // last moved on has been drawn.
-        if let Some((key, Press::Volume { down, next })) = self.button {
-            if now >= next && self.frame.is_some() {
-                self.button = Some((key, Press::Volume { down, next: now + REPEAT_MS }));
-                fx.extend(self.volume(down, now));
-            }
+        if let Some((key, Press::Volume { down, next })) = self.button
+            && now >= next && self.frame.is_some() {
+            self.button = Some((key, Press::Volume { down, next: now + REPEAT_MS }));
+            fx.extend(self.volume(down, now));
         }
         if let Some((_, _, s)) = self.cue {
             self.dirty = true;
@@ -3849,10 +3846,9 @@ impl App {
         if let Some(kept) = kept {
             kept.apply(&mut self.state);
         }
-        if !self.state.language_chosen {
-            if let Some(lang) = named.or(kept.and_then(Settings::spoken)) {
-                self.state.lang = lang;
-            }
+        if !self.state.language_chosen
+            && let Some(lang) = named.or(kept.and_then(Settings::spoken)) {
+            self.state.lang = lang;
         }
         self.refresh();
     }
@@ -4364,10 +4360,9 @@ impl App {
         let entry = self.state.file.as_mut().expect("the permissions page shows an entry");
         entry.mode = (entry.mode & !0o7777) | bits;
         let name = entry.name.clone();
-        if let Ok(entries) = &mut self.state.files.entries {
-            if let Some(listed) = entries.iter_mut().find(|e| e.name == name) {
-                listed.mode = (listed.mode & !0o7777) | bits;
-            }
+        if let Ok(entries) = &mut self.state.files.entries
+            && let Some(listed) = entries.iter_mut().find(|e| e.name == name) {
+            listed.mode = (listed.mode & !0o7777) | bits;
         }
         if bits != wanted {
             self.say(l.pick(["该位置不支持修改权限", "這個位置不支援修改權限", "Permissions can't be changed here"]), now);
@@ -4695,13 +4690,11 @@ impl App {
         }
         // The entry the file page describes stands as the folder it is in
         // lists it again, as after its file is saved.
-        if screen == Screen::Files && folder == self.state.files.path {
-            if let (Some(file), Ok(entries)) = (self.state.file.as_mut(), &files) {
-                if let Some(listed) = entries.iter().find(|e| e.name == file.name) {
-                    *file = listed.clone();
-                }
+        if screen == Screen::Files && folder == self.state.files.path
+            && let (Some(file), Ok(entries)) = (self.state.file.as_mut(), &files)
+                && let Some(listed) = entries.iter().find(|e| e.name == file.name) {
+                *file = listed.clone();
             }
-        }
         // A folder gone into starts without a query: the one typed was for
         // the folder left behind. Reading the same folder again, as after a
         // file is deleted or the order changes, keeps it.
@@ -5081,10 +5074,9 @@ impl App {
         // The light goes over its control, in the part of the screen the
         // control is drawn in, under whatever is laid over that part.
         let shine = |out: &mut Canvas, part: Group| {
-            if let Some((g, r, radius, tint)) = view.light {
-                if g == part {
-                    out.fill_round_rect(r.x, r.y, r.w, r.h, radius, tint);
-                }
+            if let Some((g, r, radius, tint)) = view.light
+                && g == part {
+                out.fill_round_rect(r.x, r.y, r.w, r.h, radius, tint);
             }
         };
         let frame = self.frame.as_ref().expect("a page is drawn from its frame");
@@ -6120,16 +6112,15 @@ impl App {
                 // The request is only held here; it is written after the
                 // page's own swipe agrees to it, so that a stray touch on a
                 // row cannot change what the bootloader checks.
-                if let Some(Ok(state)) = self.state.avb.clone() {
-                    if state.unlocked {
-                        self.state.avb_pending = match &self.state.avb_pending {
-                            Some((_, pending, _)) if *pending == check => None,
-                            _ => Some((state.clone(), check, !state.disabled(check))),
-                        };
-                        self.state.avb_notice = None;
-                        self.state.confirm = 0.0;
-                        self.refresh();
-                    }
+                if let Some(Ok(state)) = self.state.avb.clone()
+                    && state.unlocked {
+                    self.state.avb_pending = match &self.state.avb_pending {
+                        Some((_, pending, _)) if *pending == check => None,
+                        _ => Some((state.clone(), check, !state.disabled(check))),
+                    };
+                    self.state.avb_notice = None;
+                    self.state.confirm = 0.0;
+                    self.refresh();
                 }
             }
             // Taking the request back puts down both the change and the step
@@ -7093,7 +7084,7 @@ impl App {
         self.state.files.keep("");
         let query = self.state.files_query.trim().to_owned();
         self.state.find_gen += 1;
-        let gen = self.state.find_gen;
+        let generation = self.state.find_gen;
         if query.is_empty() {
             self.clear_found();
             self.refresh();
@@ -7104,7 +7095,7 @@ impl App {
         self.state.found = None;
         self.state.finding = true;
         self.refresh();
-        vec![Effect::FindFiles { root: self.state.files.path.clone(), query, gen, sort: self.state.sort }]
+        vec![Effect::FindFiles { root: self.state.files.path.clone(), query, generation, sort: self.state.sort }]
     }
 
     /// Forget what a search found, because its text is gone or the folder
@@ -7115,11 +7106,11 @@ impl App {
         self.state.find_gen += 1;
     }
 
-    /// What the search `gen` found, or why it could not look: an answer to a
+    /// What the search `generation` found, or why it could not look: an answer to a
     /// query typed over since is dropped, since the rows under the box are
     /// the rows of the text that is in it now.
-    pub fn found_files(&mut self, gen: u64, found: Result<Vec<Found>, String>) {
-        if gen != self.state.find_gen {
+    pub fn found_files(&mut self, generation: u64, found: Result<Vec<Found>, String>) {
+        if generation != self.state.find_gen {
             return;
         }
         self.state.finding = false;
@@ -7469,10 +7460,9 @@ impl App {
         // Any button stops a gliding page, and brings a sliding one to rest.
         self.fling = None;
         self.end_turn();
-        if let Some((first, at)) = self.chord {
-            if matches!((first, key), (Key::Power, Key::VolumeDown) | (Key::VolumeDown, Key::Power)) && now < at + CHORD_MS {
-                return self.screenshot(key, now);
-            }
+        if let Some((first, at)) = self.chord
+            && matches!((first, key), (Key::Power, Key::VolumeDown) | (Key::VolumeDown, Key::Power)) && now < at + CHORD_MS {
+            return self.screenshot(key, now);
         }
         let mut fx = self.let_chord_go(now);
         if !self.display_on {
@@ -7763,13 +7753,12 @@ impl App {
                 }
             }
             Confirm::SwitchSystem => {
-                if let (Some(Ok(systems)), Some(pick)) = (&self.state.systems, self.state.system_pick) {
-                    if pick != starting(systems) {
-                        fx.push(Effect::SwitchSystem(pick));
-                        self.state.systems_work = Some(SystemsWork::Switching(pick));
-                        self.state.system_pick = None;
-                        self.refresh();
-                    }
+                if let (Some(Ok(systems)), Some(pick)) = (&self.state.systems, self.state.system_pick)
+                    && pick != starting(systems) {
+                    fx.push(Effect::SwitchSystem(pick));
+                    self.state.systems_work = Some(SystemsWork::Switching(pick));
+                    self.state.system_pick = None;
+                    self.refresh();
                 }
             }
             Confirm::RemoveSystem => {
@@ -8452,17 +8441,15 @@ mod tests {
             let (x, y) = h.rect.centre();
             return (x, y - scroll);
         }
-        if let Some(p) = &fr.pinned {
-            if let Some(h) = p.hits.iter().find(|h| h.action == action) {
-                let (x, y) = h.rect.centre();
-                return (x, y + pinned_top(&t, p, scroll));
-            }
+        if let Some(p) = &fr.pinned
+            && let Some(h) = p.hits.iter().find(|h| h.action == action) {
+            let (x, y) = h.rect.centre();
+            return (x, y + pinned_top(&t, p, scroll));
         }
-        if let Some(d) = &fr.dock {
-            if let Some(h) = d.hits.iter().find(|h| h.action == action) {
-                let (x, y) = h.rect.centre();
-                return (x, y + H as f32 - d.canvas.h as f32);
-            }
+        if let Some(d) = &fr.dock
+            && let Some(h) = d.hits.iter().find(|h| h.action == action) {
+            let (x, y) = h.rect.centre();
+            return (x, y + H as f32 - d.canvas.h as f32);
         }
         let rows = fr.rows.as_ref().expect("control on the page");
         let answer = rows.action.expect("control on the page");
@@ -11225,6 +11212,7 @@ mod tests {
             other: Some(skyward_systems::Other { id: "ubuntu".into(), name: "Ubuntu Touch".into(), version: "24.04".into(), size: 16 << 30 }),
             other_starts: false,
             changed: false,
+            held: skyward_systems::Held::Recorded,
         }
     }
 
@@ -11599,7 +11587,7 @@ mod tests {
         // it asks for is a walk of the folders below this one, since a name
         // three folders down is what a search of one folder cannot find.
         let asked = tap_at(&mut app, &f, &i, Action::Type(Cap::Char('b')), 1010);
-        assert_eq!(asked, vec![Effect::FindFiles { root: "/sdcard".into(), query: "b".into(), gen: app.state.find_gen, sort: SortKey::Name }]);
+        assert_eq!(asked, vec![Effect::FindFiles { root: "/sdcard".into(), query: "b".into(), generation: app.state.find_gen, sort: SortKey::Name }]);
         assert_eq!(app.state.files_query, "b");
         assert!(app.state.finding, "the page says it is looking");
         assert_eq!(app.state.files.shown_entries().len(), 3, "the folder's own list stays whole behind the box");
@@ -11616,7 +11604,7 @@ mod tests {
         assert_eq!(app.state.sort, SortKey::Name);
         for expected in [SortKey::Modified, SortKey::Kind, SortKey::Name] {
             let asked = tap_at(&mut app, &f, &i, Action::CycleSort, 1015);
-            assert_eq!(asked, vec![Effect::FindFiles { root: "/sdcard".into(), query: "b".into(), gen: app.state.find_gen, sort: expected }], "the tree is walked again in the new order");
+            assert_eq!(asked, vec![Effect::FindFiles { root: "/sdcard".into(), query: "b".into(), generation: app.state.find_gen, sort: expected }], "the tree is walked again in the new order");
             assert_eq!(app.state.sort, expected);
         }
 

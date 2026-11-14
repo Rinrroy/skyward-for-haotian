@@ -2,12 +2,12 @@
 //! does once its screen is off: the kernel suspends it until a key, the
 //! charger, an alarm or the network wakes it.
 
+use crate::worker::{self, Told};
 use anyhow::{Context, Result};
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -54,21 +54,14 @@ struct Leave {
 /// what woke the phone, such as the power key, before it sleeps again.
 pub struct Sleeper {
     leave: Arc<(Mutex<Leave>, Condvar)>,
-    told: Receiver<Slept>,
-    /// Readable while sleeps wait to be told.
-    wake: OwnedFd,
+    told: Told<Slept>,
 }
 
 impl Sleeper {
     pub fn start() -> Result<Sleeper> {
         fs::write(MEM_SLEEP, "s2idle").with_context(|| format!("write s2idle to {MEM_SLEEP}"))?;
-        let mut fds = [0; 2];
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("make the sleeper's wake pipe");
-        }
-        let (wake, signal) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let (tell, told) = worker::telling().context("make the sleeper's wake pipe")?;
         let leave = Arc::new((Mutex::new(Leave { allowed: false, not_before: Instant::now() }), Condvar::new()));
-        let (tx, told) = mpsc::channel();
         let shared = leave.clone();
         thread::Builder::new()
             .name("sleeper".into())
@@ -102,16 +95,16 @@ impl Sleeper {
                     }
                     // The screen's loop only stops listening once the
                     // recovery ends.
-                    let _ = tx.send(slept);
-                    unsafe { libc::write(signal.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+                    tell.tell(slept);
                 }
             })
             .context("start the sleeper")?;
-        Ok(Sleeper { leave, told, wake })
+        Ok(Sleeper { leave, told })
     }
 
+    /// Readable while sleeps wait to be told.
     pub fn fd(&self) -> RawFd {
-        self.wake.as_raw_fd()
+        self.told.fd()
     }
 
     /// Let the phone sleep, or keep it awake. Let, the thread suspends it as
@@ -127,9 +120,7 @@ impl Sleeper {
 
     /// The sleeps since the last call, and how each went.
     pub fn slept(&self) -> Vec<Slept> {
-        let mut drain = [0u8; 64];
-        while unsafe { libc::read(self.wake.as_raw_fd(), drain.as_mut_ptr().cast(), drain.len()) } > 0 {}
-        self.told.try_iter().collect()
+        self.told.take()
     }
 }
 
@@ -140,49 +131,6 @@ impl Sleeper {
 /// a key press, or a cable going in or out, that the loop has yet to see.
 pub struct Wakeful {
     epoll: OwnedFd,
-}
-
-/// Where the kernel says whether a device may wake the phone, under the
-/// device's own folder: `enabled` or `disabled`, written to change it.
-const WAKEUP: &str = "power/wakeup";
-
-/// Whether a device hidden behind `path` may wake the phone from a suspend,
-/// and where that is written. `None` where the device cannot wake it at all:
-/// many input devices are made not to, and nothing can be done about that.
-fn wakeup_switch(device: &Path) -> Option<PathBuf> {
-    let at = device.join(WAKEUP);
-    at.exists().then_some(at)
-}
-
-/// Arm the touch panel as something that wakes the phone, so that a suspend
-/// while its panel is dark still ends at the first tap.
-///
-/// A phone whose display controller reports fingers with the panel off, which
-/// is the only kind the two-tap wake works on, is a phone whose touch driver
-/// must be able to wake it: otherwise the phone would have to stay awake with
-/// the screen off for the tap to be seen at all, and staying awake is most of
-/// what the recovery's power draw is.
-///
-/// The switch is on the device the driver bound to rather than on the input
-/// node: a touch driver arms its interrupt through the bus device, and the
-/// `/sys/class/input/eventN/device` link is that bus device already. Both are
-/// tried, because which one carries the attribute is the driver's business.
-/// A device already enabled is left as it is.
-pub fn arm_wakeup(device: &Path) -> Result<bool> {
-    let Some(at) = wakeup_switch(device) else { return Ok(false) };
-    match fs::read_to_string(&at) {
-        Ok(held) if held.trim() == "enabled" => return Ok(true),
-        Ok(_) => {}
-        Err(e) => return Err(e).with_context(|| format!("read {}", at.display())),
-    }
-    fs::write(&at, "enabled").with_context(|| format!("write to {}", at.display()))?;
-    Ok(true)
-}
-
-/// Whether `device` is armed to wake the phone, which is worth knowing before
-/// the loop lets it sleep.
-pub fn wakes(device: &Path) -> bool {
-    wakeup_switch(device).and_then(|at| fs::read_to_string(at).ok()).is_some_and(|held| held.trim() == "enabled")
 }
 
 impl Wakeful {
@@ -228,4 +176,47 @@ fn sleep(allowed: impl Fn() -> bool) -> Option<Slept> {
         Ok(()) => Slept::Woke,
         Err(e) => Slept::Refused(format!("the kernel would not suspend: {e}")),
     })
+}
+
+/// Where a device says whether it may wake the phone: an attribute of the
+/// device's own folder under /sys.
+const WAKEUP: &str = "power/wakeup";
+
+/// Whether a device hidden behind `path` may wake the phone from a suspend,
+/// and where that is written. `None` where the device cannot wake it at all:
+/// many input devices are made not to, and nothing can be done about that.
+fn wakeup_switch(device: &Path) -> Option<PathBuf> {
+    let at = device.join(WAKEUP);
+    at.exists().then_some(at)
+}
+
+/// Arm the touch panel as something that wakes the phone, so that a suspend
+/// while its panel is dark still ends at the first tap.
+///
+/// A phone whose display controller reports fingers with the panel off, which
+/// is the only kind the two-tap wake works on, is a phone whose touch driver
+/// must be able to wake it: otherwise the phone would have to stay awake with
+/// the screen off for the tap to be seen at all, and staying awake is most of
+/// what the recovery's power draw is.
+///
+/// The switch is on the device the driver bound to rather than on the input
+/// node: a touch driver arms its interrupt through the bus device, and the
+/// `/sys/class/input/eventN/device` link is that bus device already. Both are
+/// tried, because which one carries the attribute is the driver's business.
+/// A device already enabled is left as it is.
+pub fn arm_wakeup(device: &Path) -> Result<bool> {
+    let Some(at) = wakeup_switch(device) else { return Ok(false) };
+    match fs::read_to_string(&at) {
+        Ok(held) if held.trim() == "enabled" => return Ok(true),
+        Ok(_) => {}
+        Err(e) => return Err(e).with_context(|| format!("read {}", at.display())),
+    }
+    fs::write(&at, "enabled").with_context(|| format!("write to {}", at.display()))?;
+    Ok(true)
+}
+
+/// Whether `device` is armed to wake the phone, which is worth knowing before
+/// the loop lets it sleep.
+pub fn wakes(device: &Path) -> bool {
+    wakeup_switch(device).and_then(|at| fs::read_to_string(at).ok()).is_some_and(|held| held.trim() == "enabled")
 }

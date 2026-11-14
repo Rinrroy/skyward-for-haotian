@@ -1,0 +1,36 @@
+Merge upstream 0.3.1, keeping the fork's pages and its own features
+
+Upstream moved to the 2024 edition and Rust 1.100.0, split the pages'
+state machine into 27 modules, and added the secure element service, the
+OMAPI layer, the programs the phone's keys need and the binder objects
+that serve them.
+
+The fork keeps its own pages (crates/skyward-ui/src/app.rs and
+crates/skyward/src/ui.rs), its wlan, haptics, updates, decrypt, packer
+and download code, and everything this fork's releases added on top of
+0.2.6: a raw super image as a package of its own, the TWRP-shaped way of
+writing one, the install that cannot wait for ever, unlock refusals said
+in the page's language, avbctl covering both slots, the back gesture's
+preview, the click that is a click, and the network that joins itself.
+
+Conflicts resolved towards the fork where the fork's code carries a
+feature, and towards upstream everywhere else. The upstream pieces the
+fork's own code needed back, as they were:
+
+- skyward_config's Service keeps `description` and `sockets`, which
+  devices/haotian.toml names; From<Service> for Started hands them to the
+  programs that run from them.
+- the binder waits on the driver with a timeout again (transact_within,
+  wait_readable), so a service that never answers cannot hold a page.
+- the touch panel is armed to wake the phone (skyward_sys::sleep::arm_wakeup),
+  the installed system's libraries are put where the recovery's own
+  programs load them (secure::provide_system_libraries), and the readings
+  are taken less often with the panel dark (Readings::dark).
+- the install script keeps running from /skyward/run rather than /tmp.
+- haptics still drive the effect themselves, so upstream's waveform
+  module and the packer's stock-image reader are gone with their
+  dependencies.
+
+Also: the edition's let-chains turn the nested ifs the pages still had
+into the chains clippy now asks for, and the unused dependencies the
+merge left behind are removed.
