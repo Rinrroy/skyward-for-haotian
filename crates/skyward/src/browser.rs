@@ -115,7 +115,7 @@ fn full_launch_script(dir: &Path, url: &str) -> String {
          /system/bin/umount \"$D/sys\" 2>/dev/null || true\n\
          /system/bin/umount \"$D/proc\" 2>/dev/null || true\n\
          /system/bin/umount \"$D/dev\" 2>/dev/null || true\n\
-         mkdir -p \"$D/dev\" \"$D/proc\" \"$D/sys\" \"$D/dev/shm\"\n\
+         mkdir -p \"$D/dev\" \"$D/proc\" \"$D/sys\"\n\
          GW=\n\
          while read IF DEST GATEWAY REST; do if [ \"$DEST\" = \"00000000\" ]; then GW=$GATEWAY; break; fi; done < /proc/net/route 2>/dev/null || true\n\
          GLEN=$(printf '%s' \"$GW\" | wc -c)\n\
@@ -129,7 +129,13 @@ fn full_launch_script(dir: &Path, url: &str) -> String {
          /system/bin/mount -o bind /dev \"$D/dev\" || exit 1\n\
          /system/bin/mount -t proc proc \"$D/proc\" || exit 1\n\
          /system/bin/mount -t sysfs sysfs \"$D/sys\" || exit 1\n\
-         /system/bin/mount -t tmpfs tmpfs \"$D/dev/shm\" 2>/dev/null || true\n\
+         # /dev/shm has to be made inside the /dev that is now bound over it,\n\
+         # or the tmpfs below is asked for a folder that is not there.\n\
+         mkdir -p \"$D/dev/shm\" && /system/bin/mount -t tmpfs tmpfs \"$D/dev/shm\" 2>/dev/null || true\n\
+         # The recovery's own temp folder is not in here, and Chromium asks it\n\
+         # for the socket it keeps its profile under.\n\
+         TMPDIR=/tmp TMP=/tmp HOME=/root\n\
+         export TMPDIR TMP HOME\n\
          exec /system/bin/chroot \"$D\" /bin/sh /run.sh \"$SKYWARD_URL\" serve"
     )
 }
@@ -146,8 +152,7 @@ fn start_full(dir: &Path, url: &str) -> Result<()> {
     // Chromium says why it would not start on its own output, and the page
     // that offers to install it asks for that when it goes wrong: what it
     // prints is kept beside the plugin, so the log outlives this session.
-    let log = dir.join("tmp").join("chromium.log");
-    let _ = std::fs::create_dir_all(dir.join("tmp"));
+    let log = dir.join("chromium.log");
     let sink = || match std::fs::OpenOptions::new().create(true).append(true).open(&log) {
         Ok(file) => Stdio::from(file),
         Err(_) => Stdio::null(),

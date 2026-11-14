@@ -489,7 +489,7 @@ fn export_logs(recovery: bool, kernel: bool, browser: bool, full: bool, into: &P
         }
     }
     if full {
-        let path = Path::new("/data/media/0/Skyward/plugins/chromium/tmp/chromium.log");
+        let path = Path::new("/data/media/0/Skyward/plugins/chromium/chromium.log");
         match fs::read(path) {
             Ok(log) => save("browser-full.log", &log)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
