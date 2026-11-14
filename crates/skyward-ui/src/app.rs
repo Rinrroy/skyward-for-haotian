@@ -9700,10 +9700,23 @@ impl App {
         self.dirty = true;
     }
 
+    /// Whether this control needs a second slide for what it would do now.
+    ///
+    /// A swipe whose only outcome is to turn a check on makes the phone
+    /// check more, so it keeps the single slide `arms` gives everything that
+    /// is not listed there; a swipe that would turn one off is the second
+    /// step's to make, and that step is reached from the page's own row.
+    fn needs_two(&self, which: Confirm) -> bool {
+        match which {
+            Confirm::Avb => self.state.avb_pending.as_ref().is_some_and(|(_, _, off)| *off),
+            _ => arms(which),
+        }
+    }
+
     /// Whether sliding this control to its end now would do the thing,
     /// rather than only ask what a second slide would do.
     fn will_act(&self, which: Confirm) -> bool {
-        !(arms(which) && self.state.armed != Some(which))
+        !(self.needs_two(which) && self.state.armed != Some(which))
     }
 
     /// What a swipe-to-confirm control slid to its end does.
@@ -9714,7 +9727,7 @@ impl App {
     /// is too little for either, so the first only asks the page to say what
     /// the second would do.
     fn confirmed(&mut self, which: Confirm, now: u64) -> Vec<Effect> {
-        if arms(which) && self.state.armed != Some(which) {
+        if self.needs_two(which) && self.state.armed != Some(which) {
             self.state.armed = Some(which);
             self.dirty = true;
             return Vec::new();
@@ -11708,7 +11721,7 @@ mod tests {
         );
         // The second step has its own swipe, and that one writes.
         assert_eq!(
-            acts(app.act(Action::Confirm(Confirm::AvbDisable), 4000)),
+            acts(swiped(&mut app, &f, &i, Confirm::AvbDisable)),
             vec![Effect::SetAvb { expected: state, check: avbctl::Check::Verification, disabled: true }],
             "the second step's swipe is the one that writes it"
         );
@@ -11726,7 +11739,7 @@ mod tests {
         assert!(app.act(Action::AvbToggle(avbctl::Check::Verification), 1000).is_empty());
         assert_eq!(app.state.avb_pending, Some((state.clone(), avbctl::Check::Verification, false)));
         assert_eq!(
-            acts(app.act(Action::Confirm(Confirm::Avb), 2000)),
+            acts(swiped(&mut app, &f, &i, Confirm::Avb)),
             vec![Effect::SetAvb { expected: state, check: avbctl::Check::Verification, disabled: false }],
             "turning one on is the one direction that writes from a single swipe"
         );
@@ -13211,7 +13224,7 @@ mod tests {
         let first = Effect::Backup { parts: [true, true, false, true], place: Place::Storage, compress: false, verify: true };
         assert_eq!(swiped(&mut app, &f, &i, Confirm::Backup), vec![first]);
         tap(&mut app, &f, &i, Action::BackupPart(2));
-        assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "the data partition is backed up only with every user's files open");
+        assert!(swiped(&mut app, &f, &i, Confirm::Backup).is_empty(), "the data partition is backed up only with every user's files open");
         app.data_waiting(None, Vec::new());
         tap(&mut app, &f, &i, Action::BackupPart(0));
         assert_eq!(app.state.backup, [false, true, true, true]);
