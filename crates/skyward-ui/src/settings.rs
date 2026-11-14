@@ -59,13 +59,9 @@ pub struct Settings {
     pub aod_style: AodStyle,
     /// A computer connected over USB is offered internal storage.
     pub file_transfer: bool,
-    /// A double tap on the dark panel lights it. A file written before
-    /// this setting existed keeps it on, which is what those phones did.
-    #[serde(default = "yes")]
+    /// A double tap on the dark panel lights it.
     pub double_tap: bool,
-    /// A dark panel keeps a clock on the glass rather than being put out,
-    /// and a file that names none keeps the clock it used to have.
-    #[serde(default = "yes")]
+    /// A dark panel keeps a clock on the glass rather than being put out.
     pub always_on: bool,
     /// Turn both AVB checks off after a ROM is installed.
     pub disable_avb: bool,
@@ -393,24 +389,6 @@ mod tests {
         let mut back = State::default();
         Settings::read(&off).unwrap().apply(&mut back);
         assert!(!back.mirror, "a switch turned off stays off across a start");
-    }
-
-    #[test]
-    fn a_file_without_the_double_tap_setting_keeps_the_gesture_on() {
-        let kept = Settings::read(r#"{ "dark": true }"#).unwrap();
-        assert!(kept.double_tap, "an older file starts with the gesture on");
-        let mut state = State::default();
-        kept.apply(&mut state);
-        assert!(state.double_tap);
-    }
-
-    #[test]
-    fn a_file_without_the_clock_setting_keeps_the_clock_on() {
-        let kept = Settings::read(r#"{ "dark": true }"#).unwrap();
-        assert!(kept.always_on, "an older file starts with the clock on");
-        let mut state = State::default();
-        kept.apply(&mut state);
-        assert!(state.always_on);
     }
 
     #[test]

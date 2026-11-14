@@ -13123,6 +13123,27 @@ mod tests {
     }
 
     fn swipe(app: &mut App, f: &Fonts, i: &DeviceInfo, which: Confirm) -> Vec<Effect> {
+        // A page taller than the glass keeps its track below the fold: the
+        // page is dragged up until the track is on it, as a finger would.
+        let edge = app.theme().m.dp(24.0);
+        for _ in 0..12 {
+            let scroll = app.top().1;
+            let shown = app
+                .frame(f, i)
+                .hits
+                .iter()
+                .find(|h| h.action == Action::Confirm(which))
+                .map(|h| h.rect.centre().1 - scroll);
+            match shown {
+                Some(y) if y > edge && y < app.h as f32 - edge => break,
+                _ => {
+                    let x = app.w as f32 / 2.0;
+                    app.touch(Touch::Down(x, app.h as f32 * 0.75), f, 0);
+                    app.touch(Touch::Move(x, app.h as f32 * 0.25), f, 0);
+                    app.touch(Touch::Up, f, 0);
+                }
+            }
+        }
         let track = app.frame(f, i).hits.iter().find(|h| h.action == Action::Confirm(which)).expect("the track is on the page").rect;
         let y = track.centre().1 - app.top().1;
         let mut fx = app.touch(Touch::Down(track.x + track.h / 2.0, y), f, 0);
@@ -13209,7 +13230,7 @@ mod tests {
         // The owner's files open first; another user's still wait.
         app.data_waiting(Some((10, Keys::Digits)), Vec::new());
         let first = Effect::Backup { parts: [true, true, false, true], place: Place::Storage, compress: false, verify: true };
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Backup), vec![first]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Backup), vec![first]);
         tap(&mut app, &f, &i, Action::BackupPart(2));
         assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "the data partition is backed up only with every user's files open");
         app.data_waiting(None, Vec::new());
@@ -13290,7 +13311,7 @@ mod tests {
         assert!(swiped(&mut app, &f, &i, Confirm::Restore).is_empty());
         assert_eq!(app.deadline(0), Some(TOAST_MS), "the page says to decrypt first");
         app.data_waiting(None, Vec::new());
-        let fx = swipe(&mut app, &f, &i, Confirm::Restore);
+        let fx = swiped(&mut app, &f, &i, Confirm::Restore);
         assert!(matches!(&fx[..], [Effect::Restore { parts: [false, false, true, false], .. }]), "{fx:?}");
     }
 
@@ -13823,7 +13844,7 @@ mod tests {
         // it asks for is a walk of the folders below this one, since a name
         // three folders down is what a search of one folder cannot find.
         let asked = tap_at(&mut app, &f, &i, Action::Type(Cap::Char('b')), 1010);
-        assert_eq!(asked, vec![Effect::FindFiles { root: "/sdcard".into(), query: "b".into(), generation: app.state.find_gen, sort: SortKey::Name }]);
+        assert_eq!(acts(asked), vec![Effect::FindFiles { root: "/sdcard".into(), query: "b".into(), generation: app.state.find_gen, sort: SortKey::Name }]);
         assert_eq!(app.state.files_query, "b");
         assert!(app.state.finding, "the page says it is looking");
         assert_eq!(app.state.files.shown_entries().len(), 3, "the folder's own list stays whole behind the box");
@@ -15403,6 +15424,7 @@ mod tests {
     fn a_double_tap_on_the_dark_panel_lights_it_onto_the_page_it_left() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Settings, &f, &i);
+        app.state.double_tap = true;
         press(&mut app, Key::Power, 0);
         assert!(!app.display_on());
         app.touch(Touch::Down(700.0, 1600.0), &f, 1_000);
@@ -15507,6 +15529,8 @@ mod tests {
     fn the_double_tap_switch_is_kept_in_the_settings() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Settings, &f, &i);
+        app.state.panel_taps = true;
+        app.refresh();
         // A start with no file yet has the gesture off: it costs the phone
         // its suspend, so it is asked for rather than assumed.
         assert!(!app.state.double_tap);
@@ -15550,6 +15574,7 @@ mod tests {
     fn two_taps_on_the_dark_panel_light_it() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.double_tap = true;
         let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
         press(&mut app, Key::Power, 0);
         for (at, lit) in [(100, false), (200, true)] {
@@ -15574,6 +15599,7 @@ mod tests {
     fn taps_too_far_apart_or_too_late_do_not_light_the_panel() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.double_tap = true;
         let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
         press(&mut app, Key::Power, 0);
         // Too late: the window the first tap opened has gone by.
