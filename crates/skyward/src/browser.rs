@@ -351,9 +351,7 @@ impl Worker {
                     }
                     Task::FullTap { x, y } => {
                         let result = Cdp::connect().and_then(|mut cdp| {
-                            let cx = (x as u32 * crate::cdp::WIDTH / 1000).min(crate::cdp::WIDTH - 1);
-                            let cy = (y as u32 * crate::cdp::HEIGHT / 1000).min(crate::cdp::HEIGHT - 1);
-                            cdp.touch(cx, cy)?;
+                            cdp.touch_page(x as u32, y as u32)?;
                             Ok(full_result(&mut cdp))
                         });
                         match result {

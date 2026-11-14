@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 const PORT: u16 = 9222;
 const VIEW_W: u32 = 412;
 const VIEW_H: u32 = 915;
+/// Render at a sharp phone density; the UI maps this to its own width.
+const DEVICE_SCALE: f64 = 3.5;
+/// A full-page capture is capped so one frame cannot exhaust recovery memory.
+const MAX_PAGE_CSS: f64 = 3000.0;
 
 pub struct Cdp {
     stream: TcpStream,
@@ -52,7 +56,7 @@ impl Cdp {
         cdp.call("Page.enable", json!({}))?;
         cdp.call(
             "Emulation.setDeviceMetricsOverride",
-            json!({"width": VIEW_W, "height": VIEW_H, "deviceScaleFactor": 1, "mobile": true}),
+            json!({"width": VIEW_W, "height": VIEW_H, "deviceScaleFactor": DEVICE_SCALE, "mobile": true}),
         )?;
         cdp.call("Emulation.setTouchEmulationEnabled", json!({"enabled": true, "maxTouchPoints": 5}))?;
         Ok(cdp)
@@ -100,6 +104,32 @@ impl Cdp {
         Ok(())
     }
 
+    /// Tap a point of the whole page, not only of the visible viewport. The
+    /// page is scrolled so the point is on screen before the touch is sent.
+    pub fn touch_page(&mut self, x: u32, y: u32) -> Result<()> {
+        let px = (x as f64 * VIEW_W as f64 / 1000.0).clamp(0.0, (VIEW_W - 1) as f64);
+        let content = self.content_height();
+        let page_y = (y as f64 * content / 1000.0).clamp(0.0, (content - 1.0).max(0.0));
+        let scroll = (page_y - VIEW_H as f64 / 2.0).clamp(0.0, (content - VIEW_H as f64).max(0.0));
+        self.call(
+            "Runtime.evaluate",
+            json!({"expression": format!("window.scrollTo(0,{scroll})"), "returnByValue": true}),
+        )?;
+        std::thread::sleep(Duration::from_millis(180));
+        let sy = (page_y - scroll).clamp(0.0, (VIEW_H - 1) as f64);
+        self.touch(px.round() as u32, sy.round() as u32)
+    }
+
+    fn content_height(&mut self) -> f64 {
+        let metrics = self.call("Page.getLayoutMetrics", json!({})).unwrap_or(Value::Null);
+        let css = &metrics["cssContentSize"];
+        css["height"]
+            .as_f64()
+            .or_else(|| metrics["contentSize"]["height"].as_f64())
+            .unwrap_or(VIEW_H as f64)
+            .clamp(VIEW_H as f64, MAX_PAGE_CSS)
+    }
+
     pub fn pinch(&mut self, x: u32, y: u32, scale: f64) -> Result<()> {
         self.call(
             "Input.synthesizePinchGesture",
@@ -126,7 +156,22 @@ impl Cdp {
     }
 
     pub fn screenshot(&mut self) -> Result<Vec<u8>> {
-        let answer = self.call("Page.captureScreenshot", json!({"format": "png", "fromSurface": true}))?;
+        let height = self.content_height();
+        let answer = self.call(
+            "Page.captureScreenshot",
+            json!({
+                "format": "png",
+                "fromSurface": true,
+                "captureBeyondViewport": true,
+                "clip": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "width": VIEW_W as f64,
+                    "height": height,
+                    "scale": DEVICE_SCALE
+                }
+            }),
+        )?;
         let data = answer["data"].as_str().context("screenshot holds no data")?;
         base64::engine::general_purpose::STANDARD.decode(data).context("decode screenshot")
     }
