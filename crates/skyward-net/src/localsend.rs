@@ -13,6 +13,12 @@
 //! tests below exercise without a socket; the `Worker` wraps them in a
 //! listener, a multicast announcer and a channel the UI polls.
 
+// The page reader and the LocalSend endpoint came with the aurora build
+// and are kept as they were written: their nested `if`s read the way that
+// build's clippy wanted them, and rewriting them to satisfy a newer one
+// would be a change of somebody else's code for no gain in behaviour.
+#![allow(clippy::collapsible_if)]
+
 use anyhow::{bail, ensure, Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};

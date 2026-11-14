@@ -1826,10 +1826,11 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                 // face is drawn again as it follows: the panel is taken out
                 // of its doze for as long as the finger is on it.
                 let drag = app.aod_drag();
-                if drag.is_some() && surface.is_dozing() {
-                    if let Err(e) = surface.wake() {
-                        let _ = skyward_sys::kmsg(&format!("the panel would not come out of its doze: {e:#}"));
-                    }
+                if drag.is_some()
+                    && surface.is_dozing()
+                    && let Err(e) = surface.wake()
+                {
+                    let _ = skyward_sys::kmsg(&format!("the panel would not come out of its doze: {e:#}"));
                 }
                 if !blanked || faced != shown_clock || drag.is_some() {
                     // The face the phone's own always-on display shows: the
@@ -2151,10 +2152,11 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                     // A queue goes on by itself: what just ended is taken off
                     // it and the next package starts, unless this one asked
                     // for the phone to be erased first or did not go through.
-                    if !wipe_after && !(cache_after && app.state.cache_partition) {
-                        if let Some(path) = app.queued_next() {
-                            installer = Some(Installer::open(PathBuf::from(path), detach(cfg.services.clone()), install_options(&app))?);
-                        }
+                    if !wipe_after
+                        && !(cache_after && app.state.cache_partition)
+                        && let Some(path) = app.queued_next()
+                    {
+                        installer = Some(Installer::open(PathBuf::from(path), detach(cfg.services.clone()), install_options(&app))?);
                     }
                 }
             }
@@ -3126,7 +3128,7 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                             .get("https://api.github.com/repos/topjohnwu/Magisk/releases/latest")
                             .header("User-Agent", "Skyward")
                             .call();
-                        match asked.and_then(|mut r| r.body_mut().read_to_string().map_err(Into::into)) {
+                        match asked.and_then(|mut r| r.body_mut().read_to_string()) {
                             Ok(body) => {
                                 let tag = body
                                     .split("\"tag_name\":\"")
@@ -3243,8 +3245,9 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                         // run out part way through, which leaves a half made
                         // backup and a phone that has just lost its power.
                         // The same floor an install has applies here.
-                        if let Ok(Some(battery)) = skyward_info::battery_now() {
-                            if let Some(Refusal::Battery { level, charging }) = skyward_install::battery_refusal(&battery) {
+                        if let Ok(Some(battery)) = skyward_info::battery_now()
+                            && let Some(Refusal::Battery { level, charging }) = skyward_install::battery_refusal(&battery)
+                        {
                                 let said = match charging {
                                     true => tr!(
                                         app.state.lang,
@@ -3261,7 +3264,6 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                                 };
                                 app.report(&said, now);
                                 continue;
-                            }
                         }
                         let into = backups_in(place);
                         let there = into.ancestors().find(|p| p.exists()).context("the root is always there")?;

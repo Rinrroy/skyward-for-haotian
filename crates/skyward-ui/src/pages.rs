@@ -2275,7 +2275,7 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
             if let Some(slot) = held.slot {
                 facts.push((l.pick(["槽位", "槽位", "Slot"]), slot.letter().to_string()));
             }
-            let mut y = widgets::info_card(&mut c, t, f, top, &facts);
+            let y = widgets::info_card(&mut c, t, f, top, &facts);
             if held.device != i.codename {
                 let device = &held.device;
                 let note = tr!(

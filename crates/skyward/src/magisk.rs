@@ -44,7 +44,7 @@ pub fn read() -> (MagiskRoot, Result<Vec<MagiskModule>>) {
             modules.push(module);
         }
     }
-    modules.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    modules.sort_by_key(|m| m.name.to_lowercase());
     let root = match root {
         Some(name) => MagiskRoot::Present(name.into()),
         None => MagiskRoot::Absent,

@@ -1141,10 +1141,9 @@ pub mod kms {
                     req.add_property(self.conn, id, property::Value::UnsignedRange(run));
                 }
                 // A panel in its own doze leaves it for the page.
-                if self.power == Power::Dozing {
-                    if let Some((id, on, _)) = self.dpms {
+                if self.power == Power::Dozing
+                    && let Some((id, on, _)) = self.dpms {
                         req.add_property(self.conn, id, property::Value::UnsignedRange(on));
-                    }
                 }
             }
             if self.power == Power::Off {

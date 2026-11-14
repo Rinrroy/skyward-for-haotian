@@ -8367,21 +8367,19 @@ impl App {
             }
             Action::ReadMagisk => return vec![Effect::ReadMagisk],
             Action::ToggleMagiskModule(i) => {
-                if let Some(Ok(modules)) = self.state.magisk.modules.as_ref() {
-                    if let Some(module) = modules.get(i) {
+                if let Some(Ok(modules)) = self.state.magisk.modules.as_ref()
+                    && let Some(module) = modules.get(i) {
                         return vec![Effect::ToggleMagisk {
                             id: module.id.clone(),
                             path: module.path.clone(),
                             enabled: !module.enabled,
                         }];
-                    }
                 }
             }
             Action::RemoveMagiskModule(i) => {
-                if let Some(Ok(modules)) = self.state.magisk.modules.as_ref() {
-                    if let Some(module) = modules.get(i) {
+                if let Some(Ok(modules)) = self.state.magisk.modules.as_ref()
+                    && let Some(module) = modules.get(i) {
                         return vec![Effect::RemoveMagisk { id: module.id.clone(), path: module.path.clone() }];
-                    }
                 }
             }
             Action::MagiskRepo => {
