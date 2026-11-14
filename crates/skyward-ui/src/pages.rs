@@ -4586,8 +4586,9 @@ pub fn power_off(cx: &Ctx) -> Frame {
 const POWER_OFF: Text = ["关机", "關機", "Power off"];
 
 /// The plugins kept on the phone: where they go, what one has to be, and
-/// what was found. Nothing runs a plugin yet, and the page says so rather
-/// than showing switches for something that would do nothing.
+/// what was found. One that carries an image and says which protocol it
+/// speaks can be run from here; one that is only a manifest is listed, which
+/// is all this page can honestly offer for it.
 pub fn plugins(cx: &Ctx) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
     let mut c = long_page(cx);
@@ -4648,22 +4649,29 @@ pub fn plugins(cx: &Ctx) -> Frame {
                 .collect();
             let list: Vec<Row> = titles.iter().zip(&subs).map(|(t, s)| Row::new(t).icon(PURPLE, Icon::More).subtitle(s).trail(Trail::None)).collect();
             let drawn = widgets::list(&mut c, t, f, y, &list);
-            // A plugin that carries an image is one that can run, so tapping
-            // it hands the phone over; one that is only a manifest is
-            // selected, which is all there is to do with it.
+            // A plugin that carries its image and speaks a protocol this
+            // release knows is one that can run, so tapping it hands it the
+            // phone; one that is only a manifest, or says nothing about a
+            // protocol, is selected, which is all there is to do with it.
             let opens: Vec<Action> = rows
                 .iter()
                 .enumerate()
-                .map(|(i, row)| if row.image.is_some() { Action::OpenBrowser } else { Action::OpenPlugin(i) })
+                .map(|(i, row)| {
+                    let runs = row.image.is_some() && row.manifest.as_ref().is_ok_and(|plugin| plugin.runs());
+                    if runs {
+                        Action::RunPlugin(i)
+                    } else {
+                        Action::OpenPlugin(i)
+                    }
+                })
                 .collect();
             out.extend(hits(&drawn.rows, &opens));
             y = drawn.bottom;
         }
     }
-    // The browser is published as a plugin, and this is the page it lands on,
-    // so this is where it is fetched from. It is hundreds of megabytes, so
-    // the download says how far it has come and can be stopped and gone on
-    // with rather than started over.
+    // A plugin is published for this page, and this is where it is fetched
+    // from. It is hundreds of megabytes, so the download says how far it has
+    // come and can be stopped and gone on with rather than started over.
     y = widgets::section(&mut c, t, f, y, l.pick(["下载", "下載", "Download"]));
     match &s.plugin_job {
         None => {
@@ -4672,7 +4680,7 @@ pub fn plugins(cx: &Ctx) -> Frame {
                 "約 700 MB，下載後可以在這裡開啟，也可以用它登入需要網頁驗證的 Wi-Fi。",
                 "About 700 MB. Once it is here it opens from this page, and it can sign in to Wi-Fi that asks on a web page.",
             ]);
-            let row = Row::new(l.pick(["下载浏览器", "下載瀏覽器", "Download the browser"])).icon(BLUE, Icon::Install).subtitle(sub).trail(Trail::None);
+            let row = Row::new(l.pick(["下载插件", "下載外掛", "Download a plugin"])).icon(BLUE, Icon::Install).subtitle(sub).trail(Trail::None);
             let list = widgets::list(&mut c, t, f, y, &[row]);
             out.extend(hits(&list.rows, &[Action::DownloadPlugin]));
             y = list.bottom;
@@ -4779,14 +4787,14 @@ pub fn plugins(cx: &Ctx) -> Frame {
     // the file itself, and a plugin that could only be installed by writing a
     // manifest by hand would not be one most people could install.
     let hand = l.pick([
-        "也可以在系统里把镜像下载好，直接放进内部存储的 Skyward/plugins：单个 erofs、squashfs 或 ext4 镜像，或者一个只放了镜像的文件夹，都会当作插件列出，用 /opt/skyward/start.sh 启动。",
-        "也可以在系統裡把鏡像下載好，直接放進內部儲存空間的 Skyward/plugins：單一 erofs、squashfs 或 ext4 鏡像，或一個只放了鏡像的資料夾，都會當作外掛列出，用 /opt/skyward/start.sh 啟動。",
-        "An image fetched in the system works too: put it in Skyward/plugins on internal storage — a single erofs, squashfs or ext4 image, or a folder holding one — and it is listed as a plugin and started with /opt/skyward/start.sh.",
+        "也可以在系统里把镜像下载好，直接放进内部存储的 Skyward/plugins：单个 erofs、squashfs 或 ext4 镜像，或者一个只放了镜像的文件夹，都会被列出来。但镜像本身不知道自己该启动什么，要能运行，插件还需要一个写明 protocol: 1 和程序的 plugin.json。",
+        "也可以在系統裡把鏡像下載好，直接放進內部儲存空間的 Skyward/plugins：單一 erofs、squashfs 或 ext4 鏡像，或一個只放了鏡像的資料夾，都會被列出來。但鏡像本身不知道自己該啟動什麼，要能執行，外掛還需要一個寫明 protocol: 1 和程式的 plugin.json。",
+        "An image fetched in the system works too: put it in Skyward/plugins on internal storage — a single erofs, squashfs or ext4 image, or a folder holding one — and it is listed. An image does not say what to start in it, though, so a plugin that runs also carries a plugin.json naming protocol: 1 and its program.",
     ]);
     let what = l.pick([
-        "带镜像的插件可以运行：点它就会把手机交给它，它退出后回到这里。只有 plugin.json 的插件目前只被列出。删除和系统安装包一样，先点再滑动确认。",
-        "帶鏡像的外掛可以執行：點它就會把手機交給它，它結束後回到這裡。只有 plugin.json 的外掛目前只被列出。刪除和系統安裝檔一樣，先點再滑動確認。",
-        "A plugin that carries an image can run: tapping it hands the phone over, and these pages come back when it exits. A plugin that is only a manifest is listed and nothing more. Deleting one is asked for the way a downloaded system package is: tap it, then swipe.",
+        "声明了 protocol: 1 并带镜像的插件可以运行：点它就会把屏幕、触摸和按键交给它，它退出后回到这里。只有 plugin.json 而不说协议的插件只被列出。删除和系统安装包一样，先点再滑动确认。",
+        "宣告了 protocol: 1 並帶鏡像的外掛可以執行：點它就會把螢幕、觸控和按鍵交給它，它結束後回到這裡。只有 plugin.json 而不說協議的外掛只被列出。刪除和系統安裝檔一樣，先點再滑動確認。",
+        "A plugin that declares protocol: 1 and carries its image can run: tapping it hands over the screen, the fingers and the keys, and these pages come back when it exits. A plugin that is only a manifest, saying nothing about a protocol, is listed and nothing more. Deleting one is asked for the way a downloaded system package is: tap it, then swipe.",
     ]);
     y = widgets::footnote(&mut c, t, f, y, where_);
     y = widgets::footnote(&mut c, t, f, y, hand);
@@ -4803,7 +4811,7 @@ const PLUGINS: Text = ["插件", "外掛", "Plugins"];
 /// While the published list is being read and nothing is coming down yet.
 const ASKING_PLUGINS: Text = ["正在读取插件列表", "正在讀取外掛列表", "Reading the plugin list"];
 
-/// How installing the browser ended, as a sentence to draw, and what to add
+/// How installing a plugin ended, as a sentence to draw, and what to add
 /// to it when there is more to say.
 fn plugin_end(l: Lang, end: &PluginEnd) -> (String, Option<String>) {
     match end {
@@ -4812,11 +4820,15 @@ fn plugin_end(l: Lang, end: &PluginEnd) -> (String, Option<String>) {
             (
                 tr!(
                     l,
-                    "浏览器已安装（{size}）。点上面的条目即可打开。",
-                    "瀏覽器已安裝（{size}）。點上面的項目即可開啟。",
-                    "The browser is installed ({size}). Tap it above to open it."
+                    "插件已安装（{size}）。点上面的条目即可打开。",
+                    "外掛已安裝（{size}）。點上面的項目即可開啟。",
+                    "The plugin is installed ({size}). Tap it above to open it."
                 ),
-                Some(l.pick(["浏览器打开后可以登录需要网页认证的 Wi-Fi：认证页就在它里面。", "瀏覽器開啟後可以登入需要網頁驗證的 Wi-Fi：驗證頁就在它裡面。", "Once it is open it can sign in to Wi-Fi that asks on a web page: the page that asks is shown in it."]).to_string()),
+                Some(l.pick([
+                    "浏览器是最早的一个插件：它打开后可以登录需要网页认证的 Wi-Fi，认证页就在它里面。",
+                    "瀏覽器是最早的一個外掛：它開啟後可以登入需要網頁驗證的 Wi-Fi，驗證頁就在它裡面。",
+                    "The browser was the first plugin: once it is open it can sign in to Wi-Fi that asks on a web page, and the page that asks is shown in it.",
+                ]).to_string()),
             )
         }
         PluginEnd::Stopped => (

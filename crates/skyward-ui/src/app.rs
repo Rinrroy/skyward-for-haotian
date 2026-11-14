@@ -1356,9 +1356,9 @@ pub enum Action {
     AskDeleteDownload,
     /// Open the plugin at this place in the list of those found.
     OpenPlugin(usize),
-    /// Hand the phone to the installed plugin that carries a runnable image,
-    /// so its program runs in the place of these pages until it exits.
-    OpenBrowser,
+    /// Hand the phone to the plugin at this place in the list of those found,
+    /// so its program has the panel and the fingers until it exits.
+    RunPlugin(usize),
     /// Open the folder the plugins are kept in, in the file manager.
     OpenPluginFolder,
     /// Fetch the published plugin list and install the browser from it.
@@ -2125,8 +2125,10 @@ pub struct PluginList {
 
 /// What a plugin's manifest says it is.
 ///
-/// Nothing runs one yet: this release is the page and the reading of what a
-/// plugin will be, so that a later one has somewhere to put what it does.
+/// A plugin that speaks a protocol this program knows is one it can run; the
+/// rest are listed, because a folder someone dropped in is still a folder
+/// someone dropped in, and a page that silently passed it over would be a
+/// page that lost it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Plugin {
     /// What it calls itself, where its folder's name is not enough.
@@ -2140,8 +2142,22 @@ pub struct Plugin {
     /// What it says it needs of the recovery, by name: what a later release
     /// refuses to run it without.
     pub needs: Vec<String>,
+    /// Which plugin protocol it speaks, as its author wrote it. `Some(1)` is
+    /// the frame protocol of the plugin host: the program draws into a frame
+    /// file and the recovery puts those pixels on the panel. Nothing at all
+    /// is a plugin that is listed and not run, because the recovery does not
+    /// guess how a program wants the phone.
+    pub protocol: Option<u32>,
     /// The image it carries, where it is more than a manifest.
     pub payload: Option<Payload>,
+}
+
+impl Plugin {
+    /// Whether this program knows how to run it: it speaks the frame
+    /// protocol, and it carries an image to run out of.
+    pub fn runs(&self) -> bool {
+        self.protocol == Some(crate::plugin::PROTOCOL) && self.payload.is_some()
+    }
 }
 
 /// What a plugin carries when it is more than a manifest: one image holding a
@@ -2638,9 +2654,10 @@ pub enum Effect {
     /// Read the plugins kept on the phone, telling what is found with
     /// [`App::set_plugins`].
     ReadPlugins,
-    /// Run the plugin at `image` by starting `program` inside it. The pages
-    /// are gone until it exits: the display is the plugin's while it runs.
-    OpenBrowser { image: String, program: String },
+    /// Run the plugin called `name`, whose image is at `image`, by executing
+    /// `program` inside it. The pages are gone until it exits: the display is
+    /// the plugin's while it runs.
+    RunPlugin { name: String, image: String, program: String },
     /// Forget the network named `name`, with what was kept of it, telling
     /// how it went with [`App::wlan_forgotten`].
     ForgetWlan(String),
@@ -6714,25 +6731,28 @@ impl App {
                 self.state.plugin_chosen = i;
                 self.refresh();
             }
-            // A plugin with an image is one that can run, and the one it is
-            // today is the browser. Which image and which program come from
-            // the manifest that was read when the page was drawn, so a plugin
-            // whose image is missing is a sentence rather than a start.
-            Action::OpenBrowser => {
+            // A plugin that speaks the frame protocol is one this program can
+            // run, and the page only offers it when that is what it is. Which
+            // image and which program come from the manifest that was read when
+            // the page was drawn, so a plugin whose image has gone missing is a
+            // sentence rather than a start.
+            Action::RunPlugin(i) => {
                 let runnable = self.state.plugins.as_ref().and_then(|found| found.as_ref().ok()).and_then(|list| {
-                    list.rows.iter().find_map(|row| {
-                        let plugin = row.manifest.as_ref().ok()?;
-                        let payload = plugin.payload.as_ref()?;
-                        Some((row.image.clone()?, payload.program.clone()))
-                    })
+                    let row = list.rows.get(i)?;
+                    let plugin = row.manifest.as_ref().ok()?;
+                    if !plugin.runs() {
+                        return None;
+                    }
+                    let payload = plugin.payload.as_ref()?;
+                    Some((row.name.clone(), row.image.clone()?, payload.program.clone()))
                 });
                 match runnable {
-                    Some((image, program)) => return vec![Effect::OpenBrowser { image, program }],
+                    Some((name, image, program)) => return vec![Effect::RunPlugin { name, image, program }],
                     None => {
                         let said = self.state.lang.pick([
-                            "没有可以运行的插件。解密 data 并在插件页下载浏览器后，这里会出现它的入口。",
-                            "沒有可以執行的外掛。解密 data 並在外掛頁下載瀏覽器後，這裡會出現它的入口。",
-                            "There is no plugin to run. Once the data partition is decrypted and the browser is downloaded on the plugins page, its way in appears here.",
+                            "这个插件不能运行：它需要 protocol: 1 和它自己的镜像。",
+                            "這個外掛不能執行：它需要 protocol: 1 和它自己的鏡像。",
+                            "This plugin can't run: it needs an image and the frame protocol (protocol: 1).",
                         ]);
                         self.say(said, now);
                     }

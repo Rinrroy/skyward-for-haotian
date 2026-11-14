@@ -1,323 +1,284 @@
 # The browser, as a plugin
 
-This is the design for the built-in browser: a plugin that Skyward downloads
-after `/data` is decrypted and the phone is online, reads on every recovery
-start, and hands the phone to so that it can draw a page and play a video.
+This is how the browser works now, and why it works this way.
 
-It is written down before the code because the two or three decisions here
-decide what the code can be. Everything below marked **unverified** has not
-been run on a phone yet, and is listed at the end so it can be probed rather
-than believed.
+## What changed, and why
 
-## What is being built
+In v0.3.4 the browser was compiled into the recovery. Two files made it up —
+`crates/skyward/src/browser.rs`, which fetched and laid out a page on a worker
+thread, and `crates/skyward-ui/src/browser.rs`, which drew the reader, the
+address bar, the tabs and the form pages — and both were linked into
+`system/bin/recovery`. Chromium was already a plugin; the reader was not.
 
-- A **plugin**, in the sense the plugins page already uses: a folder with a
-  `plugin.json` in it, put there by the user or by Skyward on the user's
-  request, read at every start.
-- The plugin carries a **payload**: one image file holding a whole Linux
-  userspace, Chromium among it.
-- Skyward's job is to **install** that image (download, check, keep), and to
-  **hand over** the phone: mounts, network, display, input, and the way back.
+That split was wrong in a way that took a release to see. The reader is several
+thousand lines of page handling, and every one of them was a reason to rebuild
+the recovery: a CSS fix, a broken site, a font, a download path. It also meant
+the recovery had to know what a page *is*, which meant carrying an HTML parser,
+an image decoder, a cookie jar and a form post into a program whose actual job
+is to install system images.
 
-## Why not Android's `WebView`
+So the browser is now **entirely outside the recovery**. The recovery knows
+nothing about HTML, CSS, images, forms, cookies or Chromium. It knows one thing:
+what it means to run a program that wants to paint the panel.
 
-The obvious answer — instantiate `android.webkit.WebView` — is not available
-here, and it is worth saying why rather than trying again later.
+The version this was taken from — the source of the image that made the case —
+is `Jamvii/skyward-for-aurora`, branch `browser-v034`. That is the browser as
+it was written, and the reader, the worker and the full-mode session in the
+plugin are its code, moved, not rewritten.
 
-`WebView` is not a library. It is a facade over the Android framework: the
-provider (Trichrome/WebView APK) is chosen by `WebViewUpdateService` inside
-`system_server`, the renderer runs in a process forked from `webview_zygote`,
-drawing goes through `SurfaceFlinger`, and all of it talks over binder to
-services that only `system_server` and the installed system's `init` bring up.
-
-The recovery ramdisk has none of that. It has `init`, `adbd`, a handful of
-binaries and the libraries those need; it has no zygote, no `system_server`, no
-`SurfaceFlinger`, and no property service loaded with the installed system's
-properties. Starting that framework from the recovery means running the
-installed system's `init` as a second init — which is a container runtime
-(Waydroid-shaped: binderfs, private property area, its own mount and PID
-namespaces, its own `SurfaceFlinger` competing for the display) and not a
-feature of a recovery.
-
-So the browser is **not** an Android app. It is a Linux program, and the
-"WebView" the user sees is Chromium in kiosk mode.
-
-## The architecture
+## The split
 
 ```
-  Skyward (recovery, bionic)
-      │  install: download → sha256 → /data/skyward/plugins/webview/
-      │
-      └── hand over ──────────────────────────────────────────────┐
-            mount the payload image read-only                    │
-            bind /dev /proc /sys, tmpfs /tmp, /data for the cache │
-            write /etc/resolv.conf from the DHCP answer           │
-            write the search-engine policy                        │
-            setenforce 0            (restored on the way back)    │
-            release the DRM card                                  │
-            chroot + exec  /usr/bin/chromium --kiosk …            │
-            wait                                                  │
-            take the DRM card back, restore SELinux, unmount      │
-      ◄───────────────────────────────────────────────────────────┘
+  skyward (recovery, bionic)                    the plugin (aarch64, bionic)
+  ──────────────────────────                    ──────────────────────────
+  plugin folder + plugin.json                   its own interface: address bar,
+  payload image: download, digest, keep          tabs, downloads, forms, history
+  mount the image read-only                      its own HTML, CSS, images
+  run the program, keep it in a process group    its own cookies, its own cache
+  hand it a frame buffer and an input pipe       Chromium, when the user asks for
+  put its frames on the panel                    full mode
+  forward touch, keys, typed text
+  stop it, unmount, clean up
 ```
 
-### Why a chroot of a glibc userspace works at all
+Neither side can see into the other. The recovery writes eight environment
+variables and a file; the plugin writes pixels and forty bytes of header. That
+is the whole contract, and it is written down in
+[`skyward-plugins/webview/PROTOCOL.md`](https://github.com/Rinrroy/skyward-plugins)
+because two repositories implement it.
 
-Three restrictions are named in the request, and one design answers all three.
+### What the recovery keeps
 
-- **The linker.** Android's linker enforces namespaces: a binary may only load
-  the libraries its namespace allows, and `LD_LIBRARY_PATH` is ignored for
-  anything but the namespace's own paths. That is exactly why a prebuilt
-  Chromium cannot simply be dropped next to the recovery's own libraries. Inside
-  the payload there is a **second dynamic linker** — the payload's own
-  `/lib/ld-linux-aarch64.so.1` — and the kernel picks it up from the binary's
-  `PT_INTERP`. Bionic's namespaces never enter into it. This is the whole
-  reason the payload is a full rootfs rather than a directory of `.so` files.
-- **DNS.** Android resolves through `netd` over binder; there is no `netd` in
-  the recovery and no resolver library a glibc program could use anyway. Inside
-  the payload, glibc reads `/etc/resolv.conf`, so Skyward writes that file from
-  the DNS servers the DHCP answer carried, and Chromium's own resolver reads the
-  same file. Nothing needs `netd`.
-- **SELinux.** The recovery runs as `recovery`, and `recovery` is not allowed to
-  execute a file under `/data` as a new domain. There are two honest options:
-  put the payload where the policy already allows execution (the recovery
-  ramdisk's own `/system`, which is a small tmpfs and cannot hold a gigabyte),
-  or run permissive for the duration of the browser and restore the mode on the
-  way back. This design does the second, and says so on the page: the phone is
-  permissive only while the browser is in front, and only because the user asked
-  for the browser.
+| job | where |
+|---|---|
+| read a plugin folder, hold its manifest to a shape it can trust | `crates/skyward-ui/src/plugin.rs` |
+| fetch the index, download the payload, check the digest, resume a stopped download | `crates/skyward/src/pluginjob.rs` |
+| loop-mount the image read-only, make the run directory, exec the program | `crates/skyward/src/pluginhost.rs` |
+| copy the frames that changed onto the panel, hand touch and keys to the pipe | same file |
+| stop it, unmount it, remove the run directory | same file |
+| the page that lists them and says what a running plugin is doing | `crates/skyward-ui/src/plugin.rs` |
 
-### Display and input
+Everything else in this document is about the other side.
 
-Three arrangements have been tried on this phone. Only the third works, and the
-first two failed for reasons worth keeping written down, because each one looked
-reasonable from the outside.
+## The frame
 
-**First: a Wayland compositor.** Impossible here. The kernel is built with
-`# CONFIG_VT is not set`; libseat marks a session active by opening `tty0`, so
-no session ever becomes active and every libseat-based compositor — weston,
-cage, anything wlroots-shaped — dies before it creates its socket. Weston's own
-log says it: `Could not open tty0 to update VT`, `Could not open device:
-Operation not permitted`, `no drm device found`, `fatal: failed to create
-compositor backend`. Chromium then reports `Failed to connect to Wayland
-display`, which is the symptom, not the fault.
+The plugin does not open `/dev/dri`. It never asks who owns the display,
+because the answer is *the recovery does*, and that is not negotiable: the
+recovery owns the panel, the touch screen, the back gesture and the way out of
+whatever is on screen. Two processes cannot both be DRM master, and a plugin
+that could take the panel could also fail to give it back.
 
-**Second: Xorg with the modesetting driver.** It needs no seat — it opens
-`/dev/dri` itself and `-sharevts` keeps it out of VT handling — and it got far
-enough to prove that. Then it segfaulted during screen initialisation, and gdb
-said exactly where:
+So the plugin draws into **a file**, and the recovery puts that file on the
+panel. The file is created by the recovery, `ftruncate`d to
+`4096 + height * width * 4`, and both sides `mmap` it `MAP_SHARED`. The first
+4096 bytes are a header:
+
+| offset | size | field |
+|---|---|---|
+| 0 | 4 | magic `SWFR` |
+| 4 | 4 | version = 1 |
+| 8 | 4 | width |
+| 12 | 4 | height |
+| 16 | 4 | stride = width × 4 |
+| 20 | 4 | `seq` — the plugin bumps it once per finished frame |
+| 24 | 4 | `flags` — bit 0 ready, bit 1 quit, bit 2 wants the keyboard |
+| 28 | 4 | `dirty_count`, 0…16 |
+| 32 | 256 | sixteen `{x, y, w, h}` rectangles |
+| 288 | 3808 | reserved |
+| 4096 | w×h×4 | pixels, BGRA8888, row major |
+
+The plugin writes pixels first, then the dirty rectangles, then `dirty_count`,
+and only then `seq`, bumping it to odd while it is mid-frame and to even when
+the frame is complete. The recovery presents a frame only when `seq` is even
+and larger than the last one it saw, so a frame that is still being drawn is
+never half-shown, and no lock is needed on either side.
+
+The dirty rectangles are what makes this affordable. The panel is 1440×3200 —
+18 MB a frame. Copying all of it thirty times a second would be 550 MB/s of
+`memcpy` for a page that is standing still. A reader scrolls a line at a time
+and blinks a cursor; that is a few hundred kilobytes, and the cost of a still
+page is the cost of noticing that nothing changed.
+
+What this arrangement gives up is the display's own refresh: the panel updates
+at the rate a frame is copied and committed, not at 120 Hz. For a reader that
+is invisible. For video it means the frames the plugin decodes are the frames
+the panel shows, at the rate the plugin can get them there.
+
+## The input pipe
+
+Input goes the other way, one line per event, into a FIFO the recovery creates
+and the plugin reads `O_RDONLY|O_NONBLOCK`:
 
 ```
-#0 modesetting_drv.so
-#1 RRChangeOutputProperty ()
-#3 xf86RandR12Init ()
-#4 xf86CrtcScreenInit ()
-#6 AddScreen ()
-x0 = 0x0        the null that is dereferenced
+down  <x> <y>              move  <x> <y>              up    <x> <y>
+swipe <x0> <y0> <x1> <y1> <ms>
+pinch <cx> <cy> <scale>
+key   <Name>               text  <escaped>            rotate <0|90|180|270>
+start                      reload                     stop
 ```
 
-It died while describing the card's outputs to RandR. The card advertises four
-connectors — the panel on `DSI-1`, plus `DP-1` and two vendor `Virtual-*` ones
-for screen recording — and none of the obvious measures helped: ignoring three of
-the four in `xorg.conf.d` (which keeps them out of the screen but not out of
-RandR), `ShadowFB`, `AccelMethod none`, software cursor, `-nocursor`, glamor, and
-`ZaphodHeads` on the panel each crashed at the same address. So the fault is in
-the driver's own description of this card, not in the configuration.
+`key` carries device-independent names — `Back`, `Menu`, `Enter`, `VolumeUp`,
+`VolumeDown`, `Power`, `Escape`, and the four directions. `text` is what the
+recovery's own keyboard produced, with `\\` and `\n` escaped so a line is
+always a line. `stop` is the recovery asking the plugin to finish: it writes it,
+waits two seconds, and then kills the process group, so a plugin that hangs on
+the way out cannot hang the recovery.
 
-**Third, what ships: the payload draws into its own memory, and Skyward puts
-that memory on the panel.** The payload runs `Xvfb :0 -screen 0 1440x3200x24
--fbdir /data/skyward/browser/fb`, which never opens the card at all; Xvfb writes
-its framebuffer to `fb/Xvfb_screen0` as a plain file. Skyward keeps DRM master,
-reads that file thirty times a second, copies the rows that changed into its own
-canvas (swizzling the server's byte order into the canvas's), and presents. Over
-a page being read this costs almost nothing, because nothing changed.
+The recovery never blocks writing to the pipe. If the plugin is not reading, the
+line is dropped and the drop is logged; a stuck plugin degrades the input, not
+the recovery.
 
-Input then runs the other way round: Skyward owns the touch screen, so it writes
-one line per event into a named pipe — `down x y`, `move x y`, `up x y`,
-`key Name` — and a loop in the payload turns each line into an `xdotool`
-command. The phone's back button is `Escape`; its power button ends the browser.
+## The plugin program
 
-What this arrangement costs: the panel updates at the rate the copy and the
-commit allow rather than at the display's own rate, and video will look like a
-sequence of frames rather than a moving picture. What it buys is a browser that
-starts at all on a phone whose display driver refuses every compositor that asks
-it directly.
+One binary, `skyward-browser`, built from a new crate that lives in
+`skyward-plugins` and is compiled by that repository's CI against a pinned
+revision of this one. It links `skyward-ui` and `skyward-net` — the same crates
+the recovery uses — which is why the reader looks the same and why a CSS fix
+lands in the plugin without touching the recovery image.
 
-Typing still needs a keyboard on the glass: `xvkbd` is started inside the payload
-(in its own Xvfb display), which is what makes a captive portal answerable.
+It is an ordinary bionic program: no chroot, no second linker, no rootfs of its
+own. The recovery mounts the payload image at
+`/skyward/run/plugin/<name>/img` and executes
+`/opt/skyward/bin/skyward-browser` inside it. The image therefore holds a
+binary, two fonts and a `run.sh`, and nothing else — the fonts because the
+reader must render the same face as the recovery does (`MiSansVF.ttf`,
+`KirkMono-Regular.ttf`), and the script because it is useful to be able to run
+the thing by hand.
 
-Two other things the phone taught, both now in the payload's script: the binary
-to run is `/usr/lib/chromium/chromium`, because `/usr/bin/chromium` is a shell
-wrapper that fails under dash at its ninth line; and everything the payload
-prints has to go to a file on the data partition, because the recovery's only
-record otherwise is an exit code.
+What it does with a page is v0.3.4's behaviour, unchanged and moved:
 
-### Video and audio — what is honest
+- **a reader** — text, links, headings, lists, quotes, tables, preformatted
+  blocks, and images fetched on demand: at most six per page, at most 512 KiB
+  each, 2 MiB a page, PNG and JPEG, scaled to the panel width, with alt text
+  where an image did not arrive.
+- **basic CSS** — a `<style>` block's rules for tags, `.class` and `#id`, and
+  inline `style`, covering colour, background, bold, italic, underline,
+  alignment and size. No layout: no float, no grid, no flex, no external
+  stylesheet. This is a reader, and it says so.
+- **forms** — `text`, `password`, `hidden`, `checkbox`, `radio`, `submit`, sent
+  `GET` or `POST` with the encoding the form asked for.
+- **cookies** — `Set-Cookie` kept per domain and path and sent back on matching
+  requests. They live as long as the recovery does; a captive portal is
+  answerable, a login that spans a reboot is not.
+- **downloads** — into `$SKYWARD_DATA` (`/data/media/0/Skyward`) when `/data` is
+  open, into `$SKYWARD_HOME` before that.
+- **tabs**, a home page, editable quick links, and Bing as the search engine.
+- **no scripts.** No JavaScript, no WebSocket, no canvas, no video element. A
+  page that needs any of them needs full mode, and the address bar says so.
 
-- **Video** is decoded by Chromium's own ffmpeg. H.264 at 1080p is comfortable on
-  this class of CPU; VP9 and AV1 are heavier and will drop frames on large
-  streams. Hardware decoding is **not** reachable this way: Qualcomm's Venus
-  decoder is a *stateless* V4L2 device that needs a userspace decoder
-  (`v4l2_codec2`, an Android component) in front of it, and Chromium's V4L2
-  path does not speak that dialect. A later stage can add a shim, but the first
-  version decodes in software and says so.
-- **Audio** needs `/dev/snd` plus a mixer setup for this codec, which Android
-  normally gets from its audio HAL. The first version will most likely be
-  **silent**; that is a known gap, not an oversight.
+### Full mode, inside the plugin
 
-### The default search engine
+Full mode is Chromium, and it stays a chroot of a glibc userspace, because that
+is the only way a prebuilt browser can run here at all — the payload's own
+`/lib/ld-linux-aarch64.so.1` is what makes it loadable, and bionic's namespace
+rules are never consulted. But it is now the *plugin's* business:
 
-Chromium reads managed policy from `/etc/chromium/policies/managed/*.json`.
-Skyward writes one file there naming Bing China:
+- the Chromium rootfs is installed as a separate payload, under
+  `$SKYWARD_STORE/webview-chromium`, by the plugin's own page;
+- the plugin mounts `/dev`, `/proc`, `/sys` and a `/dev/shm` inside it, writes
+  `etc/resolv.conf` from the gateway it can see in `/proc/net/route`, and runs
+  `chroot … /bin/sh /run.sh <url> serve`;
+- it talks to it over CDP — navigate, screenshot, focus test, touch, pinch,
+  insert text, reload — exactly as `crates/skyward/src/cdp.rs` did;
+- the screenshot becomes the frame. The recovery does not know Chromium exists.
 
-```json
-{
-  "DefaultSearchProviderEnabled": true,
-  "DefaultSearchProviderName": "Bing",
-  "DefaultSearchProviderSearchURL": "https://cn.bing.com/search?q={searchTerms}",
-  "DefaultSearchProviderSuggestURL": "https://cn.bing.com/osjson.aspx?query={searchTerms}",
-  "HomepageLocation": "https://cn.bing.com",
-  "HomepageIsNewTabPage": false
-}
-```
+The display decision from the previous design is *not* carried over, and it is
+worth recording why, because it cost a release to learn:
 
-A captive portal is then just a page: the browser can open the portal address
-Skyward learned from the network, and the user logs in the way they would on any
-phone.
+- **Wayland is impossible on this kernel.** `CONFIG_VT` is not set, libseat
+  marks a session active by opening `tty0`, so no session is ever active and
+  weston and every wlroots compositor die before making a socket:
+  `Could not open tty0 to update VT`, `no drm device found`.
+- **Xorg's modesetting driver segfaults** in `RRChangeOutputProperty` while
+  `xf86CrtcScreenInit` describes this card's four connectors, whatever the
+  configuration.
+- The old answer was Xvfb writing `fb/Xvfb_screen0` and the recovery copying it.
+  The new answer is that the reader needs no compositor at all: it draws its own
+  pixels, which is what `skyward-ui` has always done. Full mode keeps Xvfb,
+  because Chromium wants a display, but the display is the plugin's own problem
+  now and the copy it writes to is the frame — one `mmap` away instead of a
+  screen-dump parser in the recovery.
 
-## The plugin format
+## The plugin package
 
-A plugin is a folder. Today it is read and listed; from this release it may also
-carry a payload, and the manifest says where to get it:
+A plugin is a folder with a manifest and an image, as it always was. Protocol 1
+is one field more:
 
 ```json
 {
   "title": "浏览器",
-  "version": "1.0",
-  "about": "在恢复里浏览网页",
+  "version": "2.0",
+  "author": "Rinrroy",
+  "about": "在恢复里浏览网页、播放视频。默认用必应搜索。",
+  "needs": ["data", "network"],
+  "protocol": 1,
   "payload": {
-    "url": "https://…/webview-1.1-arm64.erofs",
+    "url": "https://github.com/Rinrroy/skyward-plugins/releases/download/webview-2.0/webview-2.0-arm64.erofs",
     "sha256": "…64 hex…",
-    "size": 717701120,
+    "size": 20971520,
     "format": "erofs",
-    "program": "/opt/skyward/start.sh"
+    "program": "/opt/skyward/bin/skyward-browser"
   }
 }
 ```
 
-- `url` must be `https://`, `sha256` must be 64 hex characters, `size` must be
-  more than zero, `format` is one of `squashfs`, `erofs`, `ext4`, `img`, and
-  `program` is the absolute path inside the payload to run. Anything else is a
-  manifest error the page shows, not a plugin it offers to install.
-- What we ship is **erofs**, not squashfs, and for one reason: the recovery
-  mounts the phone's own system partitions as erofs, so the kernel in the
-  ramdisk is certain to read it. squashfs depends on `CONFIG_SQUASHFS`, which
-  Android does not always turn on, and a payload that cannot be mounted is a
-  browser that cannot start.
-- Installed plugins live in **`/data/skyward/plugins/<name>/`** — `/data`
-  because that is where a gigabyte belongs, and because it survives a reboot so
-  the plugin is there at the next start. It also means the plugins page can only
-  see them after `/data` is decrypted, which the page says.
-- The image is kept as `payload.<format>` beside the manifest, written as
-  `payload.<format>.part` while it downloads and renamed only after the digest
-  matches, exactly like a system package.
+- `protocol` names the frame protocol. A manifest without it is a plugin the
+  recovery lists and does not run — which is what every plugin was before this
+  branch, so nothing that used to work stops being listed.
+- `program` is the path **inside** the image. It must be an aarch64 Android
+  binary or a script with a `#!/system/bin/sh` line, because the recovery runs
+  it with its own libc and does not chroot.
+- `format` is one of `squashfs`, `erofs`, `ext4`, `img`. What we ship is erofs:
+  the recovery already mounts the phone's own partitions as erofs, so the
+  kernel in the ramdisk is certain to read it, where squashfs depends on
+  `CONFIG_SQUASHFS` being on.
+- Installed plugins live in `/data/skyward/plugins/<name>/`, which means the
+  page can only see them after `/data` is decrypted — and that a plugin
+  installed there survives a reboot.
+
+The index is `https://github.com/Rinrroy/skyward-plugins/releases/latest/download/plugins.json`,
+read the same way the recovery's own update is; the same `manifest()` on the
+phone judges each entry, plus the rule that its `name` is one folder name.
 
 ### Putting one in by hand
 
-Fetching it in the system and copying it in is the shortest way to get a plugin
-on a phone, so it needs no manifest written by hand:
+Unchanged: a single image in `Skyward/plugins`, a folder holding one image and
+no manifest, or a folder with a manifest and the image it names. A folder with
+two images and no manifest is an error the page shows, not a guess.
 
-- A **single image** dropped into `Skyward/plugins` on internal storage —
-  `webview-1.1-arm64.erofs` or any name — is a plugin. Its name is the file's,
-  and it is started with `/opt/skyward/start.sh`, the program every payload of
-  this project is built with.
-- A **folder holding one image and no `plugin.json`** is a plugin too, named
-  after the folder.
-- With a `plugin.json` beside it, the image may keep the name it was downloaded
-  with: the file named by the manifest is looked for first, then any one file
-  beside it whose extension is the format it names.
-- A folder with two images and no manifest is listed with an error rather than
-  guessed at: which of the two runs is not something to decide for someone.
-- Any other file is not a plugin and is not listed.
+## What is not known yet
 
-This is the same list the page draws either way; what a hand-copied plugin
-cannot do is be deleted from the page under `/data` — it lives where it was put.
-Deleting an installed one is asked for exactly like a downloaded system package:
-the row says what goes, a footnote says what deleting costs, and a swipe is the
-only way to say yes.
+Marked so it can be probed, not believed:
 
-## Where the image comes from
-
-The browser is not shipped in the recovery image: it is a plugin, fetched from
-its own repository's release assets when the phone is asked to. The page reads
-one small index and installs what it names.
-
-- The index is
-  `https://github.com/Rinrroy/skyward-plugins/releases/latest/download/plugins.json`.
-  It is read the same way the recovery's own update is: the direct address
-  first, and the mainland mirror only when GitHub does not answer.
-- `crates/skyward-ui/src/plugin.rs`'s `index()` parses it through the same
-  `manifest()` a folder on the phone goes through, so an entry is held to the
-  same rules — an `https://` url, a 64-hex digest, a size in range, a format it
-  can mount, an absolute program path — plus one more: the entry's `name` must
-  be a single folder name, because it becomes the folder it is installed in.
-- `crates/skyward/src/pluginjob.rs` does the work on its own thread: it reads
-  the index, takes the first entry, downloads into
-  `/data/skyward/plugins/<name>/payload.<format>` with the digest checked, and
-  writes `plugin.json` **last** — so a download that was stopped half way is
-  not a plugin the page lists.
-- A stopped download keeps its `.part`, so asking again goes on from where it
-  stopped rather than from nothing.
-- Deleting an installed plugin removes its folder, image and manifest together.
-  An image that was copied straight into a plugins folder has no folder of its
-  own, and only that file is removed — taking its parent for a plugin folder
-  would take every plugin in it.
+1. **Does `recovery` execute a binary from an erofs mount on the ramdisk?** The
+   previous design needed `setenforce 0` because it executed from `/data`. The
+   mount point is now `img/` under `/skyward/run`, which is the ramdisk's own
+   tree, but the label of the mounted files comes from the image, and an image
+   built without labels takes the mount's `context=` or the policy default. If
+   the first run is denied, the fallback is the one already used: permissive for
+   the duration of the plugin and the mode restored on the way back, said on the
+   page.
+2. **What a full-frame copy costs.** 18 MB at 30 Hz is theoretical; the reader
+   wants dirty rows. The measurement that matters is a scroll of a long page on
+   the phone, which is the first thing to try.
+3. **How much RAM a reader plus full-mode Chromium leaves.** Chromium wants
+   ~400 MB idle and Xvfb another slice; the phone has 16 GB but the recovery has
+   no zram and no low-memory killer.
+4. **Audio.** Still expected to be silent: `/dev/snd` exists, but no vendor HAL
+   does, so there is no mixer setup for this codec.
+5. **Hardware video decode.** Not reachable from Chromium's V4L2 path: Venus is
+   a stateless decoder that wants `v4l2_codec2` in front of it. Software decode
+   only, and the page says so.
 
 ## The staged plan
 
 | stage | what it lands | how it is known to work |
 |---|---|---|
-| S1 | manifest `payload`, install layout, download + digest, listing after decryption | unit tests in CI; the downloader is the one already used for system packages |
-| S2 | the handover: mounts, resolv.conf, udev, SELinux, DRM release, chroot, exec, way back — with a tiny test payload that draws and exits | on the phone: the test payload paints the panel and returns to the page |
-| S3 | the real payload, built in CI on an arm64 runner (debootstrap + Chromium + Mesa + udev), published as a plugin asset | on the phone: a page loads |
-| S4 | video, audio, captive portal, the Via-like chrome (tabs, address bar) | on the phone |
+| S1 | the host: mount, run directory, frame, input, timeouts, cleanup, `protocol: 1` in the manifest | unit tests around the frame file; `cargo ndk check` and clippy clean |
+| S2 | `skyward-browser`: the reader, drawn into a frame file, with a test page | on the phone: a page loads and scrolls |
+| S3 | the payload built in CI, published as a release asset, installable from the index | on the phone: install, run, uninstall |
+| S4 | full mode inside the plugin; downloads; the download page; captive portals | on the phone |
 
-S2 is the one that decides the project: if the chroot, the DRM release and the
-udev/libinput path do not work on this device, the payload has to be something
-else, and it is better to know that with a 2 MB test payload than with a 700 MB
-one.
-
-## What is not known yet — to be probed on the phone
-
-Answered so far, all from the phone with `adb`:
-
-1. ~~Is `/data` mounted `noexec`?~~ No: `/data` and `/sdcard` are one `dm-8`
-   f2fs mounted `rw,nosuid,nodev`, and the payload runs from a loop-mounted
-   read-only image, so this never mattered.
-2. ~~Does `/dev/dri/card0` come back cleanly?~~ Yes — the card is dropped before
-   the payload starts and reopened after it exits, and the page redraws.
-3. ~~Are `/dev/input/event*` readable?~~ Yes, `event0`…`event7` are there and
-   readable as root.
-5. ~~Does the kernel mount the image, and do loop devices work?~~ Yes: erofs
-   mounts with `losetup -r`, and the image's own superblock checks out
-   (`blocks × 4096` equals the file size exactly).
-6. Is `/dev/snd` present and does a plain ALSA open work? Still open — and with
-   no vendor HAL in the chroot, sound is expected to be silent.
-
-Still open:
-
-4. How much RAM is free while Skyward is up? (Chromium wants ~400 MB idle, and
-   X plus Chromium together more.)
-7. Does Xorg's `modesetting` driver take this card under `-sharevts`, and does
-   Chromium draw a page through it? This is what payload 1.3 exists to answer.
-
-## Risks
-
-- **Size.** The payload is 700 MB–1.2 GB. Over a mainland connection, from
-  GitHub, that is a long download; it is the reason the plugin index and the
-  payload should be served from a mirror (the same one the recovery's own update
-  uses), and the reason the download must be resumable — which it is.
-- **The first frame.** Chromium's startup on a phone's GPU with Mesa's freedreno
-  is the least proven part. SwiftShader (software GL) is the fallback, at a
-  visibly lower frame rate.
-- **Nothing here is tested on a phone yet.** S2 exists to change that cheaply.
+S1 and S2 are why the protocol exists: with the frame and the pipe fixed, the
+plugin can be built, rebuilt and shipped without touching the recovery image
+once — which is the entire point of taking the browser out of it.

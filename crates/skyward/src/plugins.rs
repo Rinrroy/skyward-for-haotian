@@ -102,7 +102,9 @@ fn wanted(dir: &Path, format: &str) -> Option<PathBuf> {
 ///
 /// The name is the file's own, the program is the one every payload of this
 /// project starts, and nothing is claimed about a version or an author, since
-/// nothing is known.
+/// nothing is known. It carries no `protocol`, which is what says it cannot be
+/// run: an image with no manifest beside it does not say what to start inside
+/// it, so the page lists it and says why it does nothing.
 fn imagined(name: &str, file: &Path, format: &str) -> Plugin {
     Plugin {
         title: Some(name.to_string()),
@@ -110,6 +112,7 @@ fn imagined(name: &str, file: &Path, format: &str) -> Plugin {
         author: None,
         about: Some("an image with no plugin.json beside it".to_string()),
         needs: Vec::new(),
+        protocol: None,
         payload: Some(Payload {
             url: String::new(),
             sha256: String::new(),

@@ -2993,40 +2993,39 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         // one the page should still show.
                         app.set_plugins(crate::plugins::read(app.state.lang));
                     }
-                    // The phone changes hands, but not the display: the payload
-                    // draws into its own memory, so the card stays here and the
-                    // browser's frames are put on the panel from this thread
-                    // while it runs. Every way the payload can fail is a
-                    // sentence on the plugins page; only a frame that cannot be
-                    // shown ends the run, because there is nothing left to show
-                    // it on.
-                    Effect::OpenBrowser { image, program } => {
-                        let outcome = crate::browser::open(Path::new(&image), &program, &mut inputs, &mut surface);
+                    // The phone changes hands, but not the display: the plugin
+                    // draws into a frame of its own, so the card stays here and
+                    // the plugin's frames are put on the panel from this thread
+                    // while it runs. Every way the plugin can fail is a sentence
+                    // on the plugins page; only a frame that cannot be shown
+                    // ends the run, because there is nothing left to show it on.
+                    Effect::RunPlugin { name, image, program } => {
+                        let outcome = crate::pluginhost::run(&name, Path::new(&image), &program, &mut inputs, &mut surface);
                         let said = match outcome {
                             Ok(end) => match end.code {
                                 Some(0) => app.state.lang.pick([
-                                    "浏览器已关闭。",
-                                    "瀏覽器已關閉。",
-                                    "The browser is closed.",
+                                    "插件已关闭。",
+                                    "外掛已關閉。",
+                                    "The plugin is closed.",
                                 ]).to_string(),
                                 Some(code) => skyward_ui::tr!(
                                     app.state.lang,
-                                    "浏览器以 {code} 退出。",
-                                    "瀏覽器以 {code} 結束。",
-                                    "The browser exited with {code}."
+                                    "插件以 {code} 退出。",
+                                    "外掛以 {code} 結束。",
+                                    "The plugin exited with {code}."
                                 ),
                                 None => app.state.lang.pick([
-                                    "浏览器被中断了。",
-                                    "瀏覽器被中斷了。",
-                                    "The browser was interrupted.",
+                                    "插件被中断了。",
+                                    "外掛被中斷了。",
+                                    "The plugin was interrupted.",
                                 ]).to_string(),
                             },
                             Err(e) => {
-                                let _ = skyward_sys::kmsg(&format!("the browser did not start: {e:#}"));
+                                let _ = skyward_sys::kmsg(&format!("{name} did not start: {e:#}"));
                                 format!("{}: {e:#}", app.state.lang.pick([
-                                    "浏览器没有启动",
-                                    "瀏覽器沒有啟動",
-                                    "The browser did not start",
+                                    "插件没有启动",
+                                    "外掛沒有啟動",
+                                    "The plugin did not start",
                                 ]))
                             }
                         };

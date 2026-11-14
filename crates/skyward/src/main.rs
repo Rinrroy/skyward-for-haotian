@@ -11,8 +11,6 @@ mod art;
 #[cfg(target_os = "android")]
 mod backup;
 #[cfg(target_os = "android")]
-mod browser;
-#[cfg(target_os = "android")]
 mod decrypt;
 #[cfg(target_os = "android")]
 mod filework;
@@ -26,6 +24,8 @@ mod input;
 mod merge;
 #[cfg(target_os = "android")]
 mod partwork;
+#[cfg(target_os = "android")]
+mod pluginhost;
 #[cfg(target_os = "android")]
 mod pluginjob;
 #[cfg(target_os = "android")]

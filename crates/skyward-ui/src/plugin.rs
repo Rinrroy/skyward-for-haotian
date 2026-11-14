@@ -1,10 +1,11 @@
 //! What a plugin's manifest says: the `plugin.json` in its folder, read
 //! into the words a page draws.
 //!
-//! Nothing runs a plugin in this release. This is the reading half, kept
-//! apart from the filesystem so that it can be tested on its own: the
-//! folder is found and the file read by the runtime, and every judgement
-//! about what the file says is made here.
+//! This is the reading half, kept apart from the filesystem so that it can be
+//! tested on its own: the folder is found and the file read by the runtime,
+//! and every judgement about what the file says is made here. What a plugin
+//! that speaks [`PROTOCOL`] is then handed — the panel, the fingers, the log —
+//! is the plugin host's business, not this file's.
 //!
 //! The manifest is written by whoever makes the plugin, not by this
 //! program, so nothing in it is trusted: every string is trimmed and cut
@@ -16,6 +17,12 @@ use serde::Deserialize;
 
 /// The file a plugin folder is read from.
 pub const FILE: &str = "plugin.json";
+
+/// The only plugin protocol this release knows: the frame protocol. A plugin
+/// that says `"protocol": 1` draws into a frame file the recovery maps and
+/// puts on the panel, and takes its fingers from a FIFO of commands. One that
+/// says nothing, or says another number, is listed and not run.
+pub const PROTOCOL: u32 = 1;
 
 /// The most a manifest may be. It comes from a folder anyone can put on
 /// internal storage, and a page draws what it holds.
@@ -61,6 +68,10 @@ struct Written {
     /// What it needs of the recovery, by name.
     #[serde(default)]
     needs: Vec<String>,
+    /// Which plugin protocol it speaks: 1 is the frame protocol, and a
+    /// manifest with none is a plugin that is listed and not run.
+    #[serde(default)]
+    protocol: Option<u32>,
     /// The image it carries, where it is more than a manifest.
     #[serde(default)]
     payload: Option<WrittenPayload>,
@@ -188,6 +199,7 @@ fn plugin_of(written: Written) -> Result<Plugin, String> {
         author: written.author.as_deref().and_then(kept),
         about: written.about.as_deref().and_then(kept),
         needs,
+        protocol: written.protocol,
         payload,
     })
 }
@@ -275,6 +287,28 @@ mod tests {
     #[test]
     fn a_manifest_without_a_payload_carries_none() {
         assert_eq!(manifest(r#"{"title":"主题包"}"#).expect("a plugin").payload, None);
+    }
+
+    #[test]
+    fn a_plugin_is_run_only_when_it_speaks_the_protocol_and_carries_an_image() {
+        let image = format!(r#""url":"https://example.invalid/w.squashfs","sha256":"{DIGEST}","size":1,"program":"/opt/skyward/run.sh""#);
+        let frames = manifest(&format!(r#"{{"title":"浏览器","protocol":1,"payload":{{{image}}}}}"#)).expect("a plugin");
+        assert_eq!(frames.protocol, Some(PROTOCOL));
+        assert!(frames.runs(), "the frame protocol, with an image");
+        // No protocol at all is a plugin from before this one: listed, and not
+        // run, because the recovery does not guess how a program wants the
+        // phone.
+        let mute = manifest(&format!(r#"{{"title":"浏览器","payload":{{{image}}}}}"#)).expect("a plugin");
+        assert_eq!(mute.protocol, None);
+        assert!(!mute.runs(), "a plugin that says nothing about a protocol");
+        // A protocol this release does not know is not one to guess at either.
+        let later = manifest(&format!(r#"{{"title":"浏览器","protocol":2,"payload":{{{image}}}}}"#)).expect("a plugin");
+        assert!(!later.runs(), "a protocol from a later release");
+        // A protocol with nothing to run is still nothing to run.
+        let bare = manifest(&format!(r#"{{"protocol":{PROTOCOL}}}"#)).expect("a plugin");
+        assert!(!bare.runs(), "a plugin with no image");
+        // A protocol that is not a number is an error, not a plugin.
+        assert!(manifest(r#"{"protocol":"one"}"#).is_err());
     }
 
     #[test]

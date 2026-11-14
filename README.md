@@ -127,12 +127,15 @@ this slot. There is no override.
   remembered and can be forgotten from the list
 - A plugins page, with its own way in on the home page: a plugin is a folder with
   a `plugin.json`, and one that names an image can be downloaded from its own
-  release and run — the browser is the first of those. The phone hands its
-  display to it, and these pages come back when it exits. The download takes the
-  same mainland mirror as the system update, and is checked against its SHA-256
-  either way; an image fetched in the system and copied into `Skyward/plugins`
-  works without a manifest. Deleting one is asked for the way a downloaded
-  system package is. See [docs/plugins/webview.md](docs/plugins/webview.md)
+  release and run — the browser is the first of those, and it is no longer part
+  of the recovery. A protocol 1 plugin is handed a frame buffer and an input
+  pipe: it paints its own frames, and the phone puts them on the panel, forwards
+  its touch screen, buttons and keyboard, and takes the panel back when the
+  plugin exits. The download takes the same mainland mirror as the system
+  update, and is checked against its SHA-256 either way; an image fetched in the
+  system and copied into `Skyward/plugins` works without a manifest. Deleting
+  one is asked for the way a downloaded system package is. See
+  [docs/plugins/webview.md](docs/plugins/webview.md)
 
 ### Without a system
 
