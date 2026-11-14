@@ -50,6 +50,34 @@ impl Drive {
     }
 }
 
+/// Give the port to a drive as host, so one plugged into it is enumerated
+/// and shows as a drive, or back to the phone's own device role, where adb
+/// and MTP come from. The controllers name the role differently: the
+/// platform's own by `mode` under `ssusb`, and the role switch, where the
+/// kernel has one, by `role`.
+pub fn set_host(host: bool) -> Result<()> {
+    let mut put = false;
+    for entry in fs::read_dir("/sys/bus/platform/devices").with_context(|| "read the platform's devices")?.flatten() {
+        if !entry.file_name().to_string_lossy().contains("ssusb") {
+            continue;
+        }
+        let mode = entry.path().join("mode");
+        if mode.is_file() && fs::write(&mode, if host { "host" } else { "peripheral" }).is_ok() {
+            put = true;
+        }
+    }
+    for entry in fs::read_dir("/sys/class/usb_role").into_iter().flatten().flatten() {
+        let role = entry.path().join("role");
+        if fs::write(&role, if host { "host" } else { "device" }).is_ok() {
+            put = true;
+        }
+    }
+    if !put {
+        bail!("no USB controller took the port as a {}", if host { "host" } else { "device" });
+    }
+    Ok(())
+}
+
 /// The USB drives plugged in that hold anything, by the names of their
 /// disks. A drive pulled out while it is looked at is left out.
 pub fn drives() -> Result<Vec<Drive>> {

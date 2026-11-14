@@ -616,6 +616,10 @@ pub mod kms {
         /// The panel rests in its low-power mode, the display processor
         /// stopped.
         Resting,
+        /// The panel is in its own doze: the display processor keeps
+        /// running, the light is out, and the frame stays on the glass,
+        /// which is what the phone's own always-on display is.
+        Dozing,
         Off,
     }
 
@@ -646,6 +650,11 @@ pub mod kms {
         /// for resting.
         conn: connector::Handle,
         lp: Option<(property::Handle, u64, u64)>,
+        /// The connector's power switch, where the display driver has one:
+        /// the panel's own doze, and the running mode. The doze is what the
+        /// phone's always-on display uses, and the driver sends the panel
+        /// the commands for it by itself.
+        dpms: Option<(property::Handle, u64, u64)>,
         power: Power,
         /// The display came on again in the panel's preferred mode, and the
         /// panel has yet to switch to its fastest.
@@ -898,6 +907,17 @@ pub mod kms {
                 Ok((id, _)) => Some((id, enum_value(&card, id, "ON")?, enum_value(&card, id, "LP2")?)),
                 Err(_) => None,
             };
+            // The panel's own doze, where the display driver has a switch
+            // for it: the driver sends the panel the commands for the doze
+            // by itself, where the recovery sends them by hand it can
+            // only guess at.
+            let dpms = match conn_props.get("DPMS") {
+                Ok((id, _)) => match (enum_value(&card, id, "On"), enum_value(&card, id, "Doze")) {
+                    (Ok(on), Ok(doze)) => Some((id, on, doze)),
+                    _ => None,
+                },
+                Err(_) => None,
+            };
             let conn = conn.handle();
             let s = KmsSurface {
                 card,
@@ -913,6 +933,7 @@ pub mod kms {
                 spr,
                 conn,
                 lp,
+                dpms,
                 power: Power::On,
                 slow: false,
                 w,
@@ -936,6 +957,56 @@ pub mod kms {
             self.power == Power::Off
         }
 
+        /// Whether the panel can be put into its own doze: the display
+        /// driver has a switch for it, and the panel takes it.
+        pub fn can_doze(&self) -> bool {
+            self.dpms.is_some()
+        }
+
+        /// Whether the panel is in its own doze.
+        pub fn is_dozing(&self) -> bool {
+            self.power == Power::Dozing
+        }
+
+        /// Put the panel into its own doze, as the phone's always-on
+        /// display is: the display processor keeps running, the light goes
+        /// out, and the frame that is on the panel stays on the glass. The
+        /// touch controller keeps scanning, so a tap can still be felt.
+        ///
+        /// The driver sends the panel the commands for the doze by itself,
+        /// which is the only way to get there: the commands are the
+        /// panel's own, and the recovery cannot write them by hand.
+        pub fn doze(&mut self) -> Result<()> {
+            let Some((id, _, doze)) = self.dpms else {
+                return Err(anyhow!("the display driver has no doze for this panel"));
+            };
+            if self.power == Power::Dozing {
+                return Ok(());
+            }
+            self.settle()?;
+            let mut req = atomic::AtomicModeReq::new();
+            req.add_property(self.conn, id, property::Value::UnsignedRange(doze));
+            self.card.atomic_commit(AtomicCommitFlags::empty(), req).context("put the panel into its doze")?;
+            self.power = Power::Dozing;
+            Ok(())
+        }
+
+        /// Bring the panel out of its doze, back to the pages.
+        pub fn wake(&mut self) -> Result<()> {
+            let Some((id, on, _)) = self.dpms else {
+                return Ok(());
+            };
+            if self.power != Power::Dozing {
+                return Ok(());
+            }
+            self.settle()?;
+            let mut req = atomic::AtomicModeReq::new();
+            req.add_property(self.conn, id, property::Value::UnsignedRange(on));
+            self.card.atomic_commit(AtomicCommitFlags::empty(), req).context("bring the panel out of its doze")?;
+            self.power = Power::On;
+            Ok(())
+        }
+
         /// Let the panel rest, ready to light again at once: in its
         /// low-power mode, as Android rests it while dozing, with the
         /// display processor stopped. The 13 Ultra's lights from there in
@@ -948,6 +1019,8 @@ pub mod kms {
             if self.power != Power::On {
                 return Ok(());
             }
+            // A panel in its own doze is left where it is: the doze is
+            // what keeps the frame on the glass.
             let Some((id, _, rest)) = self.lp else { return self.turn_off() };
             self.settle()?;
             let mut req = atomic::AtomicModeReq::new();
@@ -1066,6 +1139,12 @@ pub mod kms {
                 // otherwise rest again as it last did.
                 if let Some((id, run, _)) = self.lp {
                     req.add_property(self.conn, id, property::Value::UnsignedRange(run));
+                }
+                // A panel in its own doze leaves it for the page.
+                if self.power == Power::Dozing {
+                    if let Some((id, on, _)) = self.dpms {
+                        req.add_property(self.conn, id, property::Value::UnsignedRange(on));
+                    }
                 }
             }
             if self.power == Power::Off {

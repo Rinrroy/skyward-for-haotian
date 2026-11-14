@@ -63,7 +63,7 @@ pub fn spots(t: &Theme, frame: &Frame) -> Vec<Spot> {
     let mut page: Vec<Spot> = frame
         .hits
         .iter()
-        .filter(|h| !matches!(h.action, Action::Pattern | Action::CloseChoices))
+        .filter(|h| !matches!(h.action, Action::Pattern | Action::CloseChoices | Action::FilesSearch))
         .map(|h| Spot { stop: Stop::Hit(h.action), group: Group::Page, rect: h.rect })
         .collect();
     if let Some((cx, cy, span)) = frame.pattern {

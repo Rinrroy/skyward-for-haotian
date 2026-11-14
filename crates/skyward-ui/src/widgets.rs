@@ -2462,6 +2462,29 @@ pub fn info_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, items: &[(&str,
     bottom
 }
 
+/// A card that warns of what cannot be undone: a heading and what it says,
+/// drawn in the red the theme keeps for danger, so that it is read before
+/// anything else on the page.
+pub fn danger_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, heading: &str, text: &str) -> f32 {
+    let m = &t.m;
+    let (card_x, right) = (m.margin, m.w as f32 - m.margin);
+    let x = card_x + m.inner;
+    let width = right - m.inner - x;
+    let wrapped = wrap(c, &f.body, text, m.sub_px, width);
+    let lines = if wrapped.is_empty() { vec![String::new()] } else { wrapped };
+    let (ink_top, _) = f.heading.ink(m.row_title_px);
+    let heading_base = top + m.dp(23.5) - ink_top;
+    let body_top = heading_base + m.dp(20.2);
+    let last = body_top + m.sub_pitch * lines.len().saturating_sub(1) as f32;
+    let bottom = last + m.dp(24.0);
+    c.fill_round_rect(card_x, top, right - card_x, bottom - top, m.card_radius, t.pal.danger_soft);
+    c.text(&f.heading, heading, x, heading_base, m.row_title_px, t.pal.danger, Some(width));
+    for (k, line) in lines.iter().enumerate() {
+        c.text(&f.body, line, x, body_top + m.sub_pitch * k as f32, m.sub_px, t.pal.danger, None);
+    }
+    bottom
+}
+
 /// The height of each line on a card of what a program showed.
 const OUTPUT_PITCH_DP: f32 = 19.0;
 /// From the card's top to the ink of its first line.

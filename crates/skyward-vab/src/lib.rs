@@ -5,6 +5,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 #[cfg(target_os = "android")]
+pub mod avb;
 pub mod boot;
 mod partitions;
 pub mod snapshots;

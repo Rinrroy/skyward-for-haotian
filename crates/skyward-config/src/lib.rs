@@ -207,6 +207,17 @@ pub struct Wipe {
     pub logs: Vec<String>,
 }
 
+impl Default for Display {
+    fn default() -> Self {
+        Self { width: 0, height: 0, density: 0, diagonal: None, corner_radius: 0, gamma: default_gamma(), fastest_refresh: false }
+    }
+}
+
+/// The backlight curve a phone that says nothing about it gets.
+fn default_gamma() -> f32 {
+    1.0
+}
+
 /// The data partition, which the folders erasing takes in are in.
 const DATA: &str = "/data";
 
@@ -357,7 +368,7 @@ pub struct Device {
     pub os_version_prop: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Display {
     #[serde(default)]
     pub width: u32,
@@ -372,6 +383,12 @@ pub struct Display {
     /// sliding over another rounds its leading corners to it.
     #[serde(default)]
     pub corner_radius: u32,
+    /// How far the backlight slider's position is raised before it is
+    /// written, so that the light the panel gives rises evenly to the eye.
+    ///
+    /// 1.0 leaves it as it is, which is what a phone that says nothing gets.
+    #[serde(default = "default_gamma")]
+    pub gamma: f32,
     /// Whether the panel is switched to its fastest refresh once it is up.
     ///
     /// Off unless a phone asks for it. A recovery's pages are mostly still,

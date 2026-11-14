@@ -1,6 +1,9 @@
+use crate::blur;
 use crate::canvas::{Canvas, Run};
 use crate::charge;
 use crate::color::Rgba;
+use crate::doubletap::DoubleTap;
+
 use crate::editor::{self, Editor};
 use crate::files::{self, FileType};
 use crate::fling::{Fling, Tracker};
@@ -9,9 +12,11 @@ use crate::focus::{self, Group, Spot, Stop};
 use crate::font::Fonts;
 use crate::geom::Rect;
 use crate::glow::{self, GlowClock};
+use crate::icons::Icon;
 use crate::lang::{Lang, Text};
 use crate::motion::{self, Spring};
 use crate::pages::{self, Band, Ctx};
+use crate::powermenu;
 use crate::sprite::{Blurs, Sprite};
 use crate::search;
 use crate::settings::Settings;
@@ -19,14 +24,17 @@ use crate::term::{self, Term, TermKey};
 use crate::theme::Theme;
 use crate::tr;
 use crate::widgets::{self, Bar, Bolt, Cap, Layer, WlanMark};
+use serde::{Deserialize, Serialize};
 use skyward_info::DeviceInfo;
 use skyward_install::commands::avbctl;
 use skyward_install::{Event, ImageKind, Outcome, Reflash, Refusal, Stage};
 use skyward_net::download::{Failure, Progress};
+use skyward_net::localsend::{Phase as LocalSendPhase, Status as LocalSendStatus};
 use skyward_net::github::{Build, Newest};
 use skyward_net::release::{Release, Unanswered};
 use skyward_net::supplicant::Security;
 pub use skyward_net::supplicant::SavedNetwork;
+use skyward_net::web::{FileOffer, Opened, Page as WebPage};
 use skyward_net::wlan::{Joined, Network, Power, Stage as Joining, Traffic, Wlan};
 use skyward_systems::{Overview, Who};
 use skyward_vab::{BootSlots, Hold, Slot, SnapshotState, Standing};
@@ -69,6 +77,8 @@ pub enum Screen {
     /// and turning them on or off.
     Avb,
     Files,
+    /// The file manager's search, over the folder it shows.
+    FilesSearch,
     /// One file, and what can be done with it.
     FileInfo,
     /// The permission bits of the entry the file page shows, a switch each.
@@ -80,6 +90,9 @@ pub enum Screen {
     /// system's rules give them: what it does and a swipe to start, then
     /// how far it has come and how it ended.
     Relabel,
+    /// What the bootloader was told to start next: the message it left in
+    /// misc, what recovery makes of it, and a way to take it away.
+    Bcb,
     /// The partitions whose filesystems can be repaired or made afresh as
     /// another.
     Filesystems,
@@ -134,6 +147,8 @@ pub enum Screen {
     /// The WLAN switch, the network chosen and how joining it goes, and
     /// the networks in range.
     Wlan,
+    /// Sending and receiving files with LocalSend over the WLAN.
+    LocalSend,
     /// The password of the network chosen, typed on the screen's keyboard.
     WlanPassword,
     /// The network joined, and the address and the rest it gave.
@@ -141,11 +156,348 @@ pub enum Screen {
     /// A network added by hand: its name, how it is protected and its
     /// password, typed on the screen's keyboard.
     WlanAdd,
-    /// Turning the phone off, and what that means: the swipe that does it.
-    PowerOff,
     /// The vbmeta image of the slot the phone runs from: the copies kept of
     /// it, making one, and putting one back.
     Vbmeta,
+    /// The web, read as text, pictures and links: the address bar, the
+    /// page, the forms it carries, and the files it offers to save.
+    Browser,
+    /// The address typed on the screen's keyboard, a search where it names
+    /// no site.
+    BrowserAddress,
+    /// The files the browser has saved or is saving.
+    BrowserDownloads,
+    /// One field of a page's form, typed on the screen's keyboard.
+    BrowserForm,
+    /// The optional Linux Chromium plugin, which gives pages their scripts
+    /// and pictures back: where it stands, and how to get it.
+    BrowserFull,
+    /// The open pages, to choose among, close, or add one.
+    BrowserTabs,
+    /// The start page's shortcuts, to add or remove.
+    BrowserQuick,
+    /// Magisk, KernelSU or APatch and the modules they run.
+    Magisk,
+}
+
+/// What the browser shows.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BrowserView {
+    /// The start page: the address, links to sites, what was read before,
+    /// and the downloads.
+    Home,
+    /// A page being read, or a file being looked at, and its address.
+    Loading(String),
+    Page(WebPage),
+    File(FileOffer),
+    /// A page drawn by the external Chromium plugin, shown under the normal
+    /// browser bar and dock.
+    Full,
+    /// The address asked for, and why nothing came back.
+    Failed { url: String, why: String },
+}
+
+/// How a file the browser saves stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrowserSave {
+    Downloading { done: u64, total: Option<u64> },
+    Done,
+    Stopped,
+    Failed(String),
+}
+
+/// A file the browser offers, or offered, to save.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserDownload {
+    pub name: String,
+    pub url: String,
+    /// Where it goes: internal storage once it is open, the recovery's own
+    /// memory where it is not.
+    pub path: String,
+    pub size: Option<u64>,
+    pub done: u64,
+    pub state: BrowserSave,
+}
+
+/// One open page, kept while another tab shows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrowserTab {
+    pub url: String,
+    pub address: String,
+    pub view: BrowserView,
+    pub history: Vec<String>,
+    pub at: usize,
+    pub form: Vec<Vec<String>>,
+    pub field: Option<(usize, usize)>,
+}
+
+impl BrowserTab {
+    pub fn home() -> BrowserTab {
+        BrowserTab {
+            url: String::new(),
+            address: String::new(),
+            view: BrowserView::Home,
+            history: Vec::new(),
+            at: 0,
+            form: Vec::new(),
+            field: None,
+        }
+    }
+
+    pub fn title(&self, l: Lang) -> String {
+        match &self.view {
+            BrowserView::Home => l.pick(["主页", "首頁", "Home"]).to_string(),
+            BrowserView::Loading(url) => url.clone(),
+            BrowserView::Page(page) => page.title.clone(),
+            BrowserView::File(file) => file.name.clone(),
+            BrowserView::Full => self.url.clone(),
+            BrowserView::Failed { url, .. } => url.clone(),
+        }
+    }
+}
+
+/// One of the start page's shortcuts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuickLink {
+    pub title: String,
+    pub url: String,
+    pub color: Rgba,
+    pub icon: Icon,
+}
+
+/// The browser's page, where it stands, what it has saved, and the form it
+/// is filling in.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Browser {
+    /// What is typed in the address field.
+    pub address: String,
+    /// The address of the page shown.
+    pub url: String,
+    pub view: BrowserView,
+    /// The addresses read, oldest first, and which of them shows.
+    pub history: Vec<String>,
+    pub at: usize,
+    pub downloads: Vec<BrowserDownload>,
+    /// The download under way, by its place in `downloads`.
+    pub saving: Option<usize>,
+    /// The values typed into the page's form fields, by form and field.
+    pub form: Vec<Vec<String>>,
+    /// Which field the keyboard types into, where one is chosen.
+    pub field: Option<(usize, usize)>,
+    /// The cookie jar: name, value, domain, path, and when it expires.
+    pub cookies: Vec<Cookie>,
+    /// The plugin's state, and where it was found or why it is not there.
+    pub full: BrowserFull,
+    /// The last page the plugin rendered, as PNG.
+    pub full_shot: Option<Vec<u8>>,
+    /// Whether the page shown is the plugin's, and new addresses go to it.
+    pub full_active: bool,
+    /// The plugin page's CSS zoom, changed by the full-mode zoom buttons.
+    pub full_zoom: f32,
+    /// The keyboard is typing into the plugin page's focused field.
+    pub full_text: bool,
+    /// The last place tapped on the plugin page, in per-mille.
+    pub full_touch: (u16, u16),
+    /// The plugin's progress, from 0 to 1.
+    pub full_progress: Option<f32>,
+    /// The open pages, and which one shows.
+    pub tabs: Vec<BrowserTab>,
+    pub active: usize,
+    /// The start page's shortcuts.
+    pub quick: Vec<QuickLink>,
+}
+
+/// One cookie the browser sends back to a server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cookie {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    /// Seconds since the epoch, or none for the session.
+    pub expires: Option<i64>,
+}
+
+/// What the optional Linux Chromium plugin is doing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrowserFull {
+    /// Not looked for yet.
+    Unknown,
+    /// The plugin is not there: why.
+    Absent(String),
+    /// The plugin's files are there, at this folder.
+    Ready(String),
+    /// The plugin is being fetched or unpacked.
+    Installing { done: u64, total: Option<u64> },
+    /// The plugin is running at this local debugging address.
+    Running(String),
+    Failed(String),
+}
+
+impl Default for Browser {
+    fn default() -> Self {
+        Browser {
+            address: String::new(),
+            url: String::new(),
+            view: BrowserView::Home,
+            history: Vec::new(),
+            at: 0,
+            downloads: Vec::new(),
+            saving: None,
+            form: Vec::new(),
+            field: None,
+            cookies: Vec::new(),
+            full: BrowserFull::Unknown,
+            full_shot: None,
+            full_active: false,
+            full_zoom: 1.0,
+            full_text: false,
+            full_touch: (500, 500),
+            full_progress: None,
+            tabs: vec![BrowserTab::home()],
+            active: 0,
+            quick: default_quick(),
+        }
+    }
+}
+
+fn default_quick() -> Vec<QuickLink> {
+    vec![
+        QuickLink { title: "GitHub".into(), url: "https://github.com".into(), color: Rgba::rgb(0x34, 0x82, 0xff), icon: Icon::Globe },
+        QuickLink {
+            title: "Skyward".into(),
+            url: "https://github.com/kirklin/skyward".into(),
+            color: Rgba::rgb(0x77, 0x67, 0xf9),
+            icon: Icon::Layers,
+        },
+        QuickLink {
+            title: "LineageOS".into(),
+            url: "https://download.lineageos.org".into(),
+            color: Rgba::rgb(0x1d, 0xcd, 0x3a),
+            icon: Icon::Install,
+        },
+        QuickLink {
+            title: "Bing".into(),
+            url: "https://www.bing.com".into(),
+            color: Rgba::rgb(0xff, 0x69, 0x00),
+            icon: Icon::Globe,
+        },
+    ]
+}
+
+impl Browser {
+    pub fn page(&self) -> Option<&WebPage> {
+        match &self.view {
+            BrowserView::Page(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    pub fn downloading(&self) -> bool {
+        self.saving.is_some_and(|i| matches!(self.downloads.get(i).map(|d| &d.state), Some(BrowserSave::Downloading { .. })))
+    }
+
+    fn sync_tab(&mut self) {
+        if self.active >= self.tabs.len() {
+            self.tabs.push(BrowserTab::home());
+            self.active = self.tabs.len() - 1;
+        }
+        self.tabs[self.active] = BrowserTab {
+            url: self.url.clone(),
+            address: self.address.clone(),
+            view: self.view.clone(),
+            history: self.history.clone(),
+            at: self.at,
+            form: self.form.clone(),
+            field: self.field,
+        };
+    }
+
+    fn load_tab(&mut self) {
+        let Some(tab) = self.tabs.get(self.active).cloned() else { return };
+        self.url = tab.url;
+        self.address = tab.address;
+        self.view = tab.view;
+        self.history = tab.history;
+        self.at = tab.at;
+        self.form = tab.form;
+        self.field = tab.field;
+    }
+
+    pub fn new_tab(&mut self) {
+        self.sync_tab();
+        self.tabs.push(BrowserTab::home());
+        self.active = self.tabs.len() - 1;
+        self.load_tab();
+    }
+
+    pub fn switch_tab(&mut self, at: usize) {
+        if at >= self.tabs.len() {
+            return;
+        }
+        self.sync_tab();
+        self.active = at;
+        self.load_tab();
+    }
+
+    pub fn close_tab(&mut self, at: usize) {
+        if at >= self.tabs.len() {
+            return;
+        }
+        if self.active == at {
+            self.sync_tab();
+        }
+        self.tabs.remove(at);
+        if self.tabs.is_empty() {
+            self.tabs.push(BrowserTab::home());
+            self.active = 0;
+        } else if self.active > at {
+            self.active -= 1;
+        } else if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        } else if self.active == at {
+            self.active = self.active.min(self.tabs.len() - 1);
+        }
+        self.load_tab();
+    }
+}
+
+/// Magisk, KernelSU or APatch, and the modules it runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MagiskRoot {
+    Unknown,
+    Locked,
+    Absent,
+    Present(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MagiskModule {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub author: String,
+    pub description: String,
+    pub enabled: bool,
+    pub removing: bool,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Magisk {
+    pub root: MagiskRoot,
+    /// The modules found, or why they could not be read.
+    pub modules: Option<Result<Vec<MagiskModule>, String>>,
+    /// The installed Magisk version, when Magisk is the root solution.
+    pub version: Option<String>,
+    /// The newest Magisk release found, if it has been checked.
+    pub latest: Option<String>,
+}
+
+impl Default for Magisk {
+    fn default() -> Self {
+        Magisk { root: MagiskRoot::Unknown, modules: None, version: None, latest: None }
+    }
 }
 
 /// How far asking the update server for the newest system has come.
@@ -251,7 +603,19 @@ pub const USB_DRIVE: &str = "/mnt/usb";
 pub const USB_DRIVE_UNREADABLE: Text = ["无法读取该 U 盘", "無法讀取這個 USB 隨身碟", "This USB drive can't be read"];
 pub const USB_DRIVE_WANTED: Text = ["请通过 OTG 连接 U 盘", "請透過 OTG 連接 USB 隨身碟", "Connect a USB drive through OTG"];
 
-/// The data partition's name, as the filesystem page lists it.
+/// Whether a folder is on the OTG drive, which the file manager reads with
+/// the USB port as host.
+fn on_otg(path: &str) -> bool {
+    path == USB_DRIVE || path.starts_with(&format!("{USB_DRIVE}/"))
+}
+
+fn read_dir_effect(path: String) -> Effect {
+    if on_otg(&path) {
+        Effect::ReadUsbDir(path)
+    } else {
+        Effect::ReadDir(path)
+    }
+}
 pub const DATA_PARTITION: &str = "data";
 
 /// What work that needs the data partition is told while it is being
@@ -552,6 +916,10 @@ pub enum Slider {
     Vibration,
 }
 
+/// How long the power key is held before the power menu comes up. Short
+/// of this, letting go does what a short press has always done.
+pub const POWER_MENU_MS: u64 = 3_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Switch {
     Vibrate,
@@ -587,6 +955,9 @@ pub enum Switch {
     /// update: the check and the download both, since both hosts that serve
     /// them are commonly out of reach there. Direct first, then the mirror.
     Mirror,
+    /// Serve LocalSend on the joined network: the runtime starts or stops the
+    /// endpoint, and the page says how it stands.
+    LocalSend,
 }
 
 /// What a backup can take, in the order the backup page lists it.
@@ -596,6 +967,12 @@ pub const BACKUP_PARTS: [Text; 4] = [
     ["data 分区", "data 分割區", "data partition"],
     ["基带与 EFS", "基頻與 EFS", "Modem and EFS"],
 ];
+
+/// Which of [`BACKUP_PARTS`] can be written back from here. All of them can:
+/// the bootloader chain is not one of them, since writing one of those
+/// partitions needs fastboot or an EDL tool, where a mistake is not
+/// something a recovery can undo.
+pub const BACKUP_RESTORABLE: [bool; 4] = [true, true, true, true];
 
 /// A backup found in a place's Skyward/backups folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -943,6 +1320,11 @@ pub enum Confirm {
     /// Give the data partition's files the SELinux labels the installed
     /// system's rules give them.
     Relabel,
+    /// Take the bootloader message out of misc, so the next start follows
+    /// the reason the bootloader itself has.
+    ClearStarter,
+    /// Start the packages waiting in the queue, one after another.
+    InstallQueue,
     /// Do to the partition the filesystem page shows what it chose.
     Filesystem,
     /// Switch to the system picked on the systems page, and restart into
@@ -961,8 +1343,17 @@ pub enum Confirm {
     ForgetNetwork,
     /// Delete the full package downloaded from internal storage.
     DeleteDownload,
-    /// Turn the phone off.
-    PowerOff,
+}
+
+/// Whether a swipe-to-confirm control has to be slid twice.
+///
+/// These are the two actions that can leave a phone in a state its owner did
+/// not expect: the checks off leaves the phone's own system unable to start,
+/// which was measured on this phone rather than feared, and a factory reset
+/// takes data that cannot be brought back. Everything else is slid once, as
+/// before.
+fn arms(which: Confirm) -> bool {
+    matches!(which, Confirm::Avb | Confirm::FactoryReset)
 }
 
 /// What the wipe page erases: everything a factory reset erases, or any of
@@ -1248,6 +1639,64 @@ pub struct Fastboot {
 /// the order the page lists them; `None` keeps it on.
 pub const SCREEN_OFF: [Option<u64>; 7] = [Some(15_000), Some(30_000), Some(60_000), Some(120_000), Some(300_000), Some(600_000), None];
 
+/// The share of the panel's normal maximum the AOD is lit at, while the
+/// pages sleep: light enough to read in the dark, dim enough to forget.
+pub const AOD_LEVEL: f32 = 0.02;
+
+/// The looks the AOD's clock shows in, as the settings cycle through them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AodStyle {
+    /// `HH:MM` large, centered.
+    #[default]
+    Digits,
+    /// The hour and the minute set askew, each as large as the screen
+    /// allows.
+    Offset,
+    /// A clock face.
+    Dial,
+}
+
+impl AodStyle {
+    /// The name the style is known by, as the setting shows it.
+    pub fn name(self, l: Lang) -> &'static str {
+        match self {
+            AodStyle::Digits => l.pick(["数字", "數字", "Digits"]),
+            AodStyle::Offset => l.pick(["错位", "錯位", "Offset"]),
+            AodStyle::Dial => l.pick(["表盘", "錶盤", "Dial"]),
+        }
+    }
+
+    /// The style after this one, as the setting is tapped.
+    pub fn next(self) -> Self {
+        match self {
+            AodStyle::Digits => AodStyle::Offset,
+            AodStyle::Offset => AodStyle::Dial,
+            AodStyle::Dial => AodStyle::Digits,
+        }
+    }
+}
+
+/// How far up the glass a finger must swipe for the AOD to believe it
+/// meant to wake the panel, in dp: farther than a pocket shifts.
+const WAKE_SWIPE_DP: f32 = 64.0;
+
+/// Where the AOD sits, in dp from its usual place, one each minute in
+/// turn, so no pixel holds the light long enough to burn into the panel.
+const AOD_SPOTS: [(f32, f32); 4] = [(0.0, 0.0), (5.0, -3.0), (0.0, 6.0), (-5.0, -3.0)];
+
+/// The AOD's inks on the black panel: the clock the brightest, the day
+/// and the charge left dimmer, the hint of how to leave it faintest.
+const AOD_INK: Rgba = Rgba::rgb(0xC0, 0xC0, 0xC0);
+const AOD_DIM: Rgba = Rgba::rgb(0x82, 0x82, 0x82);
+const AOD_FAINT: Rgba = Rgba::rgb(0x52, 0x52, 0x52);
+
+/// How long changed settings wait after the last change before they are
+/// written to the owner's storage, so a slider dragged across the page
+/// writes once. Waiting for the AOD page to go through it.
+#[expect(dead_code)]
+const SETTINGS_SAVE_DELAY: u64 = 2000;
+
 /// The time zones the clock and the times on the pages can keep, in the
 /// order their page lists them: the name, the cities it covers, and the
 /// zone's name in the tz database.
@@ -1346,6 +1795,8 @@ pub enum Action {
     Dismiss,
     /// Keep the screen on for this choice in [`SCREEN_OFF`].
     ScreenOff(usize),
+    /// Show the AOD's clock in the next of [`AodStyle`]'s looks.
+    AodStyle,
     /// Keep the time zone at this place in [`TIME_ZONES`].
     TimeZone(usize),
     /// Speak this language.
@@ -1390,6 +1841,28 @@ pub enum Action {
     OpenFound(usize),
     /// Open the terminal in the folder the file manager shows.
     TerminalHere,
+    /// Empty the file manager's search field.
+    ClearFilesSearch,
+    /// Look at what an OTG drive holds, in the file manager.
+    OpenOtg,
+    /// Show Magisk, KernelSU or APatch and its modules.
+    OpenMagisk,
+    /// Read the root solution and its modules again.
+    ReadMagisk,
+    /// Turn the module at this place on or off.
+    ToggleMagiskModule(usize),
+    /// Mark the module at this place for removal.
+    RemoveMagiskModule(usize),
+    /// Open the module repository in the browser.
+    MagiskRepo,
+    /// Install a module zip from Skyward's download folder.
+    InstallMagiskModule,
+    /// Open the file manager to choose a module zip.
+    MagiskPickZip,
+    /// Ask GitHub for the newest Magisk release.
+    CheckMagiskUpdate,
+    /// Download the newest Magisk package and begin installing it.
+    MagiskDownload,
     /// Open the entry at this place in a place's folder: a folder to look
     /// in, or the file to install.
     ChooseEntry(usize),
@@ -1409,6 +1882,11 @@ pub enum Action {
     EditEntry,
     /// Install the file the file page shows.
     InstallEntry,
+    /// Choose a package in this place for the queue rather than to install
+    /// it at once.
+    QueuePick(Place),
+    /// Take the package at this place in the queue off it.
+    QueueDrop(usize),
     /// Write the file the editor page shows as it now stands.
     SaveText,
     /// Open the page of the permissions of the entry the file page shows.
@@ -1445,6 +1923,77 @@ pub enum Action {
     AddNetwork,
     /// Type into this field of the page that adds a network.
     TypeInto(Field),
+    /// Open the browser's address field.
+    BrowserAddress,
+    /// Read the address typed in the browser's field, or search for it.
+    BrowserGo,
+    /// Read `url` in the browser, from the sites it offers.
+    BrowserTo(&'static str),
+    /// Read the link the page's part `i` holds, or save the file it offers.
+    BrowserLink(usize),
+    /// Read the address at this place in the browser's history.
+    BrowserHistory(usize),
+    /// Save the file the browser is looking at.
+    BrowserSaveFile,
+    /// Stop saving the file under way.
+    BrowserStopDownload,
+    /// Read the page before this one.
+    BrowserBack,
+    /// Read the page after going back.
+    BrowserForward,
+    /// Read the page shown again.
+    BrowserReload,
+    /// Show the browser's start page.
+    BrowserHome,
+    /// Show the files the browser has saved.
+    BrowserDownloads,
+    /// Change the full-mode page's zoom.
+    BrowserZoomOut,
+    BrowserZoomIn,
+    /// Leave the plugin page and read the same address with the basic reader.
+    BrowserBasic,
+    /// Type into the page's focused field with the recovery keyboard.
+    BrowserKeyboard,
+    /// Load the current address, or the full-mode home, in full mode.
+    BrowserFullLoad,
+    /// Open, or install, the file the browser saved at this place.
+    BrowserOpenDownload(usize),
+    /// Empty the browser's address field.
+    BrowserClearAddress,
+    /// Show the open pages.
+    BrowserTabs,
+    /// Open a fresh start page in a new tab.
+    BrowserNewTab,
+    /// Show the tab at this place.
+    BrowserPickTab(usize),
+    /// Close the tab at this place.
+    BrowserCloseTab(usize),
+    /// Edit the start page's shortcuts.
+    BrowserQuick,
+    /// Open the shortcut at this place.
+    BrowserQuickOpen(usize),
+    /// Take the shortcut at this place away.
+    BrowserQuickRemove(usize),
+    /// Add the page shown as a shortcut.
+    BrowserQuickAdd,
+    /// Put the shortcuts back as they started.
+    BrowserQuickReset,
+    /// Type into the page's form field `field` of form `form`.
+    BrowserFormField(usize, usize),
+    /// Send the page's form `i`.
+    BrowserFormSubmit(usize),    /// Show the optional full browser plugin.
+    BrowserFull,
+    /// Download and unpack the full browser plugin.
+    BrowserPluginInstall,
+    /// Start the full browser plugin.
+    BrowserPluginStart,
+    /// Tap the page the full browser plugin drew, at this point of it, in
+    /// tenths of a percent across and down.
+    BrowserPluginTap(u16, u16),
+    /// Stop the full browser plugin.
+    BrowserPluginStop,
+    /// Take the full browser plugin away.
+    BrowserPluginRemove,
     /// Open the protections a network added by hand can have.
     ChooseSecurity,
     /// Take this protection, and close the list.
@@ -1720,6 +2269,74 @@ impl Frame {
     }
 }
 
+/// What the bootloader message in misc asks for, as the runtime read it for
+/// the page that shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Starter {
+    /// The command the bootloader acts on, such as `boot-recovery`. Empty
+    /// where nothing is pending.
+    pub command: String,
+    /// The one piece of work that command and its arguments add up to.
+    pub asks: Asking,
+    /// Why the system asked, in its own words, such as `fs_mgr_mount_all`.
+    pub reason: Option<String>,
+    /// The arguments as they were written, for reading in full.
+    pub args: Vec<String>,
+}
+
+impl Starter {
+    /// Whether misc holds anything for the bootloader to act on.
+    pub fn pending(&self) -> bool {
+        !self.command.is_empty()
+    }
+}
+
+/// The work a bootloader message asks for, named so the page can say it in
+/// the reader's own language.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Asking {
+    /// Nothing: recovery starts on its own pages.
+    #[default]
+    Nothing,
+    /// The recovery's userspace fastboot.
+    Fastboot,
+    /// Install the update package at this path.
+    Update(String),
+    /// Erase all user data, made afresh as this filesystem where one is
+    /// named.
+    WipeData { reformat: Option<String> },
+    /// Say that Android cannot start, and offer to erase all user data.
+    PromptWipeData,
+    /// Erase the cache partition.
+    WipeCache,
+    /// Erase the phone by the wipe package the system left behind.
+    WipeAb,
+    /// Wait for a package over `adb sideload`.
+    Sideload,
+    /// Wait for `adb rescue` on a computer.
+    Rescue,
+    /// Undo the sharing of blocks so the partitions can be written to.
+    Unshare,
+    /// Start the system at once.
+    Exit,
+    /// Work the recovery does not do, as it was asked.
+    Unsupported(String),
+}
+
+/// A package waiting its turn behind the one being installed, in the order
+/// the packages were chosen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Queued {
+    /// What the page calls it: the file's own name.
+    pub name: String,
+    /// Where it is.
+    pub path: String,
+    /// How big it is, which the page says before it is opened.
+    pub size: u64,
+    /// Where it came from, which the install page says beside it.
+    pub source: Source,
+}
+
 /// Choices the pages show and the user changes, and where installing
 /// stands.
 #[derive(Clone, Debug, PartialEq)]
@@ -1746,6 +2363,11 @@ pub struct State {
     /// The time zone the clock and the times on the pages keep, by its
     /// place in [`TIME_ZONES`].
     pub time_zone: usize,
+    /// The day and the day of the week the AOD shows under the clock, as
+    /// [`fmt::aod_date`] wrote them last.
+    pub aod_date: String,
+    /// The look of the AOD's clock.
+    pub aod_style: AodStyle,
     pub vibrate: bool,
     /// How strongly the motor taps, from 0 at the slider's left end to 1
     /// at its right.
@@ -1784,11 +2406,27 @@ pub struct State {
     pub pattern: Vec<usize>,
     /// How far the swipe-to-confirm knob is dragged, 0 to 1.
     pub confirm: f32,
+    /// The slide that asked what it was about to do, and whose second slide
+    /// does it. Only the actions that can leave the phone unable to start, or
+    /// take data that cannot come back, are slid twice.
+    pub armed: Option<Confirm>,
     pub install: Install,
     /// Where the package being installed comes from.
     pub source: Source,
     /// The name of the file being installed, when it is one on the phone.
     pub package_name: Option<String>,
+    /// The packages waiting to be installed, in the order they were chosen.
+    /// The one being installed is not among them.
+    pub queue: Vec<Queued>,
+    /// Whether the package being chosen from a place goes on the queue
+    /// rather than starting at once.
+    pub queue_picking: bool,
+    /// Whether the queue is actively running (i.e. started by the user
+    /// choosing "install queue", not by a standalone install). A normal
+    /// install must not advance a queue that the user never started.
+    pub queue_active: bool,
+    /// The package whose install failed, which stopped the queue there.
+    pub queue_stopped: Option<String>,
     /// What the install script last run showed, its latest lines.
     pub script_output: Vec<String>,
     /// A zip's install script runs only if the zip was signed with one of
@@ -1833,14 +2471,25 @@ pub struct State {
     pub restore: Option<(BackupEntry, [bool; 4])>,
     /// Backing up or restoring under way, or how it last ended.
     pub backup_job: Option<BackupJob>,
-    /// Which logs to export: the recovery's, the kernel's.
-    pub logs: [bool; 2],
+    /// Which logs to export: recovery, kernel, basic browser and full mode.
+    pub logs: [bool; 4],
     /// Where the logs go: 0 for the temporary folder, 1 for internal
     /// storage.
     pub logs_to: usize,
     /// What the phone's boot control holds of the slots, as the runtime
     /// last read it for the slot or reboot page, or why it could not.
     pub boot_slots: Option<Result<BootSlots, String>>,
+    /// What the bootloader made of those flags when the phone last started:
+    /// `enforcing`, `disabled`, or whatever else it calls it. A change to the
+    /// flags shows here only once the phone starts again.
+    pub verity: Option<String>,
+    /// The last change the AVB page made, block by block, or why it made
+    /// none.
+    /// What the bootloader message in misc asks for, as the runtime last
+    /// read it for its page, or why it could not be read.
+    pub starter: Option<Result<Starter, String>>,
+    /// How taking that message away went, where the page was used to.
+    pub starter_cleared: Option<Result<(), String>>,
     /// The slot picked on the slot page to start next; with none picked,
     /// the page shows the one the boot control starts next.
     pub next_slot: Option<Slot>,
@@ -1916,6 +2565,10 @@ pub struct State {
     /// of the drive.
     pub usb_drive: Option<UsbDrive>,
     pub drive: Folder,
+    /// Magisk, KernelSU or APatch and its modules.
+    pub magisk: Magisk,
+    /// The file manager is choosing a module zip for the Magisk page.
+    pub magisk_pick: bool,
     /// The entry the file page describes.
     pub file: Option<FileRow>,
     pub fastboot: Fastboot,
@@ -1955,6 +2608,9 @@ pub struct State {
     /// The WLAN, as the runtime last told it; none on a phone whose WLAN the
     /// recovery does not bring up.
     pub wlan: Option<Wlan>,
+    /// The LocalSend endpoint, as the runtime last told it. It starts off
+    /// until its switch is turned on.
+    pub local_send: LocalSendStatus,
     /// The network the password page is for, and what is typed there.
     pub joining: Option<Network>,
     /// The network the details page is of, as it was found.
@@ -1995,6 +2651,9 @@ pub struct State {
     /// The networks whose passwords the phone keeps, as the runtime last
     /// read them: what the WLAN page offers to forget one of.
     pub saved: Vec<SavedNetwork>,
+    /// The web page, where the browser stands, what it has saved, and the
+    /// form and cookies it keeps.
+    pub browser: Browser,
 }
 
 /// A copy of the slot's vbmeta image kept somewhere that outlives a start,
@@ -2027,6 +2686,8 @@ impl Default for State {
             avb: None,
             avb_pending: None,
             avb_notice: None,
+            aod_date: String::new(),
+            aod_style: AodStyle::Digits,
             lang: Lang::Hans,
             language_chosen: false,
             dark: false,
@@ -2051,9 +2712,14 @@ impl Default for State {
             phone_logs: 0,
             pattern: Vec::new(),
             confirm: 0.0,
+            armed: None,
             install: Install::Idle,
             source: Source::Computer,
             package_name: None,
+            queue: Vec::new(),
+            queue_picking: false,
+            queue_active: false,
+            queue_stopped: None,
             script_output: Vec::new(),
             check_signature: false,
             recovery_partitions: false,
@@ -2071,9 +2737,12 @@ impl Default for State {
             backups: Vec::new(),
             restore: None,
             backup_job: None,
-            logs: [true, true],
+            logs: [true, true, true, true],
             logs_to: 0,
             boot_slots: None,
+            verity: None,
+            starter: None,
+            starter_cleared: None,
             next_slot: None,
             dual_boot: false,
             systems: None,
@@ -2099,6 +2768,8 @@ impl Default for State {
             storage: Folder::new(""),
             usb_drive: None,
             drive: Folder::new(""),
+            magisk: Magisk::default(),
+            magisk_pick: false,
             file: None,
             fastboot: Fastboot { running: false, link: UsbLink::Unplugged },
             erase: Erase::default(),
@@ -2116,6 +2787,7 @@ impl Default for State {
             part_work: None,
             update: Standing::None,
             wlan: None,
+            local_send: LocalSendStatus::default(),
             joining: None,
             details: None,
             adding: None,
@@ -2134,6 +2806,7 @@ impl Default for State {
             avb_confirming: false,
             forget_pending: None,
             saved: Vec::new(),
+            browser: Browser::default(),
         }
     }
 }
@@ -2207,12 +2880,13 @@ impl State {
         self.skyward_job.as_ref().is_some_and(|j| j.outcome.is_none())
     }
 
-    /// Whether the phone has the page `screen`: the WLAN page where the
-    /// recovery brings the phone's WLAN up, and updating Skyward where the
-    /// phone also keeps its recovery in a partition of each slot.
+    /// Whether the phone has the page `screen`: the WLAN page and the
+    /// LocalSend page it leads to where the recovery brings the phone's WLAN
+    /// up, and updating Skyward where the phone also keeps its recovery in a
+    /// partition of each slot.
     pub fn offers(&self, screen: Screen) -> bool {
         match screen {
-            Screen::Wlan => self.wlan.is_some(),
+            Screen::Wlan | Screen::LocalSend => self.wlan.is_some(),
             Screen::SkywardUpdate => self.wlan.is_some() && self.recovery_partitions,
             Screen::Systems => self.dual_boot,
             _ => true,
@@ -2324,6 +2998,12 @@ pub enum Effect {
     /// Read what the boot control holds of the slots, telling it with
     /// [`App::set_boot_slots`].
     ReadSlots,
+    /// Read what the bootloader message in misc asks for, telling it with
+    /// [`App::set_starter`].
+    ReadStarter,
+    /// Take that message away so the next start follows the bootloader's own
+    /// reason, telling how it went with [`App::starter_cleared`].
+    ClearStarter,
     /// Have the bootloader start this slot next, telling how it went with
     /// [`App::slot_switched`].
     SetSlot(Slot),
@@ -2349,6 +3029,20 @@ pub enum Effect {
     /// telling what it found with [`App::found_files`] against search `generation`
     /// so that an answer to a query already typed over is dropped.
     FindFiles { root: String, query: String, generation: u64, sort: SortKey },
+    /// Read a folder of the OTG drive, taking the USB port as host first.
+    ReadUsbDir(String),
+    /// Read the root solution and its modules.
+    ReadMagisk,
+    /// Turn a module on or off.
+    ToggleMagisk { id: String, path: String, enabled: bool },
+    /// Mark a module for removal.
+    RemoveMagisk { id: String, path: String },
+    /// Install the module zip at this path.
+    InstallMagiskModule(String),
+    /// Ask GitHub for the newest Magisk release.
+    CheckMagiskUpdate,
+    /// Download the newest Magisk package.
+    DownloadMagisk,
     /// List the folder at this path from the top of a place, to choose a
     /// file to install in, telling what it holds with [`App::set_place`].
     ReadPlace(Place, String),
@@ -2423,10 +3117,37 @@ pub enum Effect {
     /// making the data partition afresh as another filesystem is a factory
     /// reset, which tells as erasing tells.
     Filesystem { name: String, action: FsAction },
-    /// Save the logs chosen, the recovery's own and the kernel's, into a
-    /// folder of their own in internal storage or the temporary folder,
-    /// saying where with [`App::report`].
-    ExportLogs { recovery: bool, kernel: bool, storage: bool },
+    /// Save the logs chosen, the recovery's own, the kernel's, the browser's
+    /// basic log and the full mode's, into a folder of their own in internal
+    /// storage or the temporary folder, saying where with [`App::report`].
+    ExportLogs { recovery: bool, kernel: bool, browser: bool, full: bool, storage: bool },
+    /// Read the page at this address in the browser, sending the cookies
+    /// kept for it.
+    BrowserOpen { url: String, cookie: Option<String> },
+    /// Send the page's form.
+    BrowserSubmit { url: String, fields: Vec<(String, String)>, post: bool, cookie: Option<String> },
+    /// Save the file at this address to this path, telling how far it has
+    /// come with [`App::browser_saved`] and how it ended with
+    /// [`App::browser_save_ended`].
+    BrowserDownload { url: String, name: String, path: String },
+    /// Stop reading the page, or saving the file, under way.
+    StopBrowser,
+    /// Download and unpack the full browser plugin.
+    BrowserPluginInstall { archive: String, dir: String },
+    /// Start the full browser plugin, which writes the page to `out`.
+    BrowserPluginStart { dir: String, url: String, out: String },
+    /// Tap the persistent full-mode page.
+    BrowserPluginTap { x: u16, y: u16 },
+    /// Pinch the persistent full-mode page.
+    BrowserPluginPinch { scale: f64 },
+    /// Type into the focused field of the persistent full-mode page.
+    BrowserPluginText(String),
+    /// Reload the persistent full-mode page.
+    BrowserPluginReload,
+    /// Stop the full browser plugin.
+    BrowserPluginStop,
+    /// Take the full browser plugin away.
+    BrowserPluginRemove { dir: String },
     /// Back up the parts ticked, by their place in [`BACKUP_PARTS`], into
     /// a folder of their own in `place`, telling how it goes with
     /// [`App::backup_started`], [`App::backup_plan`], [`App::backup_at`]
@@ -2451,6 +3172,9 @@ pub enum Effect {
     ScanWlan,
     JoinWlan { ssid: Vec<u8>, name: String, security: Security, password: Secret },
     LeaveWlan,
+    /// Start or stop the LocalSend endpoint; how it stands comes back with
+    /// [`App::set_local_send`].
+    LocalSend(bool),
     /// Ask the update server for the newest system, telling what it
     /// answered with [`App::update_checked`].
     CheckUpdate,
@@ -2512,6 +3236,11 @@ enum Drag {
     /// A finger that landed just after the panel lit; nothing it does
     /// counts until it lifts.
     Waking,
+    /// A finger on the glass of the AOD, from the `y` it came down at;
+    /// swiped up far enough, it lights the panel.
+    /// Waiting for the AOD to be wired into the panel loop.
+    #[expect(dead_code)]
+    Aod { y: f32 },
 }
 
 /// Where the keys are on a page.
@@ -3024,6 +3753,10 @@ pub struct App {
     /// A swipe-to-confirm control whose knob the power key moved, to draw
     /// again with the page.
     knob: Option<(Confirm, Rect)>,
+    /// Whether the knob of a swipe-to-confirm control has already tapped
+    /// the motor for the drag it is in: it taps once as the knob passes
+    /// the point where letting go does the thing, not on every step.
+    confirm_ticked: bool,
     /// The slider lit takes the volume keys, until the power key lets it
     /// go.
     adjusting: bool,
@@ -3083,6 +3816,13 @@ pub struct App {
     /// while other pages show.
     term: Option<Term>,
     display_on: bool,
+    /// Settings the user has changed since the owner's storage was last
+    /// written; the write comes a moment after the last change.
+    settings_dirty: bool,
+    /// When a pending settings write matures.
+    /// Waiting for the AOD page to go through it.
+    #[expect(dead_code)]
+    settings_due_at: Option<u64>,
     /// When the screen was last touched or a key pressed; set on the first
     /// tick, so the time before the UI started does not count.
     active: Option<u64>,
@@ -3154,6 +3894,26 @@ pub struct App {
     /// How round the screen's corners are, in pixels.
     corners: f32,
     dirty: bool,
+    /// The double tap that lights a dark panel.
+    double_tap: DoubleTap,
+    /// How far a finger has swiped up on the dark glass, in pixels, while
+    /// it is still down: the face follows it, and the page comes up where
+    /// the finger has brought it.
+    aod_drag: Option<f32>,
+    /// When the power key went down, while a three-second hold is weighed
+    /// against a short press.
+    power_down_at: Option<u64>,
+    /// This hold has already opened the menu: its release does nothing.
+    power_menu_spent: bool,
+    /// A short press on a lit panel owes it a screen-off, paid when the key
+    /// comes up so a three-second hold never darkens the panel first.
+    power_pending_off: bool,
+    /// The power menu is up over the page.
+    power_menu: bool,
+    /// The page blurred behind the menu, worked out once as it opens.
+    power_bg: Option<Canvas>,
+    /// The pill a finger is dragging, if any.
+    power_drag: Option<powermenu::Drag>,
     w: u32,
     h: u32,
     px_per_dp: f32,
@@ -3162,6 +3922,8 @@ pub struct App {
 impl App {
     pub fn new(start: Screen, w: u32, h: u32, px_per_dp: f32) -> Self {
         App {
+            settings_dirty: false,
+            settings_due_at: None,
             state: State::default(),
             stack: vec![(start, 0.0, Focus::Unset)],
             frame: None,
@@ -3173,6 +3935,7 @@ impl App {
             chord: None,
             seek: None,
             knob: None,
+            confirm_ticked: false,
             adjusting: false,
             height: 0.0,
             drawn: Vec::new(),
@@ -3223,6 +3986,14 @@ impl App {
             preview: None,
             corners: 0.0,
             dirty: true,
+            double_tap: DoubleTap::new(),
+            aod_drag: None,
+            power_down_at: None,
+            power_menu_spent: false,
+            power_pending_off: false,
+            power_menu: false,
+            power_bg: None,
+            power_drag: None,
             w,
             h,
             px_per_dp,
@@ -3233,6 +4004,17 @@ impl App {
     /// leading corners of a page sliding over another.
     pub fn set_screen_corners(&mut self, radius: f32) {
         self.corners = radius;
+    }
+
+    /// Whether a double tap on the dark panel should light it. The runtime
+    /// keeps the touch controller powered while this is so.
+    pub fn double_tap_wake(&self) -> bool {
+        self.state.double_tap
+    }
+
+    /// Whether the power menu is up over the page.
+    pub fn power_menu_open(&self) -> bool {
+        self.power_menu
     }
 
     pub fn theme(&self) -> Theme {
@@ -3258,6 +4040,17 @@ impl App {
     /// Whether the panel needs a new frame since the last call.
     pub fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
+    }
+
+    /// How far a finger has swiped up on the dark glass, in pixels, while
+    /// it is still down; none when no finger is on it.
+    ///
+    /// The face on the dark glass follows the finger: it is drawn as far
+    /// up as the finger has come, and fades as it goes, so that the
+    /// panel comes up where the finger has brought it and not all at
+    /// once.
+    pub fn aod_drag(&self) -> Option<f32> {
+        self.aod_drag
     }
 
     /// When time next has to pass through [`App::tick`]: at once while
@@ -3299,7 +4092,10 @@ impl App {
         };
         let blink = self.blink_at(now).filter(|_| self.display_on).map(|(_, next)| next);
         let chord = self.chord.map(|(_, at)| at + CHORD_MS);
-        [self.toast.as_ref().map(|t| t.1), easing, self.idle_due(), held, repeat, blink, darkens, chord].into_iter().flatten().min()
+        // A power key being held has to wake the loop at the three-second
+        // mark even when nothing else is due and the panel is dark.
+        let power = self.power_down_at.filter(|_| !self.power_menu_spent).map(|at| at + POWER_MENU_MS);
+        [self.toast.as_ref().map(|t| t.1), easing, self.idle_due(), held, repeat, blink, darkens, chord, power].into_iter().flatten().min()
     }
 
     /// Whether a text field's cursor shows at `now`, and when it next turns;
@@ -3340,6 +4136,16 @@ impl App {
     /// deadline goes away.
     pub fn tick(&mut self, now: u64) -> Vec<Effect> {
         let mut fx = Vec::new();
+        // Held three seconds, the power key opens the menu. The hold is
+        // judged on time passing rather than on a release, so the panel
+        // comes up at the third second, not whenever the finger happens to
+        // lift. Nothing is asked of the runtime: this only changes a layer.
+        if !self.power_menu_spent && self.power_down_at.is_some_and(|at| now >= at + POWER_MENU_MS) {
+            self.power_menu_spent = true;
+            self.power_pending_off = false;
+            self.wake(now);
+            self.open_power_menu(now);
+        }
         // The key waiting for its partner in a screenshot, left alone long
         // enough, does what it does alone.
         if self.chord.is_some_and(|(_, at)| now >= at + CHORD_MS) {
@@ -3645,6 +4451,9 @@ impl App {
         self.darkening = self.panel(now);
         self.curtain.set(false, now);
         self.display_on = false;
+        self.power_menu = false;
+        self.power_bg = None;
+        self.power_drag = None;
         self.bright = full_brightness();
         match std::mem::replace(&mut self.drag, Drag::Idle) {
             Drag::Confirm { .. } => {
@@ -4206,11 +5015,22 @@ impl App {
             return;
         }
         self.state.wlan = Some(w);
-        if matches!(self.screen(), Screen::Home | Screen::Wlan | Screen::WlanNetwork | Screen::Update | Screen::SkywardUpdate) {
+        if matches!(self.screen(), Screen::Home | Screen::Wlan | Screen::LocalSend | Screen::WlanNetwork | Screen::Update | Screen::SkywardUpdate) {
             self.refresh();
         }
         // The status bar shows the network joined over every page.
         self.dirty = true;
+    }
+
+    /// How the LocalSend endpoint stands, as the runtime last told it.
+    pub fn set_local_send(&mut self, s: LocalSendStatus) {
+        if self.state.local_send == s {
+            return;
+        }
+        self.state.local_send = s;
+        if matches!(self.screen(), Screen::Wlan | Screen::LocalSend) {
+            self.refresh();
+        }
     }
 
     /// How fast data went over the network joined in the last second, which
@@ -4485,10 +5305,30 @@ impl App {
         self.refresh();
     }
 
+    /// What the bootloader message in misc asks for, as it was just read.
+    pub fn set_starter(&mut self, read: Result<Starter, String>) {
+        self.state.starter = Some(read);
+        self.refresh();
+    }
+
+    /// How taking the bootloader message away went, with what misc holds
+    /// then.
+    pub fn starter_cleared(&mut self, outcome: Result<(), String>, readings: Result<Starter, String>, now: u64) {
+        match &outcome {
+            Ok(()) => self.say(self.state.lang.pick(["启动指令已清除", "啟動指令已清除", "The bootloader message is gone"]), now),
+            Err(why) => {
+                let said = tr!(self.state.lang, "没有清除：{why}", "沒有清除：{why}", "Nothing was cleared: {why}");
+                self.say(&said, now);
+            }
+        }
+        self.state.starter_cleared = Some(outcome);
+        self.state.starter = Some(readings);
+        self.refresh();
+    }
+
     /// How switching the slot to start next went: what the boot control
     /// holds of the slots now, or why it did not switch.
-    pub fn slot_switched(&mut self, outcome: Result<BootSlots, String>, now: u64) {
-        match outcome {
+    pub fn slot_switched(&mut self, outcome: Result<BootSlots, String>, now: u64) {        match outcome {
             Ok(slots) => {
                 self.state.next_slot = None;
                 self.state.boot_slots = Some(Ok(slots));
@@ -4631,6 +5471,36 @@ impl App {
     /// and one shown while its page is up is read at once. The backups
     /// listed are looked for again, and a backup on a drive gone leaves its
     /// page.
+    /// The root solution and modules the runtime read.
+    pub fn set_magisk(&mut self, root: MagiskRoot, modules: Result<Vec<MagiskModule>, String>) {
+        let version = self.state.magisk.version.clone();
+        let latest = self.state.magisk.latest.clone();
+        self.state.magisk = Magisk { root, modules: Some(modules), version, latest };
+        if self.screen() == Screen::Magisk {
+            self.refresh();
+        }
+    }
+
+    pub fn set_magisk_version(&mut self, version: Option<String>) {
+        self.state.magisk.version = version;
+        if self.screen() == Screen::Magisk {
+            self.refresh();
+        }
+    }
+
+    pub fn set_magisk_latest(&mut self, latest: Option<String>) {
+        self.state.magisk.latest = latest;
+        if self.screen() == Screen::Magisk {
+            self.refresh();
+        }
+    }
+
+    /// Begin installing a package the runtime downloaded for the Magisk page.
+    pub fn install_downloaded(&mut self, path: String, size: u64, now: u64) -> Vec<Effect> {
+        self.install_opened(path, size, now)
+    }
+
+    /// The root solution and its modules.
     pub fn set_usb_drive(&mut self, drive: Option<UsbDrive>) -> Vec<Effect> {
         if drive == self.state.usb_drive {
             return Vec::new();
@@ -4792,6 +5662,10 @@ impl App {
     /// it scrolls into view; that done, make the About page field's dither,
     /// for that page to open without making it. Whether any is left to do.
     pub fn draw_ahead(&mut self, f: &Fonts, info: &DeviceInfo) -> bool {
+        if !self.display_on {
+            // The AOD is on the panel: no page is drawn ahead of time.
+            return false;
+        }
         let Some(frame) = &self.frame else { return false };
         let (held, h) = (frame.canvas.held(), frame.canvas.h);
         if self.cols < self.w {
@@ -4883,6 +5757,11 @@ impl App {
     /// while a cable has just gone in, both as dark as the content stands
     /// as the panel goes off or comes up.
     pub fn compose(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64) {
+        if self.power_menu {
+            self.compose_power_menu(out, f, info, clock, now);
+            out.dim(self.curtain.level(now));
+            return;
+        }
         let charge = self.charging.as_ref().map_or(0.0, |c| c.shown.level(now));
         if charge < 1.0 {
             self.compose_page(out, f, info, clock, now);
@@ -4891,6 +5770,79 @@ impl App {
             self.compose_charging(out, f, info, charge, now);
         }
         out.dim(self.curtain.level(now));
+    }
+
+    /// Put the power menu up over whatever page was showing. The page
+    /// itself is left alone: nothing is pushed, nothing is popped.
+    fn open_power_menu(&mut self, now: u64) {
+        self.power_menu = true;
+        self.power_bg = None;
+        self.power_drag = None;
+        self.double_tap.reset();
+        self.drop_button();
+        self.chord = None;
+        self.drag = Drag::Idle;
+        self.dirty = true;
+        self.stir(now);
+    }
+
+    fn close_power_menu(&mut self, now: u64) {
+        self.power_menu = false;
+        self.power_bg = None;
+        self.power_drag = None;
+        self.dirty = true;
+        self.refresh();
+        self.stir(now);
+    }
+
+    /// The page the menu covers is blurred once, when the menu opens, and
+    /// kept: the page cannot change while the menu is up, and a Gaussian
+    /// convolution of the whole panel is far too much work for every frame.
+    fn compose_power_menu(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64) {
+        if self.power_bg.is_none() {
+            let mut page = Canvas::new(out.w, out.h);
+            self.compose_page(&mut page, f, info, clock, now);
+            let mut bg = blur::gaussian(&page);
+            powermenu::tint(&mut bg);
+            self.power_bg = Some(bg);
+        }
+        out.lay(self.power_bg.as_ref().expect("drawn above"), 0, 0, 1.0);
+        let (t, l) = (self.theme(), self.state.lang);
+        let g = powermenu::geometry(&t.m);
+        powermenu::draw(out, &t, f, l, &g, self.power_drag);
+    }
+
+    /// A finger on the menu works one pill at a time. Let go past the
+    /// threshold, the pill's target goes to the runtime as it always does
+    /// from the reboot page. A press outside the pills sends the menu away.
+    fn touch_power_menu(&mut self, ev: Touch, now: u64) -> Vec<Effect> {
+        self.stir(now);
+        let g = powermenu::geometry(&self.theme().m);
+        match ev {
+            Touch::Down(x, y) => match powermenu::hit(&g, x, y) {
+                Some(index) => {
+                    self.power_drag = Some(powermenu::Drag { index, progress: 0.0 });
+                    self.dirty = true;
+                }
+                None => self.close_power_menu(now),
+            },
+            Touch::Move(x, _) => {
+                if let Some(mut d) = self.power_drag {
+                    d.progress = powermenu::progress(&g, d.index, x);
+                    self.power_drag = Some(d);
+                    self.dirty = true;
+                }
+            }
+            Touch::Up => {
+                let done = self.power_drag.take().filter(|d| d.progress >= powermenu::CONFIRM_AT);
+                self.dirty = true;
+                if let Some(d) = done {
+                    self.close_power_menu(now);
+                    return vec![Effect::Reboot(powermenu::CHOICES[d.index].target())];
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// The charging screen, `level` of the way over the page drawn on `out`.
@@ -5395,6 +6347,121 @@ impl App {
         self.caret_shown
     }
 
+    /// Draw the AOD the sleeping panel shows: the day, then the time in
+    /// the style the settings chose, the charge left under it, and the
+    /// hint of how to leave it, all dim on black, and all aside from where
+    /// they were the minute before, so no pixel holds the light long
+    /// enough to burn into the panel.
+    ///
+    /// `drag` is how far a finger has swiped up on the dark glass, in dp:
+    /// the face goes up with the finger and fades as it goes, so that the
+    /// panel comes up where the finger has brought it and not all at once.
+    /// None is a finger that is not on the glass.
+    pub fn compose_aod(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, drag: Option<f32>) {
+        out.fill_rect(0.0, 0.0, out.w as f32, out.h as f32, Rgba::rgb(0, 0, 0));
+        let t = self.theme();
+        let m = t.m;
+        let l = self.state.lang;
+        let (w, h) = (out.w as f32, out.h as f32);
+        let minute = clock.get(3..5).and_then(|m| m.parse::<u32>().ok()).unwrap_or(0);
+        let (dx, dy) = AOD_SPOTS[(minute as usize) % AOD_SPOTS.len()];
+        let (dx, dy) = (m.dp(dx), m.dp(dy));
+        let cx = w / 2.0 + dx;
+        let date = self.state.aod_date.clone();
+        let (hh, mm) = clock.split_once(':').unwrap_or(("00", "00"));
+        match self.state.aod_style {
+            AodStyle::Digits => {
+                let cy = h * 0.34 + dy;
+                out.text_center(&f.body, &date, cx, cy - m.dp(64.0), m.dp(16.0), AOD_DIM);
+                out.text_center(&f.title, clock, cx, cy, m.dp(88.0), AOD_INK);
+            }
+            AodStyle::Offset => {
+                out.text_center(&f.title, hh, cx - m.dp(90.0), h * 0.28 + dy, m.dp(150.0), AOD_INK);
+                out.text_center(&f.title, mm, cx + m.dp(90.0), h * 0.28 + dy + m.dp(150.0), m.dp(150.0), AOD_INK);
+                out.text_center(&f.body, &date, cx, h * 0.28 + dy + m.dp(252.0), m.dp(16.0), AOD_DIM);
+            }
+            AodStyle::Dial => {
+                let cy = h * 0.40 + dy;
+                self.aod_dial(out, f, (cx, cy, m.dp(104.0)), clock, info.battery.as_ref().map(|b| b.level));
+                out.text_center(&f.body, &date, cx, cy - m.dp(104.0) - m.dp(46.0), m.dp(16.0), AOD_DIM);
+            }
+        }
+        if let Some(battery) = &info.battery {
+            let level = battery.level;
+            let words = if battery.plugged {
+                tr!(l, "充电中 {level}%", "充電中 {level}%", "Charging {level}%")
+            } else {
+                format!("{level}%")
+            };
+            out.text_center(&f.body, &words, cx, h * 0.66 + dy, m.dp(15.0), AOD_DIM);
+        }
+        let hint = l.pick(["上滑解锁", "上滑解鎖", "Swipe up to unlock"]);
+        out.text_center(&f.body, hint, cx, h * 0.85 + dy, m.dp(13.0), AOD_FAINT);
+        // A finger on the glass takes the face up with it, and the face
+        // fades as it goes: it is leaving, and the page is coming.
+        if let Some(drag) = drag {
+            // The drag is in pixels; the threshold it is measured against
+            // is in dp, as the gesture itself is.
+            let gone = (drag / m.dp(WAKE_SWIPE_DP)).clamp(0.0, 1.0);
+            out.lift(-gone * h * 0.35, 1.0 - gone * 0.85);
+        }
+    }
+
+    /// The AOD's clock face: a ring with a subtle face, twelve marks, the
+    /// quarter hours named inside them, tapered hour and minute hands at
+    /// the time `(hh, mm)` name, and the charge left as an arc of the
+    /// battery's share just outside the ring.
+    fn aod_dial(&self, out: &mut Canvas, f: &Fonts, (cx, cy, r): (f32, f32, f32), clock: &str, level: Option<u8>) {
+        let (hh, mm) = match clock.split_once(':').and_then(|(hh, mm)| hh.parse::<f32>().ok().zip(mm.parse::<f32>().ok())) {
+            Some((hh, mm)) => (hh, mm),
+            None => return,
+        };
+        let t = self.theme();
+        let m = t.m;
+        out.fill_circle(cx, cy, r, AOD_DIM);
+        out.fill_circle(cx, cy, r - m.dp(3.0), Rgba::rgb(0x0A, 0x0A, 0x0A));
+        if let Some(level) = level.filter(|l| *l > 0) {
+            let turn = std::f32::consts::TAU;
+            out.stroke_arc(cx, cy, r + m.dp(10.0), -std::f32::consts::FRAC_PI_2, turn * f32::from(level) / 100.0, m.dp(4.0), AOD_INK);
+        }
+        // Twelve marks, longer and thicker at the quarters, and the quarter
+        // hours named inside them.
+        for i in 0..12 {
+            let a = i as f32 * std::f32::consts::FRAC_PI_6;
+            let (sx, sy) = (a.sin(), -a.cos());
+            let (px, py) = (-sy, sx);
+            let quarter = i % 3 == 0;
+            let (r0, r1, half) = if quarter {
+                (r - m.dp(14.0), r - m.dp(6.0), m.dp(2.5))
+            } else {
+                (r - m.dp(10.0), r - m.dp(6.0), m.dp(1.25))
+            };
+            out.fill_convex(
+                &[(cx + sx * r0 + px * half, cy + sy * r0 + py * half), (cx + sx * r1 + px * half, cy + sy * r1 + py * half), (cx + sx * r1 - px * half, cy + sy * r1 - py * half), (cx + sx * r0 - px * half, cy + sy * r0 - py * half)],
+                AOD_INK,
+            );
+            if quarter {
+                let n = if i == 0 { "12" } else { &i.to_string()[..] };
+                out.text_center(&f.heading, n, cx + sx * r * 0.72, cy + sy * r * 0.72, m.dp(26.0), AOD_INK);
+            }
+        }
+        // A hand, tapered from its base at the center out to its tip, at
+        // `angle` from twelve, clockwise.
+        let mut hand = |angle: f32, len: f32, base: f32, tip: f32| {
+            let (sx, sy) = (angle.sin(), -angle.cos());
+            let (px, py) = (-sy, sx);
+            out.fill_convex(
+                &[(cx - px * base, cy - py * base), (cx + sx * len + px * tip, cy + sy * len + py * tip), (cx + sx * len - px * tip, cy + sy * len - py * tip), (cx + px * base, cy + py * base)],
+                AOD_INK,
+            );
+        };
+        let turn = std::f32::consts::TAU;
+        hand(hh.rem_euclid(12.0) / 12.0 * turn + mm / 60.0 * (turn / 12.0), r * 0.48, m.dp(5.0), m.dp(1.5));
+        hand(mm / 60.0 * turn, r * 0.76, m.dp(3.5), m.dp(1.0));
+        out.fill_circle(cx, cy, m.dp(6.0), AOD_INK);
+        out.fill_circle(cx, cy, m.dp(2.0), Rgba::rgb(0x0A, 0x0A, 0x0A));
+    }
+
     /// Draw the search bar on its way between the home page and the search
     /// page; see [`Morph`].
     fn compose_morph(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64, caret_on: bool) {
@@ -5593,6 +6660,505 @@ impl App {
         self.dirty = true;
     }
 
+    /// Read what is typed in the browser's address field: an address, or a
+    /// search where it names no site. With no network joined, the WLAN page
+    /// opens to join one.
+    fn browser_go(&mut self, input: &str, now: u64) -> Vec<Effect> {
+        let l = self.state.lang;
+        if self.state.browser.full_text {
+            let text = input.trim().to_string();
+            self.state.browser.full_text = false;
+            self.state.browser.address.clear();
+            if text.is_empty() {
+                return Vec::new();
+            }
+            self.state.browser.full_progress = Some(0.2);
+            self.refresh();
+            return vec![Effect::BrowserPluginText(text)];
+        }
+        let url = skyward_net::web::address(input);
+        if url.is_empty() {
+            self.say(l.pick(["请输入网址或搜索词", "請輸入網址或搜尋詞", "Enter an address or search for something"]), now);
+            return Vec::new();
+        }
+        if !self.state.online() {
+            self.say(l.pick(["需先连接 WLAN", "需先連接 Wi-Fi", "Connect to Wi-Fi first"]), now);
+            self.open(Screen::Wlan);
+            return self.arrive_at(Screen::Wlan);
+        }
+        self.browser_read(url)
+    }
+
+    /// Put `url` in the browser's history and read it.
+    fn browser_read(&mut self, url: String) -> Vec<Effect> {
+        let url = if self.state.browser.full_active { chromium_url(&url) } else { url };
+        let full = {
+            let b = &mut self.state.browser;
+            if b.history.is_empty() {
+                b.history.push(url.clone());
+                b.at = 0;
+            } else {
+                b.history.truncate(b.at + 1);
+                if b.history.last() != Some(&url) {
+                    b.history.push(url.clone());
+                    b.at = b.history.len() - 1;
+                }
+            }
+            b.url = url.clone();
+            b.address = url.clone();
+            b.view = BrowserView::Loading(url.clone());
+            b.form.clear();
+            b.field = None;
+            if b.full_active {
+                let dir = match &b.full {
+                    BrowserFull::Ready(dir) => Some(dir.clone()),
+                    BrowserFull::Running(_) => Some("/data/media/0/Skyward/plugins/chromium".into()),
+                    _ => None,
+                };
+                if let Some(dir) = dir {
+                    b.full_shot = None;
+                    b.full_progress = Some(0.12);
+                    let out = format!("{dir}/tmp/skyward-chromium.png");
+                    Some((dir, url.clone(), out))
+                } else {
+                    b.full_active = false;
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if self.screen() == Screen::Browser {
+            self.top_mut().1 = 0.0;
+        }
+        self.refresh();
+        if let Some((dir, url, out)) = full {
+            return vec![Effect::BrowserPluginStart { dir, url, out }];
+        }
+        let cookie = self.browser_cookie(&url);
+        vec![Effect::BrowserOpen { url, cookie }]
+    }
+
+    /// Read the page at `at` in the browser's history.
+    fn browser_step(&mut self, at: usize, now: u64) -> Vec<Effect> {
+        let l = self.state.lang;
+        if self.state.browser.history.is_empty() || at >= self.state.browser.history.len() {
+            self.say(l.pick(["没有更多页面了", "沒有更多頁面了", "There's no page that way"]), now);
+            return Vec::new();
+        }
+        let url = if self.state.browser.full_active { chromium_url(&self.state.browser.history[at]) } else { self.state.browser.history[at].clone() };
+        let full = {
+            let b = &mut self.state.browser;
+            b.at = at;
+            b.url = url.clone();
+            b.address = url.clone();
+            b.view = BrowserView::Loading(url.clone());
+            b.form.clear();
+            b.field = None;
+            if b.full_active {
+                let dir = match &b.full {
+                    BrowserFull::Ready(dir) => Some(dir.clone()),
+                    BrowserFull::Running(_) => Some("/data/media/0/Skyward/plugins/chromium".into()),
+                    _ => None,
+                };
+                if let Some(dir) = dir {
+                    b.full_shot = None;
+                    b.full_progress = Some(0.12);
+                    let out = format!("{dir}/tmp/skyward-chromium.png");
+                    Some((dir, url.clone(), out))
+                } else {
+                    b.full_active = false;
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if self.screen() == Screen::Browser {
+            self.top_mut().1 = 0.0;
+        }
+        self.refresh();
+        if let Some((dir, url, out)) = full {
+            return vec![Effect::BrowserPluginStart { dir, url, out }];
+        }
+        let cookie = self.browser_cookie(&url);
+        vec![Effect::BrowserOpen { url, cookie }]
+    }
+
+    /// Save the file `url` offers under `name`, into internal storage once
+    /// it is open and the recovery's own memory where it is not.
+    fn browser_download(&mut self, url: String, name: String, now: u64) -> Vec<Effect> {
+        let l = self.state.lang;
+        if self.state.browser.downloading() {
+            self.say(l.pick(["已有文件正在下载", "已有檔案正在下載", "A file is being downloaded already"]), now);
+            return Vec::new();
+        }
+        if !self.state.online() {
+            self.say(l.pick(["需先连接 WLAN", "需先連接 Wi-Fi", "Connect to Wi-Fi first"]), now);
+            self.open(Screen::Wlan);
+            return self.arrive_at(Screen::Wlan);
+        }
+        let name = if name.trim().is_empty() { skyward_net::web::file_name(&url) } else { name };
+        let path = match self.state.data.storage_open() {
+            true => format!("/sdcard/{}/{}", skyward_net::web::FOLDER, name),
+            false => format!("/tmp/skyward-browser/{name}"),
+        };
+        let b = &mut self.state.browser;
+        b.downloads.push(BrowserDownload {
+            name: name.clone(),
+            url: url.clone(),
+            path: path.clone(),
+            size: None,
+            done: 0,
+            state: BrowserSave::Downloading { done: 0, total: None },
+        });
+        b.saving = Some(b.downloads.len() - 1);
+        self.refresh();
+        vec![Effect::BrowserDownload { url, name, path }]
+    }
+
+    /// The page or file the address held, or why nothing came back.
+    pub fn browser_opened(&mut self, opened: Result<Opened, String>) {
+        {
+            let b = &mut self.state.browser;
+            match opened {
+                Ok(Opened::Page(page)) => {
+                    let url = page.url.clone();
+                    if let Some(slot) = b.history.get_mut(b.at) {
+                        *slot = url.clone();
+                    }
+                    b.url = url.clone();
+                    b.address = url;
+                    b.form = page
+                        .forms
+                        .iter()
+                        .map(|form| form.fields.iter().map(|field| field.value.clone()).collect())
+                        .collect();
+                    for cookie in &page.cookies {
+                        b.cookies.retain(|kept: &Cookie| !(kept.name == cookie.name && kept.domain == cookie.domain && kept.path == cookie.path));
+                        b.cookies.push(Cookie {
+                            name: cookie.name.clone(),
+                            value: cookie.value.clone(),
+                            domain: cookie.domain.clone(),
+                            path: cookie.path.clone(),
+                            expires: None,
+                        });
+                    }
+                    b.view = BrowserView::Page(page);
+                    b.field = None;
+                }
+                Ok(Opened::File(file)) => {
+                    let url = file.url.clone();
+                    if let Some(slot) = b.history.get_mut(b.at) {
+                        *slot = url.clone();
+                    }
+                    b.url = url.clone();
+                    b.address = url;
+                    b.view = BrowserView::File(file);
+                }
+                Err(why) => {
+                    let url = b.url.clone();
+                    b.view = BrowserView::Failed { url, why };
+                }
+            }
+        }
+        if self.screen() == Screen::Browser {
+            self.top_mut().1 = 0.0;
+        }
+        self.refresh();
+    }
+
+    /// How far the browser's download has come.
+    pub fn browser_saved(&mut self, done: u64, total: Option<u64>) {
+        let Some(i) = self.state.browser.saving else { return };
+        let Some(d) = self.state.browser.downloads.get_mut(i) else { return };
+        d.done = done;
+        if total.is_some() {
+            d.size = total;
+        }
+        d.state = BrowserSave::Downloading { done, total };
+        if self.screen() == Screen::BrowserDownloads || (self.screen() == Screen::Browser && matches!(self.state.browser.view, BrowserView::Home)) {
+            self.refresh();
+        }
+    }
+
+    /// The browser's download ended: the page says where it went, or why it
+    /// did not.
+    pub fn browser_save_ended(&mut self, outcome: Result<u64, String>, now: u64) {
+        let Some(i) = self.state.browser.saving.take() else { return };
+        let l = self.state.lang;
+        if let Some(d) = self.state.browser.downloads.get_mut(i) {
+            let path = d.path.clone();
+            let said = match outcome {
+                Ok(size) => {
+                    d.done = size;
+                    d.size = Some(size);
+                    d.state = BrowserSave::Done;
+                    tr!(l, "已保存到 {path}", "已儲存到 {path}", "Saved to {path}")
+                }
+                Err(why) if why.to_ascii_lowercase().contains("stopped") => {
+                    d.state = BrowserSave::Stopped;
+                    l.pick(["已停止下载", "已停止下載", "Download stopped"]).to_string()
+                }
+                Err(why) => {
+                    d.state = BrowserSave::Failed(why.clone());
+                    tr!(l, "下载失败：{why}", "下載失敗：{why}", "Couldn't download it: {why}")
+                }
+            };
+            self.say(&said, now);
+        }
+        self.refresh();
+    }
+
+    fn browser_open_download(&mut self, i: usize, now: u64) -> Vec<Effect> {
+        let l = self.state.lang;
+        let Some(d) = self.state.browser.downloads.get(i) else { return Vec::new() };
+        let (name, path, size, state) = (d.name.clone(), d.path.clone(), d.done, d.state.clone());
+        match state {
+            BrowserSave::Downloading { .. } => {
+                self.say(l.pick(["正在下载，请稍候", "正在下載，請稍候", "Downloading. Wait for it to finish"]), now);
+                Vec::new()
+            }
+            BrowserSave::Done => {
+                if skyward_net::web::installable(&name) {
+                    self.install_opened(path, size, now)
+                } else {
+                    let said = tr!(l, "文件位于 {path}", "檔案位於 {path}", "The file is at {path}");
+                    self.say(&said, now);
+                    Vec::new()
+                }
+            }
+            BrowserSave::Stopped | BrowserSave::Failed(_) => {
+                self.say(l.pick(["文件尚未下载完成", "檔案尚未下載完成", "The file isn't downloaded yet"]), now);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Send the page's form `form`, with the values typed into it.
+    fn browser_submit(&mut self, form: usize, now: u64) -> Vec<Effect> {
+        let l = self.state.lang;
+        let Some(page) = self.state.browser.page() else { return Vec::new() };
+        let Some(f) = page.forms.get(form) else { return Vec::new() };
+        let mut fields = Vec::new();
+        for (i, field) in f.fields.iter().enumerate() {
+            if field.kind == skyward_net::web::FieldKind::Submit {
+                continue;
+            }
+            let value = self
+                .state
+                .browser
+                .form
+                .get(form)
+                .and_then(|v| v.get(i))
+                .cloned()
+                .unwrap_or_else(|| field.value.clone());
+            if field.name.is_empty() {
+                continue;
+            }
+            fields.push((field.name.clone(), value));
+        }
+        let url = f.action.clone();
+        let post = f.post;
+        let cookie = self.browser_cookie(&url);
+        self.state.browser.view = BrowserView::Loading(url.clone());
+        self.refresh();
+        let _ = (l, now);
+        vec![Effect::BrowserSubmit { url, fields, post, cookie }]
+    }
+
+    /// The cookies the browser keeps for `url`, in one header.
+    fn browser_cookie(&self, url: &str) -> Option<String> {
+        let pairs: Vec<(String, String, String, String)> = self
+            .state
+            .browser
+            .cookies
+            .iter()
+            .map(|c| (c.name.clone(), c.value.clone(), c.domain.clone(), c.path.clone()))
+            .collect();
+        skyward_net::web::cookie_header(&pairs, url)
+    }
+
+    /// Where the optional full browser plugin stands on disk.
+    fn browser_check_full(&mut self) {
+        let path = "/data/media/0/Skyward/plugins/chromium";
+        if !self.state.data.storage_open() {
+            self.state.browser.full = BrowserFull::Absent(
+                self.state.lang.pick(["需先解密 data 分区", "需先解密 data 分割區", "Decrypt the data partition first"]).to_string(),
+            );
+        } else if std::path::Path::new(path).join("run.sh").exists() {
+            self.state.browser.full = BrowserFull::Ready(path.to_string());
+        } else {
+            self.state.browser.full = BrowserFull::Absent(
+                self.state.lang.pick(["插件尚未安装", "外掛尚未安裝", "The plugin isn't installed"]).to_string(),
+            );
+        }
+    }
+
+    fn browser_plugin_install(&mut self, now: u64) -> Vec<Effect> {
+        let l = self.state.lang;
+        if !self.state.data.storage_open() {
+            self.say(l.pick(["请先解密 data 分区", "請先解密 data 分割區", "Decrypt the data partition first"]), now);
+            return Vec::new();
+        }
+        let dir = "/data/media/0/Skyward/plugins/chromium";
+        let archive = [
+            "/sdcard/Skyward/plugins/chromium.tar.gz",
+            "/sdcard/Download/Skyward/chromium.tar.gz",
+            "/sdcard/Skyward/plugins/chromium.zip",
+            "/sdcard/Download/Skyward/chromium.zip",
+        ]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists());
+        let Some(archive) = archive else {
+            let said = tr!(
+                l,
+                "没找到插件包，请先把它下载到 /sdcard/Skyward/plugins/chromium.tar.gz",
+                "找不到外掛包，請先將它下載到 /sdcard/Skyward/plugins/chromium.tar.gz",
+                "The plugin package isn't at /sdcard/Skyward/plugins/chromium.tar.gz"
+            );
+            self.say(&said, now);
+            return Vec::new();
+        };
+        self.state.browser.full = BrowserFull::Installing { done: 0, total: None };
+        self.state.browser.full_progress = Some(0.0);
+        self.refresh();
+        vec![Effect::BrowserPluginInstall { archive: archive.into(), dir: dir.into() }]
+    }
+
+    fn browser_plugin_start(&mut self, now: u64) -> Vec<Effect> {
+        let l = self.state.lang;
+        if !self.state.online() {
+            self.say(l.pick(["需先连接 WLAN", "需先連接 Wi-Fi", "Connect to Wi-Fi first"]), now);
+            self.open(Screen::Wlan);
+            return self.arrive_at(Screen::Wlan);
+        }
+        let url = if self.state.browser.url.is_empty() {
+            self.say(l.pick(["请先打开一个网页", "請先開啟一個網頁", "Open a page first"]), now);
+            self.open(Screen::BrowserAddress);
+            return self.arrive_at(Screen::BrowserAddress);
+        } else {
+            self.state.browser.url.clone()
+        };
+        self.browser_plugin_start_at(url, now)
+    }
+
+    fn browser_plugin_tap(&mut self, x: u16, y: u16, _now: u64) -> Vec<Effect> {
+        if self.state.browser.url.is_empty() || self.state.browser.full_shot.is_none() {
+            return Vec::new();
+        }
+        self.state.browser.full_touch = (x, y);
+        self.state.browser.full_progress = Some(0.2);
+        self.refresh();
+        vec![Effect::BrowserPluginTap { x, y }]
+    }
+
+    fn browser_plugin_start_at(&mut self, url: String, now: u64) -> Vec<Effect> {
+        let l = self.state.lang;
+        if !self.state.online() {
+            self.say(l.pick(["需先连接 WLAN", "需先連接 Wi-Fi", "Connect to Wi-Fi first"]), now);
+            self.open(Screen::Wlan);
+            return self.arrive_at(Screen::Wlan);
+        }
+        let url = chromium_url(&url);
+        let dir = match &self.state.browser.full {
+            BrowserFull::Ready(dir) => dir.clone(),
+            BrowserFull::Running(_) => "/data/media/0/Skyward/plugins/chromium".into(),
+            _ => {
+                self.say(l.pick(["插件尚未安装", "外掛尚未安裝", "The plugin isn't installed"]), now);
+                return Vec::new();
+            }
+        };
+        self.state.browser.full = BrowserFull::Running("127.0.0.1:9222".into());
+        let keep = self.state.browser.full_active && self.state.browser.full_shot.is_some();
+        self.state.browser.full_active = true;
+        if !keep {
+            self.state.browser.full_shot = None;
+            self.state.browser.view = BrowserView::Loading(url.clone());
+        }
+        self.state.browser.full_progress = Some(0.12);
+        self.state.browser.url = url.clone();
+        self.state.browser.address = url.clone();
+        let out = format!("{dir}/tmp/skyward-chromium.png");
+        if self.screen() != Screen::Browser {
+            self.open(Screen::Browser);
+        }
+        self.refresh();
+        vec![Effect::BrowserPluginStart { dir, url, out }]
+    }
+
+    fn browser_plugin_stop(&mut self) -> Vec<Effect> {
+        if let BrowserFull::Running(_) = self.state.browser.full {
+            self.state.browser.full = BrowserFull::Absent("已停止".into());
+            self.state.browser.full_progress = None;
+            self.state.browser.full_active = false;
+            self.refresh();
+        }
+        vec![Effect::BrowserPluginStop]
+    }
+
+    fn browser_plugin_remove(&mut self, now: u64) -> Vec<Effect> {
+        let _ = now;
+        let dir = "/data/media/0/Skyward/plugins/chromium";
+        self.state.browser.full = BrowserFull::Absent("插件尚未安装".into());
+        self.state.browser.full_shot = None;
+        self.state.browser.full_progress = None;
+        self.refresh();
+        vec![Effect::BrowserPluginRemove { dir: dir.into() }]
+    }
+
+    /// The plugin package was unpacked, or why it was not.
+    pub fn browser_plugin_installed(&mut self, ended: Result<(), String>) {
+        self.state.browser.full = match ended {
+            Ok(()) => BrowserFull::Ready("/data/media/0/Skyward/plugins/chromium".into()),
+            Err(why) => BrowserFull::Failed(why),
+        };
+        self.state.browser.full_progress = None;
+        self.refresh();
+    }
+
+    /// The plugin drew a page, or why it did not.
+    /// A text field on the full-mode page took focus: bring up the recovery
+    /// keyboard, so typing goes to the page rather than nowhere.
+    pub fn browser_plugin_focus(&mut self, focus: bool) {
+        if focus
+            && self.state.browser.full_active
+            && !self.state.browser.full_text
+            && self.screen() == Screen::Browser
+            && !matches!(self.state.browser.view, BrowserView::Home)
+        {
+            self.state.browser.full_text = true;
+            self.state.browser.address.clear();
+            self.state.layer = Layer::Letters;
+            self.open(Screen::BrowserAddress);
+        }
+    }
+
+    pub fn browser_plugin_shot(&mut self, shot: Result<Vec<u8>, String>) {        match shot {
+            Ok(png) => {
+                self.state.browser.full_shot = Some(png);
+                self.state.browser.full_progress = Some(1.0);
+                if self.state.browser.full_active {
+                    self.state.browser.view = BrowserView::Full;
+                    if self.screen() == Screen::BrowserAddress {
+                        self.open(Screen::Browser);
+                    }
+                }
+                if let BrowserFull::Running(at) = &self.state.browser.full {
+                    self.state.browser.full = BrowserFull::Running(at.clone());
+                }
+            }
+            Err(why) => {
+                self.state.browser.full_progress = None;
+                self.state.browser.full_active = false;
+                let url = self.state.browser.url.clone();
+                self.state.browser.view = BrowserView::Failed { url, why: why.clone() };
+                self.state.browser.full = BrowserFull::Failed(why);
+            }
+        }
+        self.refresh();
+    }
+
     /// Go back a page. Leaving the installing page stops what can be
     /// stopped; while a package is being read or written, the page stays.
     /// In the file manager, back climbs a folder until it reaches the root,
@@ -5609,6 +7175,11 @@ impl App {
         let left = self.screen();
         match left {
             Screen::Mount => self.state.mount_failure = None,
+            // What the AVB page last did is not for the page to say again
+            // once it is left.
+            Screen::Avb => self.state.avb_notice = None,
+            // Neither is what the bootloader page last did.
+            Screen::Bcb => self.state.starter_cleared = None,
             // A slot picked and not switched to is put down.
             Screen::Slot => self.state.next_slot = None,
             // So is a system; the page stays while the boot partitions are
@@ -5623,7 +7194,7 @@ impl App {
             }
             Screen::Files => {
                 if let Some(up) = self.state.files.up() {
-                    return vec![Effect::ReadDir(up)];
+                    return vec![read_dir_effect(up)];
                 }
                 // Leaving the file manager puts a picked entry down.
                 self.state.clip = None;
@@ -5657,6 +7228,20 @@ impl App {
                 self.state.password.clear();
             }
             Screen::WlanNetwork => self.state.details = None,
+            Screen::BrowserAddress => {
+                self.state.browser.address = self.state.browser.url.clone();
+            }
+            Screen::BrowserForm => {
+                self.state.browser.field = None;
+            }
+            // The system's back goes through the pages read before leaving
+            // the browser, as its own back button does.
+            Screen::Browser => {
+                if self.state.browser.at > 0 {
+                    let at = self.state.browser.at;
+                    return self.browser_step(at - 1, now);
+                }
+            }
             // A list open over the page closes first.
             Screen::WlanAdd => {
                 if let Some(a) = self.state.adding.as_mut().filter(|a| a.choosing) {
@@ -5892,6 +7477,64 @@ impl App {
         }
     }
 
+    /// The next package of the queue, where the one that just ended went
+    /// through and another waits: taken off the queue and made the one being
+    /// installed, with the path the runtime opens.
+    ///
+    /// Only advances when the queue was explicitly started by the user
+    /// (`queue_active`). A standalone (non-queued) install finishing must
+    /// not start packages sitting in the queue.
+    ///
+    /// Where the current package did not go through, the queue stops and
+    /// `queue_stopped` records the name of the package that actually failed
+    /// — the one that was just running, not the one still waiting in line.
+    pub fn queued_next(&mut self) -> Option<String> {
+        // Only advance if the queue is actively running. A normal install
+        // that happened outside the queue must not pull items off it.
+        if !self.state.queue_active {
+            return None;
+        }
+        let through = match &self.state.install {
+            Install::Finished { outcome, .. } => {
+                matches!(outcome, Outcome::Installed { .. } | Outcome::Flashed { .. } | Outcome::Ran { .. })
+            }
+            _ => return None,
+        };
+        if !through {
+            // The package that just failed is the one that was being
+            // installed — its name is in `package_name`, not the head of
+            // the waiting queue. Record that one as the stopper.
+            if let Some(name) = &self.state.package_name {
+                self.state.queue_stopped = Some(name.clone());
+            }
+            self.state.queue_active = false;
+            return None;
+        }
+        // Success: if there is another package waiting, start it. If the
+        // queue is empty, the run is complete.
+        let Some(next) = self.state.queue.first().cloned() else {
+            self.state.queue_active = false;
+            return None;
+        };
+        self.state.queue.remove(0);
+        self.state.queue_stopped = None;
+        let (path, name) = (next.path, next.name);
+        self.begin_install(Install::Checking { size: next.size, stage: None }, next.source, Some(name));
+        Some(path)
+    }
+
+    /// Take the package at `i` in the queue off it, as the install page asks
+    /// when one is dropped before the queue starts.
+    pub fn queue_dropped(&mut self, i: usize) {
+        if i < self.state.queue.len() {
+            self.state.queue.remove(i);
+            if self.state.queue.is_empty() {
+                self.state.queue_stopped = None;
+            }
+        }
+        self.refresh();
+    }
+
     /// What the page shown first asks of the runtime as it shows.
     pub fn arrive(&mut self) -> Vec<Effect> {
         self.arrive_at(self.screen())
@@ -5901,6 +7544,14 @@ impl App {
     /// started. The decrypt page opens the data partition, which is also
     /// how it learns which control a user's screen lock is answered with.
     fn arrive_at(&mut self, s: Screen) -> Vec<Effect> {
+        // A slide that asked what it was about to do is answered on the page
+        // it was made on; leaving that page puts the question down.
+        self.state.armed = None;
+        // Choosing a package for the queue is a question asked from one page
+        // and answered on another; landing anywhere else puts it down.
+        if !matches!(s, Screen::Choose(_)) {
+            self.state.queue_picking = false;
+        }
         match s {
             Screen::Avb => {
                 // Read afresh each time it opens: a zip may have flashed a
@@ -5919,10 +7570,15 @@ impl App {
                 vec![Effect::FindVbmeta { storage: true, usb: self.state.usb_drive.is_some() }, Effect::ReadAvb]
             }
             Screen::Filesystems => vec![Effect::ReadFilesystems],
+            // The tools page says beside its row whether the checks are on,
+            // so it reads them as it opens; the AVB page reads them again.
+            Screen::Advanced => vec![Effect::ReadAvb],
+            Screen::Bcb => vec![Effect::ReadStarter],
             Screen::Slot | Screen::Reboot => vec![Effect::ReadSlots],
             Screen::Systems => vec![Effect::ReadSystems],
             Screen::Restore => vec![self.find_backups()],
             Screen::Files => vec![Effect::ReadDir(self.state.files.path.clone())],
+            Screen::Magisk => vec![Effect::ReadMagisk],
             Screen::Choose(place) if self.state.place_open(place) => vec![Effect::ReadPlace(place, self.state.folder(s).path.clone())],
             Screen::Search => {
                 self.state.search.clear();
@@ -5998,7 +7654,189 @@ impl App {
                 }
                 return self.arrive_at(s);
             }
+            // The queue is built from the same places a package is installed
+            // from; what is chosen there waits instead of starting.
+            Action::QueuePick(place) => {
+                self.state.queue_picking = true;
+                self.open(Screen::Choose(place));
+                return self.arrive_at(Screen::Choose(place));
+            }
+            Action::QueueDrop(i) => {
+                self.queue_dropped(i);
+                return Vec::new();
+            }
             Action::OpenData => return self.open_data(),
+            Action::BrowserAddress => {
+                if self.screen() == Screen::BrowserAddress {
+                    return Vec::new();
+                }
+                let b = &mut self.state.browser;
+                if !b.url.is_empty() {
+                    b.address = b.url.clone();
+                }
+                self.state.layer = Layer::Letters;
+                self.open(Screen::BrowserAddress);
+            }
+            Action::BrowserClearAddress => {
+                self.state.browser.address.clear();
+                self.refresh();
+            }
+            Action::BrowserGo => {
+                let input = self.state.browser.address.clone();
+                if self.screen() == Screen::BrowserAddress {
+                    self.back(now);
+                }
+                return self.browser_go(&input, now);
+            }
+            Action::BrowserTo(url) => {
+                if self.screen() == Screen::BrowserAddress {
+                    self.back(now);
+                }
+                if self.screen() == Screen::Magisk {
+                    self.open(Screen::Browser);
+                }
+                return self.browser_go(url, now);
+            }
+            Action::BrowserHistory(at) => return self.browser_step(at, now),
+            Action::BrowserLink(i) => {
+                let block = self.state.browser.page().and_then(|p| p.blocks.get(i)).cloned();
+                if let Some(skyward_net::web::Block::Link { url, download, .. }) = block {
+                    if download {
+                        return self.browser_download(url.clone(), skyward_net::web::file_name(&url), now);
+                    }
+                    if self.screen() == Screen::BrowserAddress {
+                        self.back(now);
+                    }
+                    return self.browser_go(&url, now);
+                }
+            }
+            Action::BrowserSaveFile => {
+                if let BrowserView::File(file) = self.state.browser.view.clone() {
+                    return self.browser_download(file.url.clone(), file.name.clone(), now);
+                }
+            }
+            Action::BrowserBack => {
+                let at = self.state.browser.at;
+                if at > 0 {
+                    return self.browser_step(at - 1, now);
+                }
+                self.say(l.pick(["已到最早的一页", "已到最早的一頁", "This is the first page"]), now);
+            }
+            Action::BrowserForward => {
+                let (at, len) = (self.state.browser.at, self.state.browser.history.len());
+                if at + 1 < len {
+                    return self.browser_step(at + 1, now);
+                }
+                self.say(l.pick(["已到最新的一页", "已到最新的一頁", "This is the last page"]), now);
+            }
+            Action::BrowserZoomIn | Action::BrowserZoomOut => {
+                if self.state.browser.full_active {
+                    let up = matches!(action, Action::BrowserZoomIn);
+                    let zoom = (self.state.browser.full_zoom * if up { 1.25 } else { 0.8 }).clamp(0.5, 3.0);
+                    self.state.browser.full_zoom = zoom;
+                    self.state.browser.full_progress = Some(0.2);
+                    self.refresh();
+                    return vec![Effect::BrowserPluginPinch { scale: if up { 1.25 } else { 0.8 } }];
+                }
+            }
+            Action::BrowserBasic => {
+                self.state.browser.full_active = false;
+                self.state.browser.full_text = false;
+                let url = self.state.browser.url.clone();
+                if !url.is_empty() {
+                    return self.browser_read(url);
+                }
+                self.state.browser.view = BrowserView::Home;
+                self.refresh();
+            }
+            Action::BrowserKeyboard => {
+                if self.state.browser.full_active {
+                    self.state.browser.full_text = true;
+                    self.state.browser.address.clear();
+                    self.state.layer = Layer::Letters;
+                    self.open(Screen::BrowserAddress);
+                }
+            }
+            Action::BrowserFullLoad => {
+                let url = if self.state.browser.url.is_empty() { "https://www.bing.com/".to_string() } else { self.state.browser.url.clone() };
+                if matches!(self.state.browser.full, BrowserFull::Ready(_) | BrowserFull::Running(_)) {
+                    return self.browser_plugin_start_at(url, now);
+                }
+                self.open(Screen::BrowserFull);
+            }
+            Action::BrowserReload => {
+                if matches!(self.state.browser.view, BrowserView::Home) {
+                    self.refresh();
+                    return Vec::new();
+                }
+                if self.state.browser.full_active {
+                    self.state.browser.full_progress = Some(0.2);
+                    self.refresh();
+                    return vec![Effect::BrowserPluginReload];
+                }
+                let url = self.state.browser.url.clone();
+                if url.is_empty() {
+                    self.open(Screen::BrowserAddress);
+                } else if !self.state.online() {
+                    self.say(l.pick(["需先连接 WLAN", "需先連接 Wi-Fi", "Connect to Wi-Fi first"]), now);
+                    self.open(Screen::Wlan);
+                    return self.arrive_at(Screen::Wlan);
+                } else {
+                    return self.browser_read(url);
+                }
+            }
+            Action::BrowserHome => {
+                self.state.browser.full_active = false;
+                self.state.browser.view = BrowserView::Home;
+                self.state.browser.address.clear();
+                self.refresh();
+            }
+            Action::BrowserDownloads => self.open(Screen::BrowserDownloads),
+            Action::BrowserStopDownload => {
+                if self.state.browser.downloading() {
+                    return vec![Effect::StopBrowser];
+                }
+            }
+            Action::BrowserOpenDownload(i) => return self.browser_open_download(i, now),
+            Action::BrowserFormField(form, field) => {
+                let b = &mut self.state.browser;
+                if b.form.len() <= form {
+                    b.form.resize(form + 1, Vec::new());
+                }
+                if b.form[form].len() <= field {
+                    b.form[form].resize(field + 1, String::new());
+                }
+                b.field = Some((form, field));
+                self.state.layer = Layer::Letters;
+                self.open(Screen::BrowserForm);
+            }
+            Action::BrowserFormSubmit(form) => return self.browser_submit(form, now),
+            Action::BrowserFull => {
+                self.browser_check_full();
+                self.open(Screen::BrowserFull);
+            }
+            Action::BrowserTabs => self.open(Screen::BrowserTabs),
+            Action::BrowserNewTab => {
+                self.state.browser.new_tab();
+                self.open(Screen::Browser);
+            }
+            Action::BrowserPickTab(i) => {
+                self.state.browser.switch_tab(i);
+                self.open(Screen::Browser);
+            }
+            Action::BrowserCloseTab(i) => {
+                self.state.browser.close_tab(i);
+                self.refresh();
+            }
+            Action::BrowserQuick => self.open(Screen::BrowserQuick),
+            Action::BrowserQuickOpen(i) => {
+                if let Some(q) = self.state.browser.quick.get(i).cloned() {
+                    if self.screen() == Screen::BrowserAddress {
+                        self.back(now);
+                    }
+                    return self.browser_go(&q.url, now);
+                }
+            }
             // A user offered by name: the page asks for their screen lock,
             // as it does for the owner's.
             Action::UnlockUser(user) => {
@@ -6008,6 +7846,34 @@ impl App {
                     self.refresh();
                 }
             }
+            Action::BrowserQuickRemove(i) => {
+                if i < self.state.browser.quick.len() {
+                    self.state.browser.quick.remove(i);
+                    self.refresh();
+                }
+            }
+            Action::BrowserQuickAdd => {
+                let url = self.state.browser.url.clone();
+                if !url.is_empty() && self.state.browser.quick.iter().all(|q| q.url != url) {
+                    let title = skyward_net::web::host_of(&url);
+                    self.state.browser.quick.push(QuickLink {
+                        title,
+                        url,
+                        color: Rgba::rgb(0x34, 0x82, 0xff),
+                        icon: Icon::Globe,
+                    });
+                    self.refresh();
+                }
+            }
+            Action::BrowserQuickReset => {
+                self.state.browser.quick = default_quick();
+                self.refresh();
+            }
+            Action::BrowserPluginInstall => return self.browser_plugin_install(now),
+            Action::BrowserPluginStart => return self.browser_plugin_start(now),
+            Action::BrowserPluginTap(x, y) => return self.browser_plugin_tap(x, y, now),
+            Action::BrowserPluginStop => return self.browser_plugin_stop(),
+            Action::BrowserPluginRemove => return self.browser_plugin_remove(now),
             Action::Skip => {
                 self.leave(true);
                 if self.stack.len() > 1 {
@@ -6024,6 +7890,7 @@ impl App {
                     self.state.dark = dark;
                     self.refresh();
                 }
+                self.settings_dirty = true;
             }
             // The switch moves at once; the runtime then tells how the WLAN
             // came up, or went off.
@@ -6034,9 +7901,21 @@ impl App {
                 self.refresh();
                 return vec![Effect::Wlan(on)];
             }
+            // So does LocalSend's: the runtime starts or stops the endpoint,
+            // then tells how it stands. Starting it needs the address the
+            // joined network gave, which only the runtime holds.
+            Action::Toggle(Switch::LocalSend) => {
+                let on = matches!(self.state.local_send.phase, LocalSendPhase::Off | LocalSendPhase::Failed);
+                self.state.local_send.phase = if on { LocalSendPhase::Starting } else { LocalSendPhase::Off };
+                self.state.local_send.error = None;
+                self.refresh();
+                return vec![Effect::LocalSend(on)];
+            }
             Action::Toggle(switch) => {
                 let on = match switch {
                     Switch::Vibrate => &mut self.state.vibrate,
+                    Switch::DoubleTap => &mut self.state.double_tap,
+                    Switch::AlwaysOn => &mut self.state.always_on,
                     Switch::FileTransfer => &mut self.state.file_transfer,
                     Switch::Compress => &mut self.state.compress,
                     Switch::Verify => &mut self.state.verify,
@@ -6045,11 +7924,10 @@ impl App {
                     Switch::DisableAvb => &mut self.state.disable_avb,
                     Switch::RememberPassword => &mut self.state.remember_password,
                     Switch::ShowPassword => &mut self.state.show_password,
-                    Switch::AlwaysOn => &mut self.state.always_on,
-                    Switch::DoubleTap => &mut self.state.double_tap,
                     Switch::RememberWlan => &mut self.state.remember_wlan,
                     Switch::Mirror => &mut self.state.mirror,
                     Switch::Wlan => unreachable!("the WLAN switch is turned above"),
+                    Switch::LocalSend => unreachable!("the LocalSend switch is turned above"),
                 };
                 *on = !*on;
                 let now_on = *on;
@@ -6296,6 +8174,13 @@ impl App {
             Action::ScreenOff(k) => {
                 self.state.screen_off = k;
                 self.refresh();
+                self.settings_dirty = true;
+            }
+            Action::AodStyle => {
+                self.state.aod_style = self.state.aod_style.next();
+                self.refresh();
+                self.settings_dirty = true;
+                return Vec::new();
             }
             Action::TimeZone(k) => {
                 self.state.time_zone = k;
@@ -6314,10 +8199,14 @@ impl App {
                 self.state.backup_to = place;
                 self.refresh();
             }
-            // All a backup holds is ticked to restore at first.
+            // All a backup holds is ticked to restore at first, but only
+            // what can be put back: a kept bootloader chain is not one.
             Action::OpenBackup(i) => {
                 let entry = self.state.backups[i].clone();
-                let parts = entry.held.as_ref().map_or([false; 4], |h| h.parts);
+                let mut parts = entry.held.as_ref().map_or([false; 4], |h| h.parts);
+                for (tick, can) in parts.iter_mut().zip(BACKUP_RESTORABLE) {
+                    *tick &= can;
+                }
                 self.state.restore = Some((entry, parts));
                 self.state.asking_delete = false;
                 self.open(Screen::RestoreBackup);
@@ -6344,13 +8233,14 @@ impl App {
                 self.refresh();
             }
             Action::ExportLogs => {
-                let ([recovery, kernel], storage) = (self.state.logs, self.state.logs_to == 1);
-                if !recovery && !kernel {
+                let [recovery, kernel, browser, full] = self.state.logs;
+                let storage = self.state.logs_to == 1;
+                if !recovery && !kernel && !browser && !full {
                     self.say(l.pick(["请选择要导出的日志", "請選擇要匯出的記錄", "Choose the logs to export"]), now);
                 } else if storage && !self.state.data.storage_open() {
                     self.say(l.pick(DECRYPT_FIRST), now);
                 } else {
-                    return vec![Effect::ExportLogs { recovery, kernel, storage }];
+                    return vec![Effect::ExportLogs { recovery, kernel, browser, full, storage }];
                 }
             }
             Action::PickSlot(slot) => {
@@ -6393,7 +8283,7 @@ impl App {
                     FileKind::Folder { .. } | FileKind::Link { folder: true, .. } => {
                         let scroll = self.top().1;
                         self.state.files.leave(scroll);
-                        return vec![Effect::ReadDir(self.state.files.inside(&entry.name))];
+                        return vec![read_dir_effect(self.state.files.inside(&entry.name))];
                     }
                     FileKind::File if matches!(files::file_type(&entry.name), FileType::Text | FileType::Code) => {
                         return vec![Effect::OpenText(self.state.files.inside(&entry.name))];
@@ -6445,6 +8335,82 @@ impl App {
             }
             // A shell already running goes to the folder; otherwise one starts
             // there.
+            Action::OpenOtg => {
+                let l = self.state.lang;
+                match self.state.usb_drive.clone() {
+                    Some(UsbDrive::Shown) => {
+                        self.state.files = Folder::new(USB_DRIVE);
+                        self.open(Screen::Files);
+                        return vec![Effect::ReadUsbDir(USB_DRIVE.into())];
+                    }
+                    Some(UsbDrive::Unreadable(why)) => self.say(&why, now),
+                    None => self.say(l.pick(USB_DRIVE_WANTED), now),
+                }
+            }
+            Action::FilesSearch => {
+                self.state.files_search = true;
+                self.state.layer = Layer::Letters;
+                self.open(Screen::FilesSearch);
+            }
+            Action::ClearFilesSearch => {
+                self.state.files_search = false;
+                self.refresh();
+            }
+            Action::OpenMagisk => {
+                self.open(Screen::Magisk);
+                return vec![Effect::ReadMagisk];
+            }
+            Action::ReadMagisk => return vec![Effect::ReadMagisk],
+            Action::ToggleMagiskModule(i) => {
+                if let Some(Ok(modules)) = self.state.magisk.modules.as_ref() {
+                    if let Some(module) = modules.get(i) {
+                        return vec![Effect::ToggleMagisk {
+                            id: module.id.clone(),
+                            path: module.path.clone(),
+                            enabled: !module.enabled,
+                        }];
+                    }
+                }
+            }
+            Action::RemoveMagiskModule(i) => {
+                if let Some(Ok(modules)) = self.state.magisk.modules.as_ref() {
+                    if let Some(module) = modules.get(i) {
+                        return vec![Effect::RemoveMagisk { id: module.id.clone(), path: module.path.clone() }];
+                    }
+                }
+            }
+            Action::MagiskRepo => {
+                if self.screen() == Screen::Magisk {
+                    self.open(Screen::Browser);
+                    return self.browser_go("https://github.com/topics/magisk-module", now);
+                }
+            }
+            Action::MagiskPickZip => {
+                if !self.state.data.storage_open() {
+                    self.say(l.pick(["请先解密 data 分区", "請先解密 data 分割區", "Decrypt the data partition first"]), now);
+                } else {
+                    self.state.magisk_pick = true;
+                    self.open(Screen::Choose(Place::Storage));
+                    return vec![Effect::ReadPlace(Place::Storage, "/sdcard".into())];
+                }
+            }
+            Action::CheckMagiskUpdate => {
+                if matches!(self.state.magisk.root, MagiskRoot::Present(ref name) if name == "Magisk") {
+                    return vec![Effect::CheckMagiskUpdate];
+                }
+            }
+            Action::MagiskDownload => {
+                if self.state.magisk.latest.is_some() {
+                    return vec![Effect::DownloadMagisk];
+                }
+            }
+            Action::InstallMagiskModule => {
+                if !self.state.data.storage_open() {
+                    self.say(l.pick(["请先解密 data 分区", "請先解密 data 分割區", "Decrypt the data partition first"]), now);
+                } else {
+                    return vec![Effect::InstallMagiskModule("/sdcard/Download/Skyward/module.zip".into())];
+                }
+            }
             Action::TerminalHere => {
                 let folder = self.state.files.path.clone();
                 let running = self.term.as_ref().is_some_and(|term| term.running);
@@ -6462,6 +8428,10 @@ impl App {
                 let folder = self.state.folder(screen);
                 let Some(entry) = folder.entry(i).cloned() else { return Vec::new() };
                 let path = folder.inside(&entry.name);
+                if self.state.magisk_pick && entry.name.to_lowercase().ends_with(".zip") {
+                    self.state.magisk_pick = false;
+                    return vec![Effect::InstallMagiskModule(path)];
+                }
                 match entry.kind {
                     FileKind::Folder { .. } | FileKind::Link { folder: true, .. } => {
                         let scroll = self.top().1;
@@ -6672,12 +8642,6 @@ impl App {
                 }
                 return vec![Effect::ReadDir(self.state.files.path.clone())];
             }
-            Action::FilesSearch => {
-                if !self.state.files_search {
-                    self.state.files_search = true;
-                    self.refresh();
-                }
-            }
             Action::CloseFilesSearch => {
                 if self.state.files_search {
                     self.state.files_search = false;
@@ -6782,6 +8746,11 @@ impl App {
                     Field::Password => &mut self.state.password,
                 }
             }
+            Screen::BrowserAddress => &mut self.state.browser.address,
+            Screen::BrowserForm => {
+                let (form, field) = self.state.browser.field.expect("the form page has a field");
+                &mut self.state.browser.form[form][field]
+            }
             s => panic!("{s:?} has no text field"),
         }
     }
@@ -6831,6 +8800,20 @@ impl App {
     /// the runtime to, its page following how it goes; one install at a
     /// time.
     fn install_named(&mut self, source: Source, name: Option<String>, size: u64, start: Effect, now: u64) -> Vec<Effect> {
+        // A package chosen while the queue is being built waits its turn
+        // instead of starting: the install page then shows the queue and
+        // begins it when asked.
+        let start = match start {
+            Effect::InstallPath(path) if self.state.queue_picking => {
+                let called = name.unwrap_or_else(|| path.rsplit('/').next().unwrap_or(&path).to_string());
+                self.state.queue.push(Queued { name: called, path, size, source });
+                self.state.queue_picking = false;
+                self.state.queue_stopped = None;
+                self.open(Screen::Install);
+                return Vec::new();
+            }
+            other => other,
+        };
         match self.state.install {
             Install::Idle | Install::Finished { .. } => {
                 self.begin_install(Install::Checking { size, stage: None }, source, name);
@@ -6877,7 +8860,13 @@ impl App {
         let Data::Locked { user, keys, .. } = self.state.data else { unreachable!("only a screen lock waiting takes what is entered") };
         self.state.data = Data::Locked { user, keys, checking: true };
         self.refresh();
-        vec![Effect::Unlock { user, code }]
+        let mut fx = vec![Effect::Unlock { user, code }];
+        // Sending it is felt, as the key that sent it was: the dots clear
+        // while it is checked, and nothing says it went otherwise.
+        if self.state.vibrate {
+            fx.push(Effect::Haptic);
+        }
+        fx
     }
 
     /// A key of the keyboard on the editor page: a character or a space
@@ -7023,10 +9012,23 @@ impl App {
                         }
                     }
                 }
+                Screen::BrowserAddress => {
+                    let input = std::mem::take(&mut self.state.browser.address);
+                    if input.trim().is_empty() {
+                        self.say(l.pick(["请输入网址或搜索词", "請輸入網址或搜尋詞", "Enter an address or search for something"]), now);
+                    } else {
+                        self.back(now);
+                        return self.browser_go(&input, now);
+                    }
+                }
+                Screen::BrowserForm => {
+                    let (form, _) = self.state.browser.field.expect("the form page has a field");
+                    self.back(now);
+                    return self.browser_submit(form, now);
+                }
                 // So is a name no network can have; the keyboard then types
                 // into the field turned down.
-                Screen::WlanAdd => {
-                    let a = self.state.adding.as_mut().expect("the page adds a network");
+                Screen::WlanAdd => {                    let a = self.state.adding.as_mut().expect("the page adds a network");
                     let (field, why) = match a.name.len() {
                         0 => (Field::Name, Some(l.pick(["请输入网络名称", "請輸入網路名稱", "Enter the network's name"]).to_string())),
                         n if n > SSID_MAX => (
@@ -7119,6 +9121,9 @@ impl App {
     }
 
     pub fn touch(&mut self, ev: Touch, f: &Fonts, now: u64) -> Vec<Effect> {
+        if self.power_menu {
+            return self.touch_power_menu(ev, now);
+        }
         // A finger on the dark panel lights nothing by itself, as on the
         // phone's own system, where the power key lights it - except that a
         // second tap where the first one landed lights it, which is that
@@ -7231,6 +9236,7 @@ impl App {
                     .filter(|&(a, r)| self.frame.as_ref().is_some_and(|fr| fr.hits.contains(&Hit { rect: r, action: a })))
                     .filter(|&(a, r)| row_wide(&t, r) && !matches!(a, Action::Open(Screen::Search) | Action::Confirm(_) | Action::TypeInto(_)))
                     .map(|(_, r)| r);
+                let mut joined = false;
                 self.drag = match hit {
                     Some((Action::Slider(which), track)) => {
                         self.set_slider(&t, which, track, x);
@@ -7238,11 +9244,15 @@ impl App {
                     }
                     Some((Action::Confirm(which), track)) if self.on_knob(track, x) => {
                         let knob_x = track.x + (track.w - track.h) * self.state.confirm;
+                        // A new drag of the knob taps the motor anew when
+                        // it passes the point where letting go does the
+                        // thing.
+                        self.confirm_ticked = false;
                         Drag::Confirm { which, track, grab: x - knob_x }
                     }
                     Some((Action::Pattern, _)) => {
                         self.state.pattern.clear();
-                        self.trace(&t, x, y + scroll);
+                        joined = self.trace(&t, x, y + scroll);
                         Drag::Pattern
                     }
                     _ => {
@@ -7253,6 +9263,11 @@ impl App {
                         Drag::Press { x, y, action, edge: at_edge, at: now }
                     }
                 };
+                // A tap of the motor as the finger finds the first dot, as
+                // the system's pattern lock does.
+                if joined && self.state.vibrate {
+                    fx.push(Effect::Haptic);
+                }
             }
             Touch::Move(x, y) => match std::mem::replace(&mut self.drag, Drag::Idle) {
                 Drag::Press { x: x0, y: y0, action, edge: at_edge, at } => {
@@ -7314,11 +9329,24 @@ impl App {
                 Drag::Confirm { which, track, grab } => {
                     let travel = (track.w - track.h).max(1.0);
                     self.state.confirm = ((x - grab - track.x) / travel).clamp(0.0, 1.0);
+                    // A tap of the motor as the knob passes the point where
+                    // letting go does the thing, so the finger knows it is
+                    // far enough before it lifts. A control that is only
+                    // armed by this slide does nothing yet, and says so
+                    // with words instead.
+                    if self.state.confirm > SLID && !self.confirm_ticked && self.state.vibrate && self.will_act(which) {
+                        self.confirm_ticked = true;
+                        fx.push(Effect::Haptic);
+                    }
                     self.repaint_confirm(&t, f, which, track);
                     self.drag = Drag::Confirm { which, track, grab };
                 }
                 Drag::Pattern => {
-                    self.trace(&t, x, y + scroll);
+                    // A tap of the motor as the finger finds each dot, as
+                    // the system's pattern lock does.
+                    if self.trace(&t, x, y + scroll) && self.state.vibrate {
+                        fx.push(Effect::Haptic);
+                    }
                     self.drag = Drag::Pattern;
                 }
                 Drag::History { last, carry, pitch } => {
@@ -7326,6 +9354,9 @@ impl App {
                     self.drag = self.scroll_history(last, y, carry, pitch);
                 }
                 Drag::Waking => self.drag = Drag::Waking,
+                // The finger that lit the panel from the AOD goes on as
+                // one that only keeps it awake.
+                Drag::Aod { .. } => self.drag = Drag::Waking,
                 Drag::Held => self.drag = Drag::Held,
                 Drag::Idle => {}
             },
@@ -7333,6 +9364,12 @@ impl App {
                 Drag::Press { action: Some(a), .. } => {
                     if let Some(p) = &mut self.row_press {
                         p.lift(now);
+                    }
+                    // A key of the keyboard, or one of the editor's and the
+                    // terminal's own row, taps the motor as the system's own
+                    // keyboard does.
+                    if self.state.vibrate && matches!(a, Action::Type(_) | Action::TermKey(_)) {
+                        fx.push(Effect::Haptic);
                     }
                     fx.extend(self.act(a, now));
                 }
@@ -7382,8 +9419,16 @@ impl App {
                 Drag::Confirm { which, track, .. } => {
                     let done = self.state.confirm > SLID;
                     self.state.confirm = 0.0;
+                    self.confirm_ticked = false;
                     self.repaint_confirm(&t, f, which, track);
                     if done {
+                        // A tap of the motor as the thing it asked for
+                        // begins, so the hand that let go is answered. A
+                        // slide that only arms a control has not begun
+                        // anything, and is left silent.
+                        if self.state.vibrate && self.will_act(which) {
+                            fx.push(Effect::Haptic);
+                        }
                         fx.extend(self.confirmed(which, now));
                     }
                 }
@@ -7457,6 +9502,20 @@ impl App {
     /// goes down first waits [`CHORD_MS`] for the other, or until it is let
     /// go, and then does what it does alone, as pressed when it went down.
     pub fn key(&mut self, key: Key, now: u64) -> Vec<Effect> {
+        // A menu up over the page takes the keys for itself: a tap of the
+        // power or back key sends it away, the rest do nothing.
+        if self.power_menu {
+            if matches!(key, Key::Power | Key::Back) {
+                self.close_power_menu(now);
+            }
+            self.button = Some((key, Press::Spent));
+            return Vec::new();
+        }
+        if key == Key::Power {
+            self.power_down_at = Some(now);
+            self.power_menu_spent = false;
+            self.power_pending_off = false;
+        }
         // Any button stops a gliding page, and brings a sliding one to rest.
         self.fling = None;
         self.end_turn();
@@ -7466,8 +9525,9 @@ impl App {
         }
         let mut fx = self.let_chord_go(now);
         if !self.display_on {
-            // The power key lights the dark panel, and does only that, as on
-            // the phone's own system; the other keys leave it dark.
+            // The power key lights the dark panel at once, as the phone's
+            // own does; holding it past three seconds then brings the power
+            // menu up over the page it lit.
             if key == Key::Power {
                 self.wake(now);
             }
@@ -7482,9 +9542,11 @@ impl App {
             return fx;
         }
         // A button pressed just after the panel lit only keeps it awake, so
-        // a power press meant to wake it does not turn it back off.
+        // a power press meant to wake it does not turn it back off. It is
+        // not the start of a three-second hold either.
         if self.just_woke(now) {
             self.stir(now);
+            self.power_down_at = None;
             self.button = Some((key, Press::Spent));
             return fx;
         }
@@ -7552,6 +9614,13 @@ impl App {
                     // Turning the screen off, the key ticks the motor.
                     None => {
                         self.button = Some((key, Press::Spent));
+                        if self.power_down_at.is_some() {
+                            // A hold may still become the power menu: owe
+                            // the screen-off to the release instead of
+                            // turning the panel dark under the finger.
+                            self.power_pending_off = true;
+                            return Vec::new();
+                        }
                         self.sleep(now);
                         return vec![Effect::Ticks];
                     }
@@ -7566,6 +9635,22 @@ impl App {
     /// partner in a screenshot came, the key waiting for it first does what
     /// it does alone.
     pub fn key_up(&mut self, key: Key, now: u64) -> Vec<Effect> {
+        if key == Key::Power {
+            let spent = std::mem::take(&mut self.power_menu_spent);
+            self.power_down_at = None;
+            let off = std::mem::take(&mut self.power_pending_off);
+            if spent {
+                // The hold already opened the menu. Its release must not
+                // also turn the panel off or work a control behind it.
+                self.button = None;
+                return Vec::new();
+            }
+            if off {
+                self.button = None;
+                self.sleep(now);
+                return vec![Effect::Ticks];
+            }
+        }
         let mut fx = match self.chord {
             Some((first, _)) if first == key => self.let_chord_go(now),
             _ => Vec::new(),
@@ -7610,8 +9695,26 @@ impl App {
         self.dirty = true;
     }
 
+    /// Whether sliding this control to its end now would do the thing,
+    /// rather than only ask what a second slide would do.
+    fn will_act(&self, which: Confirm) -> bool {
+        !(arms(which) && self.state.armed != Some(which))
+    }
+
     /// What a swipe-to-confirm control slid to its end does.
+    ///
+    /// Two of them are slid twice. Turning the checks the vbmeta blocks name
+    /// off leaves the phone's own system unable to start, which was measured
+    /// rather than feared; erasing all user data cannot be undone. One slide
+    /// is too little for either, so the first only asks the page to say what
+    /// the second would do.
     fn confirmed(&mut self, which: Confirm, now: u64) -> Vec<Effect> {
+        if arms(which) && self.state.armed != Some(which) {
+            self.state.armed = Some(which);
+            self.dirty = true;
+            return Vec::new();
+        }
+        self.state.armed = None;
         let (l, mut fx) = (self.state.lang, Vec::new());
         match which {
             Confirm::Reboot => fx.push(Effect::Reboot(TARGETS[self.state.reboot])),
@@ -7733,6 +9836,23 @@ impl App {
                     self.say(l.pick(["请先在「解密」中打开 data 分区", "請先在「解密」中開啟 data 分割區", "Open the data partition in Decrypt first"]), now)
                 }
             },
+            // The message is what a phone that could not start leaves for
+            // the next start; taking it away is the whole of what this page
+            // changes, and misc holds nothing else.
+            Confirm::ClearStarter => fx.push(Effect::ClearStarter),
+            // The queue begins with the package at its head, which leaves the
+            // queue and becomes the one being installed.
+            Confirm::InstallQueue => {
+                if let Some(next) = self.state.queue.first().cloned() {
+                    self.state.queue.remove(0);
+                    self.state.queue_active = true;
+                    self.state.queue_stopped = None;
+                    let (path, name) = (next.path, next.name);
+                    self.begin_install(Install::Checking { size: next.size, stage: None }, next.source, Some(name));
+                    self.open(Screen::Installing);
+                    fx.push(Effect::InstallPath(path));
+                }
+            }
             // The data partition is reached through its own key whether or
             // not it is open, but not while it is being opened or erased.
             Confirm::Filesystem => {
@@ -7813,7 +9933,6 @@ impl App {
                 }
                 _ => self.say(l.pick(["没有可删除的安装包", "沒有可刪除的安裝檔", "There is no package to delete"]), now),
             },
-            Confirm::PowerOff => fx.push(Effect::Reboot(Target::PowerOff)),
         }
         fx
     }
@@ -7846,8 +9965,12 @@ impl App {
                 if self.state.pattern.is_empty() {
                     self.say(l.pick(["连接完成后，在最后一个点上再按一次电源键", "連接完成後，在最後一個點上再按一次電源鍵", "When the pattern is done, press the power key again on its last dot"]), now);
                 }
-                self.join(&self.theme(), i);
-                Vec::new()
+                let joined = self.join(&self.theme(), i);
+                // A tap of the motor as a dot is taken, as the finger's is.
+                match joined && self.state.vibrate {
+                    true => vec![Effect::Haptic],
+                    false => Vec::new(),
+                }
             }
         }
     }
@@ -8208,6 +10331,7 @@ impl App {
             Slider::Vibration => &mut self.state.vibration,
         };
         *value = level.clamp(if which == Slider::Brightness { MIN_BRIGHTNESS } else { 0.0 }, 1.0);
+        self.settings_dirty = true;
         let value = *value;
         if let Some(fr) = self.frame.as_mut() {
             fr.canvas.fill_rect(track.x, track.y, track.w, track.h, t.pal.card);
@@ -8234,22 +10358,23 @@ impl App {
     }
 
     /// Add the dot under the finger to the pattern being drawn.
-    fn trace(&mut self, t: &Theme, x: f32, y: f32) {
-        let Some((cx, cy, span)) = self.frame.as_ref().and_then(|fr| fr.pattern) else { return };
+    fn trace(&mut self, t: &Theme, x: f32, y: f32) -> bool {
+        let Some((cx, cy, span)) = self.frame.as_ref().and_then(|fr| fr.pattern) else { return false };
         let reach = t.m.dp(widgets::PATTERN_REACH_DP);
         let dots = widgets::pattern_dots(cx, cy, span);
-        if let Some(i) = dots.iter().position(|&(dx, dy)| (dx - x).hypot(dy - y) < reach) {
-            self.join(t, i);
+        match dots.iter().position(|&(dx, dy)| (dx - x).hypot(dy - y) < reach) {
+            Some(i) => self.join(t, i),
+            None => false,
         }
     }
 
     /// Join dot `i` to the pattern being drawn, after the dot it passes
     /// straight over on its way from the last one, as the system's pattern
     /// lock joins that one too. A dot joined once is not joined again.
-    fn join(&mut self, t: &Theme, i: usize) {
+    fn join(&mut self, t: &Theme, i: usize) -> bool {
         let drawn = &mut self.state.pattern;
         if drawn.contains(&i) {
-            return;
+            return false;
         }
         if let Some(&last) = drawn.last() {
             let (row, col) = ((last / 3) as i32, (last % 3) as i32);
@@ -8264,6 +10389,7 @@ impl App {
         }
         drawn.push(i);
         self.repaint_pattern(t);
+        true
     }
 
     fn repaint_pattern(&mut self, t: &Theme) {
@@ -8277,11 +10403,36 @@ impl App {
     }
 }
 
+/// The address the plugin should load. The basic reader asks Bing for RSS;
+/// Chromium should get the same search without `format=rss`, or it renders
+/// an XML feed instead of the page.
+fn chromium_url(url: &str) -> String {
+    let mut url = url
+        .replace("?format=rss&", "?")
+        .replace("&format=rss&", "&")
+        .replace("?format=rss", "?")
+        .replace("&format=rss", "");
+    if url.ends_with('?') {
+        url.pop();
+    }
+    url
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::color::over;
     use crate::fmt;
+
+    #[test]
+    fn the_plugin_gets_a_page_not_bings_rss_feed() {
+        assert_eq!(
+            chromium_url("https://cn.bing.com/search?format=rss&setlang=zh-Hans&q=test"),
+            "https://cn.bing.com/search?setlang=zh-Hans&q=test"
+        );
+        assert_eq!(chromium_url("https://cn.bing.com/search?q=test&format=rss"), "https://cn.bing.com/search?q=test");
+        assert_eq!(chromium_url("https://example.com/?format=rss"), "https://example.com/");
+    }
     use skyward_info::{Boot, Charge, Cpu, Storage};
     use skyward_install::{Failure, Refusal};
     use skyward_net::reach::Reach;
@@ -8338,6 +10489,8 @@ mod tests {
             Screen::Backup,
             Screen::Restore,
             Screen::Advanced,
+            Screen::Avb,
+            Screen::Bcb,
             Screen::Files,
             Screen::Terminal,
             Screen::Language,
@@ -9131,7 +11284,7 @@ mod tests {
         app.set_update(Standing::Waiting);
         assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Update)), vec![Effect::ReadUpdate], "the page reads where the update stands");
         assert_eq!(app.screen(), Screen::Update);
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Merge), vec![Effect::Merge]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Merge), vec![Effect::Merge]);
         assert_eq!(app.state.update, Standing::Merging(0.0), "the page turns to the merge at once");
         assert!(app.frame(&f, &i).hits.is_empty(), "nothing to swipe while it merges");
         app.set_update(Standing::Merging(0.5));
@@ -9172,7 +11325,7 @@ mod tests {
     }
 
     #[test]
-    fn a_partition_in_use_cannot_be_unmounted() {
+    fn a_partition_in_use_still_offers_its_switch() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Mount, &f, &i);
         let held = vec!["touch_report".to_string(), "touchsensor".to_string()];
@@ -9181,12 +11334,9 @@ mod tests {
             MountRow { base: "vendor".into(), point: "/vendor".into(), mounted: true, holders: Vec::new() },
         ]));
         let frame = app.frame(&f, &i);
-        assert!(matches!(frame.hits[0].action, Action::Unavailable(_)), "the programs using odm keep it");
+        assert_eq!(frame.hits[0].action, Action::MountToggle(0), "a partition in use can still be asked to go");
         assert_eq!(frame.hits[1].action, Action::MountToggle(1));
-        let busy = frame.hits[0].action;
-        assert!(tap(&mut app, &f, &i, busy).is_empty());
-        app.tick(1000);
-        assert_eq!(app.deadline(1000), Some(TOAST_MS), "it says why");
+        assert_eq!(app.act(Action::MountToggle(0), 0), vec![Effect::Unmount("odm".into())]);
     }
 
     #[test]
@@ -9977,7 +12127,11 @@ mod tests {
         app.touch(Touch::Move(track.x + track.w / 2.0, y), &f, 0);
         app.touch(Touch::Move(track.x + track.w, y), &f, 0);
         let fx = app.touch(Touch::Up, &f, 0);
-        assert_eq!(fx, vec![Effect::Reboot(Target::Bootloader)]);
+        assert_eq!(
+            fx,
+            vec![Effect::Haptic, Effect::Reboot(Target::Bootloader)],
+            "the motor taps as the reboot begins; the other tap came with the move that passed the point"
+        );
         assert_eq!(app.state.confirm, 0.0, "the knob springs back");
     }
 
@@ -9994,10 +12148,9 @@ mod tests {
 
     #[test]
     fn a_control_that_cannot_work_explains_itself() {
-        let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Mount, W, H, PPD);
         app.set_mounts(Ok(vec![MountRow { base: "odm".into(), point: "/odm".into(), mounted: true, holders: vec!["qseecomd".into()] }]));
-        tap(&mut app, &f, &i, Action::Unavailable("无法卸载正在使用的分区"));
+        app.act(Action::Unavailable("无法卸载正在使用的分区"), 0);
         assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("无法卸载正在使用的分区"));
         // Once the row tapped has faded back, only the message waits.
         app.tick(1000);
@@ -10028,7 +12181,7 @@ mod tests {
         tap_back(&mut app, &f, &i, 2000);
         app.tick(3000);
         tap(&mut app, &f, &i, Action::Open(Screen::Mount));
-        tap(&mut app, &f, &i, Action::Unavailable("A partition in use can't be unmounted"));
+        app.act(Action::Unavailable("A partition in use can't be unmounted"), 3000);
         assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("A partition in use can't be unmounted"), "as do its messages");
     }
 
@@ -10125,7 +12278,11 @@ mod tests {
         let y = track.centre().1 - app.top().1;
         app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
         app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
-        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Flash { partition: "boot", pick: Pick::Both }]);
+        assert_eq!(
+            app.touch(Touch::Up, &f, 1000),
+            vec![Effect::Haptic, Effect::Flash { partition: "boot", pick: Pick::Both }],
+            "the motor taps as the writing begins"
+        );
         assert_eq!(app.state.install, Install::Flashing { partition: "boot", stage: None });
         app.install(Event::Progress(Stage::Flashing { done: 10, total: 40 }), 1000);
         assert_eq!(app.state.install, Install::Flashing { partition: "boot", stage: Some(Stage::Flashing { done: 10, total: 40 }) });
@@ -10220,7 +12377,20 @@ mod tests {
         let fastboot = TARGETS.iter().position(|t| *t == Target::Fastboot).unwrap();
         tap(&mut app, &f, &i, Action::RebootTarget(fastboot));
         assert_eq!(app.state.reboot, fastboot);
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Reboot), vec![Effect::Reboot(Target::Fastboot)]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Reboot), vec![Effect::Reboot(Target::Fastboot)]);
+    }
+
+    #[test]
+    fn a_swipe_to_confirm_taps_the_motor_as_it_passes_the_point_and_as_the_thing_begins() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Reboot, W, H, PPD);
+        let fastboot = TARGETS.iter().position(|t| *t == Target::Fastboot).unwrap();
+        tap(&mut app, &f, &i, Action::RebootTarget(fastboot));
+        assert_eq!(
+            swipe(&mut app, &f, &i, Confirm::Reboot),
+            vec![Effect::Haptic, Effect::Haptic, Effect::Reboot(Target::Fastboot)],
+            "one tap as the knob passes the point, one as the thing begins"
+        );
     }
 
     /// Press `key` and let it go.
@@ -10253,16 +12423,16 @@ mod tests {
         let snug = snug(&f, &info());
         let i = DeviceInfo { snapshot: SnapshotState::Snapshotted, ..info() };
         let mut app = App::new(Screen::Home, W, snug, PPD);
-        let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::PowerOff));
+        let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::Reboot));
         assert!(y > snug as f32, "below the screen to start with");
-        light_on(&mut app, &f, &i, Stop::Hit(Action::Open(Screen::PowerOff)));
+        light_on(&mut app, &f, &i, Stop::Hit(Action::Open(Screen::Reboot)));
         for ms in (0..3000).step_by(8) {
             app.tick(ms);
         }
-        let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::PowerOff));
+        let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::Reboot));
         assert!(y < snug as f32, "the page scrolled the lit row into view");
         press(&mut app, Key::Power, 3000);
-        assert_eq!(app.screen(), Screen::PowerOff);
+        assert_eq!(app.screen(), Screen::Reboot);
     }
 
     #[test]
@@ -10324,12 +12494,12 @@ mod tests {
         press(&mut app, Key::VolumeDown, 0);
         assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::About))));
         press(&mut app, Key::VolumeDown, 0);
-        assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::Install))));
+        assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::Browser))));
         press(&mut app, Key::VolumeUp, 0);
         assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::About))));
         press(&mut app, Key::VolumeUp, 0);
         press(&mut app, Key::VolumeUp, 0);
-        assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::PowerOff))), "up from the first goes round to the last");
+        assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::Reboot))), "up from the first goes round to the last");
         app.tick(5000);
         let reboot = app.lit().expect("lit");
         assert!(app.shows(&reboot, app.top().1), "scrolled into view");
@@ -10475,7 +12645,7 @@ mod tests {
         app.frame(&f, &i);
         press(&mut app, Key::VolumeDown, 0);
         assert_eq!(lit(&mut app, &f, &i), Some(Stop::Dot(0)), "the grid's first dot is lit first");
-        assert!(press(&mut app, Key::Power, 0).is_empty());
+        assert_eq!(press(&mut app, Key::Power, 0), vec![Effect::Haptic], "the dot taken taps the motor");
         assert_eq!(app.state.pattern, [0]);
         assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("连接完成后，在最后一个点上再按一次电源键"));
         press(&mut app, Key::Power, 0);
@@ -10500,7 +12670,7 @@ mod tests {
         press(&mut app, Key::VolumeDown, 0);
         assert!(press(&mut app, Key::Power, 0).is_empty(), "a dot joined already is not joined again");
         press(&mut app, Key::VolumeUp, 0);
-        assert_eq!(press(&mut app, Key::Power, 0), vec![Effect::Unlock { user: 0, code: "1236987".into() }], "the last one joined ends it");
+        assert_eq!(acts(press(&mut app, Key::Power, 0)), vec![Effect::Unlock { user: 0, code: "1236987".into() }], "the last one joined ends it");
     }
 
     #[test]
@@ -10515,7 +12685,7 @@ mod tests {
         }
         assert_eq!(app.state.code, "2580");
         light_on(&mut app, &f, &i, Stop::Hit(Action::Type(Cap::Enter)));
-        assert_eq!(press(&mut app, Key::Power, 0), vec![Effect::Unlock { user: 0, code: "2580".into() }]);
+        assert_eq!(acts(press(&mut app, Key::Power, 0)), vec![Effect::Unlock { user: 0, code: "2580".into() }]);
     }
 
     #[test]
@@ -10581,10 +12751,10 @@ mod tests {
         app.tick(REPEAT_DELAY_MS);
         assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::About))));
         app.tick(REPEAT_DELAY_MS + REPEAT_MS);
-        assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::Install))));
+        assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::Browser))));
         app.key_up(Key::VolumeDown, REPEAT_DELAY_MS + REPEAT_MS + 10);
         app.tick(REPEAT_DELAY_MS + REPEAT_MS * 5);
-        assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::Install))), "let go, it stops");
+        assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::Browser))), "let go, it stops");
     }
 
     #[test]
@@ -10618,7 +12788,15 @@ mod tests {
         let mut app = App::new(Screen::CantStart, W, H, PPD);
         app.set_asked(Asked { reason: Some("RescueParty".into()), ..Asked::default() });
         assert_eq!(tap(&mut app, &f, &i, Action::RebootTo(Target::System)), vec![Effect::Reboot(Target::System)]);
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::FactoryReset), vec![Effect::FactoryReset]);
+        assert!(
+            swipe(&mut app, &f, &i, Confirm::FactoryReset).is_empty(),
+            "the first slide only asks what the second would do, and taps no motor"
+        );
+        assert_eq!(
+            swipe(&mut app, &f, &i, Confirm::FactoryReset),
+            vec![Effect::Haptic, Effect::Haptic, Effect::FactoryReset],
+            "the second does it, and the motor says so"
+        );
         assert_eq!(tap(&mut app, &f, &i, Action::Dismiss), vec![Effect::Dismiss]);
         assert_eq!(app.screen(), Screen::Home);
         app.key(Key::Back, 0);
@@ -10663,22 +12841,22 @@ mod tests {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Wipe, &f, &i);
         let chosen = |app: &App| WIPES.iter().zip(app.state.wipe).filter(|(_, on)| *on).map(|(&w, _)| w).collect::<Vec<_>>();
-        assert!(swipe(&mut app, &f, &i, Confirm::Wipe).is_empty(), "nothing is chosen at first");
+        assert!(swiped(&mut app, &f, &i, Confirm::Wipe).is_empty(), "nothing is chosen at first");
         for part in [Wipe::Updates, Wipe::Logs, Wipe::Art, Wipe::SystemCaches, Wipe::AppCaches, Wipe::Media, Wipe::AppData] {
             tap(&mut app, &f, &i, Action::WipeItem(part));
         }
         let parts = vec![Wipe::AppData, Wipe::Media, Wipe::AppCaches, Wipe::SystemCaches, Wipe::Art, Wipe::Logs, Wipe::Updates];
         assert_eq!(chosen(&app), parts, "every part the page lists can be chosen with the others");
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(parts)], "in the order listed");
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(parts)], "in the order listed");
         tap(&mut app, &f, &i, Action::WipeItem(Wipe::All));
         assert_eq!(chosen(&app), [Wipe::All], "everything takes the parts in");
         tap(&mut app, &f, &i, Action::WipeItem(Wipe::Art));
         assert_eq!(chosen(&app), [Wipe::Art], "a part on its own leaves everything out");
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(vec![Wipe::Art])]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(vec![Wipe::Art])]);
         tap(&mut app, &f, &i, Action::WipeItem(Wipe::Art));
         assert!(chosen(&app).is_empty(), "tapped again, a part is left out");
         tap(&mut app, &f, &i, Action::WipeItem(Wipe::All));
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(vec![Wipe::All])]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(vec![Wipe::All])]);
     }
 
     #[test]
@@ -10692,7 +12870,7 @@ mod tests {
         assert!(offered(&mut app));
         tap(&mut app, &f, &i, Action::WipeItem(Wipe::Cache));
         tap(&mut app, &f, &i, Action::WipeItem(Wipe::Media));
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(vec![Wipe::Media, Wipe::Cache])], "in the order listed");
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(vec![Wipe::Media, Wipe::Cache])], "in the order listed");
     }
 
     #[test]
@@ -10755,7 +12933,7 @@ mod tests {
         let y = track.centre().1 - app.top().1;
         app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
         app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
-        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Install]);
+        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Haptic, Effect::Install], "the motor taps as it begins");
         assert_eq!(app.state.install, Install::Updating { version: Some("OS3.0.306.0.WMACNXM".into()), stage: None, overwriting: false });
         app.key(Key::Back, 1000);
         assert_eq!(app.screen(), Screen::Installing, "an update being written keeps the page");
@@ -10783,7 +12961,7 @@ mod tests {
         let y = track.centre().1 - app.top().1;
         app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
         app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
-        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Install]);
+        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Haptic, Effect::Install], "the motor taps as it begins");
         assert_eq!(app.state.install, Install::Scripting { stage: None, running: false });
         app.install(Event::Running, 1000);
         for line in ["- Flashing boot", " ", "- Done"] {
@@ -10924,6 +13102,21 @@ mod tests {
     }
 
     /// Drag the knob of a swipe-to-confirm track all the way across.
+    /// What a swipe to confirm did, with the taps of the motor left out:
+    /// what the slide was for, and not how it felt.
+    fn swiped(app: &mut App, f: &Fonts, i: &DeviceInfo, which: Confirm) -> Vec<Effect> {
+        let mut fx = swipe(app, f, i, which);
+        fx.retain(|e| !matches!(e, Effect::Haptic));
+        fx
+    }
+
+    /// What the app was asked to do, leaving out the taps of the motor: a
+    /// test that asks what a control does does not count them, and the ones
+    /// that do ask after them say so.
+    fn acts(fx: Vec<Effect>) -> Vec<Effect> {
+        fx.into_iter().filter(|e| !matches!(e, Effect::Haptic)).collect()
+    }
+
     fn swipe(app: &mut App, f: &Fonts, i: &DeviceInfo, which: Confirm) -> Vec<Effect> {
         let track = app.frame(f, i).hits.iter().find(|h| h.action == Action::Confirm(which)).expect("the track is on the page").rect;
         let y = track.centre().1 - app.top().1;
@@ -10973,16 +13166,18 @@ mod tests {
     fn logs_are_exported_as_ticked_where_they_can_go() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Logs, W, H, PPD);
-        let both = Effect::ExportLogs { recovery: true, kernel: true, storage: false };
-        assert_eq!(tap(&mut app, &f, &i, Action::ExportLogs), vec![both], "both, to the temporary folder, at first");
+        let all = Effect::ExportLogs { recovery: true, kernel: true, browser: true, full: true, storage: false };
+        assert_eq!(tap(&mut app, &f, &i, Action::ExportLogs), vec![all], "all four, to the temporary folder, at first");
         tap(&mut app, &f, &i, Action::LogPart(0));
         tap(&mut app, &f, &i, Action::LogsTo(1));
         assert!(tap(&mut app, &f, &i, Action::ExportLogs).is_empty(), "internal storage waits for the data partition");
         app.tick(1000);
         assert_eq!(app.deadline(1000), Some(TOAST_MS), "and says so");
         app.data_waiting(None, Vec::new());
-        assert_eq!(tap(&mut app, &f, &i, Action::ExportLogs), vec![Effect::ExportLogs { recovery: false, kernel: true, storage: true }]);
+        assert_eq!(tap(&mut app, &f, &i, Action::ExportLogs), vec![Effect::ExportLogs { recovery: false, kernel: true, browser: true, full: true, storage: true }]);
         tap(&mut app, &f, &i, Action::LogPart(1));
+        tap(&mut app, &f, &i, Action::LogPart(2));
+        tap(&mut app, &f, &i, Action::LogPart(3));
         assert!(tap(&mut app, &f, &i, Action::ExportLogs).is_empty(), "nothing ticked, nothing saved");
     }
 
@@ -11004,7 +13199,7 @@ mod tests {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Backup, &f, &i);
         assert_eq!(app.state.backup, [true, true, false, true]);
-        assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "internal storage waits for the data partition");
+        assert!(swiped(&mut app, &f, &i, Confirm::Backup).is_empty(), "internal storage waits for the data partition");
         assert_eq!(app.deadline(0), Some(TOAST_MS), "and says so");
         // The owner's files open first; another user's still wait.
         app.data_waiting(Some((10, Keys::Digits)), Vec::new());
@@ -11018,14 +13213,14 @@ mod tests {
         tap(&mut app, &f, &i, Action::BackupTo(Place::UsbDrive));
         tap(&mut app, &f, &i, Action::Toggle(Switch::Compress));
         tap(&mut app, &f, &i, Action::Toggle(Switch::Verify));
-        assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "no drive is plugged in");
+        assert!(swiped(&mut app, &f, &i, Confirm::Backup).is_empty(), "no drive is plugged in");
         app.set_usb_drive(Some(UsbDrive::Shown));
         let second = Effect::Backup { parts: [false, true, true, true], place: Place::UsbDrive, compress: true, verify: false };
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Backup), vec![second]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Backup), vec![second]);
         for k in 1..4 {
             tap(&mut app, &f, &i, Action::BackupPart(k));
         }
-        assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "nothing ticked, nothing backed up");
+        assert!(swiped(&mut app, &f, &i, Confirm::Backup).is_empty(), "nothing ticked, nothing backed up");
     }
 
     /// A backup found in `place`, made at `made`, holding `parts`.
@@ -11068,7 +13263,7 @@ mod tests {
         tap(&mut app, &f, &i, Action::RestorePart(1));
         assert_eq!(app.state.restore.as_ref().map(|r| r.1), Some([true, false, false, true]));
         let name = fmt::stamp(1_792_348_260, 0);
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Restore), vec![Effect::Restore {
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Restore), vec![Effect::Restore {
             place: Place::Storage,
             name: name.clone(),
             parts: [true, false, false, true]
@@ -11076,7 +13271,7 @@ mod tests {
         for k in [0, 3] {
             tap(&mut app, &f, &i, Action::RestorePart(k));
         }
-        assert!(swipe(&mut app, &f, &i, Confirm::Restore).is_empty(), "nothing ticked, nothing restored");
+        assert!(swiped(&mut app, &f, &i, Confirm::Restore).is_empty(), "nothing ticked, nothing restored");
         assert_eq!(app.key(Key::Back, 0), vec![Effect::FindBackups { storage: false, usb: false }], "back on the list, it is looked for again");
         assert_eq!((app.screen(), app.state.restore.clone()), (Screen::Restore, None));
     }
@@ -11087,7 +13282,7 @@ mod tests {
         let mut app = opened(Screen::Restore, &f, &i);
         app.set_backups(vec![found(Place::Storage, 1_792_348_260, [false, false, true, false])]);
         tap(&mut app, &f, &i, Action::OpenBackup(0));
-        assert!(swipe(&mut app, &f, &i, Confirm::Restore).is_empty());
+        assert!(swiped(&mut app, &f, &i, Confirm::Restore).is_empty());
         assert_eq!(app.deadline(0), Some(TOAST_MS), "the page says to decrypt first");
         app.data_waiting(None, Vec::new());
         let fx = swipe(&mut app, &f, &i, Confirm::Restore);
@@ -11120,7 +13315,7 @@ mod tests {
         tap(&mut app, &f, &i, Action::OpenBackup(0));
         assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::Confirm(Confirm::DeleteBackup)), "asked for first");
         tap(&mut app, &f, &i, Action::AskDelete);
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::DeleteBackup), vec![Effect::DeleteBackup { place: Place::Storage, name: entry.name }]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::DeleteBackup), vec![Effect::DeleteBackup { place: Place::Storage, name: entry.name }]);
         assert!(app.backup_deleted(Err("Permission denied".into()), 0).is_empty());
         assert_eq!(app.screen(), Screen::RestoreBackup, "not deleted, the page stays and says why");
         assert_eq!(app.backup_deleted(Ok(()), 0), vec![Effect::FindBackups { storage: true, usb: false }]);
@@ -11185,10 +13380,10 @@ mod tests {
         assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Slot)), vec![Effect::ReadSlots], "read as the page opens");
         let held = BootSlots { active: Slot::B, bootable: [false, true], successful: [true, true] };
         app.set_boot_slots(Ok(held));
-        assert!(swipe(&mut app, &f, &i, Confirm::Slot).is_empty());
+        assert!(swiped(&mut app, &f, &i, Confirm::Slot).is_empty());
         assert_eq!(app.deadline(0), Some(TOAST_MS), "B starts next already");
         tap(&mut app, &f, &i, Action::PickSlot(Slot::A));
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Slot), vec![Effect::SetSlot(Slot::A)]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Slot), vec![Effect::SetSlot(Slot::A)]);
         let switched = BootSlots { active: Slot::A, bootable: [true, true], ..held };
         app.slot_switched(Ok(switched), 0);
         assert_eq!((app.state.boot_slots.clone(), app.state.next_slot), (Some(Ok(switched)), None), "the pick is done with");
@@ -11253,7 +13448,7 @@ mod tests {
         let mut app = systems_page(&f, &i, two_systems());
         assert!(!swipes(&mut app, &f, &i), "the main system starts already");
         tap(&mut app, &f, &i, Action::PickSystem(Who::Other));
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Other)]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Other)]);
         assert_eq!((app.state.systems_work, app.state.system_pick), (Some(SystemsWork::Switching(Who::Other)), None));
         assert!(app.frame(&f, &i).hits.is_empty(), "nothing to tap while the boot partitions are written");
         // The card tapped darkens and comes back, as a row of a list does.
@@ -11264,7 +13459,7 @@ mod tests {
         assert_eq!(app.state.systems_work, None);
         app.set_systems(Ok(Overview { other_starts: true, ..two_systems() }));
         tap(&mut app, &f, &i, Action::PickSystem(Who::Installed));
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Installed)]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Installed)]);
         app.set_systems(Ok(two_systems()));
         tap(&mut app, &f, &i, Action::PickSystem(Who::Other));
         app.key(Key::Back, 0);
@@ -11279,7 +13474,7 @@ mod tests {
         assert!(!swipes(&mut app, &f, &i), "nothing to swipe");
         app.set_systems(Ok(Overview { other_starts: true, ..two_systems() }));
         tap(&mut app, &f, &i, Action::PickSystem(Who::Installed));
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Installed)], "back to the main system to merge it");
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Installed)], "back to the main system to merge it");
     }
 
     #[test]
@@ -11290,7 +13485,7 @@ mod tests {
         app.state.data = Data::Open;
         app.refresh();
         tap(&mut app, &f, &i, Action::AskDelete);
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::RemoveSystem), vec![Effect::RemoveSystem]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::RemoveSystem), vec![Effect::RemoveSystem]);
         assert_eq!((app.state.systems_work, app.state.asking_delete), (Some(SystemsWork::Removing), false));
         app.set_systems(Ok(Overview { other: None, ..two_systems() }));
         assert_eq!(app.state.systems_work, None);
@@ -11312,7 +13507,7 @@ mod tests {
         let y = track.centre().1 - app.top().1;
         app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
         app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
-        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::InstallSystem { size: 8 << 30 }]);
+        assert_eq!(acts(app.touch(Touch::Up, &f, 1000)), vec![Effect::InstallSystem { size: 8 << 30 }]);
         assert_eq!(app.state.install, Install::Systeming { name: "Ubuntu Touch".into(), stage: None });
         app.install(Event::Progress(Stage::Root { done: 1 << 30, total: 6 << 30 }), 1000);
         assert_eq!(app.state.install, Install::Systeming { name: "Ubuntu Touch".into(), stage: Some(Stage::Root { done: 1 << 30, total: 6 << 30 }) });
@@ -11395,7 +13590,7 @@ mod tests {
         assert_eq!(app.state.code, "1234");
         tap(&mut app, &f, &i, Action::Type(Cap::Backspace));
         assert_eq!(app.state.code, "123");
-        let fx = tap(&mut app, &f, &i, Action::Type(Cap::Enter));
+        let fx = acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter)));
         assert_eq!(fx, vec![Effect::Unlock { user: 0, code: "123".into() }]);
         assert_eq!(app.state.code, "", "what was typed is gone once it is sent");
         assert_eq!(app.state.data, Data::Locked { user: 0, keys: Keys::Digits, checking: true });
@@ -11428,10 +13623,32 @@ mod tests {
         for &which in &[1usize, 4, 7] {
             app.touch(Touch::Move(dots[which].0, dots[which].1 - scroll), &f, 0);
         }
-        let fx = app.touch(Touch::Up, &f, 0);
+        let fx = acts(app.touch(Touch::Up, &f, 0));
         assert_eq!(fx, vec![Effect::Unlock { user: 0, code: "1258".into() }], "the dots counted from one across the rows");
         assert!(app.state.pattern.is_empty(), "the grid is cleared once it is sent");
         assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::Pattern), "nothing more is drawn while it is checked");
+    }
+
+    #[test]
+    fn a_pattern_taps_the_motor_at_each_dot_the_finger_finds() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Decrypt, W, H, PPD);
+        app.data_waiting(Some((0, Keys::Pattern)), Vec::new());
+        let (cx, cy, span) = app.frame(&f, &i).pattern.expect("the grid is on the page");
+        let dots = widgets::pattern_dots(cx, cy, span);
+        let scroll = app.top().1;
+        assert_eq!(
+            app.touch(Touch::Down(dots[0].0, dots[0].1 - scroll), &f, 0),
+            vec![Effect::Haptic],
+            "the first dot found"
+        );
+        for &which in &[1usize, 4, 7] {
+            assert_eq!(
+                app.touch(Touch::Move(dots[which].0, dots[which].1 - scroll), &f, 0),
+                vec![Effect::Haptic],
+                "each dot found"
+            );
+        }
     }
 
     #[test]
@@ -11516,6 +13733,17 @@ mod tests {
     }
 
     #[test]
+    fn a_key_taps_the_motor_and_a_list_row_does_not() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Search, &f, &i);
+        assert_eq!(tap(&mut app, &f, &i, Action::Type(Cap::Char('b'))), vec![Effect::Haptic]);
+        app.state.vibrate = false;
+        assert!(tap(&mut app, &f, &i, Action::Type(Cap::Char('c'))).is_empty(), "turned off, a key is not felt");
+        let mut rows = opened(Screen::Backup, &f, &i);
+        assert!(tap(&mut rows, &f, &i, Action::BackupTo(Place::UsbDrive)).is_empty(), "a row is not a key");
+    }
+
+    #[test]
     fn the_terminal_sends_every_key_to_its_shell() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Settings, W, H, PPD);
@@ -11523,6 +13751,9 @@ mod tests {
         let (rows, cols) = app.term_size(&f);
         assert!(rows >= 20 && cols >= 40, "a screen of {rows} rows by {cols}");
         app.term_started(rows, cols);
+        // The motor's tap on a key is told apart on its own; here it would
+        // only sit in front of what the shell is sent.
+        app.state.vibrate = false;
         assert_eq!(tap(&mut app, &f, &i, Action::Type(Cap::Char('l'))), vec![Effect::TermInput(b"l".to_vec())]);
         assert_eq!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)), vec![Effect::TermInput(b"\r".to_vec())]);
         assert!(tap(&mut app, &f, &i, Action::TermKey(TermKey::Ctrl)).is_empty());
@@ -11547,7 +13778,7 @@ mod tests {
         let (rows, cols) = app.term_size(&f);
         app.term_started(rows, cols);
         app.term_ended(TermEnd::Exited(0));
-        assert_eq!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)), vec![Effect::StartShell("/sdcard/Download".into())], "Enter starts it again there");
+        assert_eq!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))), vec![Effect::StartShell("/sdcard/Download".into())], "Enter starts it again there");
         app.term_started(rows, cols);
         tap_back(&mut app, &f, &i, 0);
         app.set_files("/data/adb".into(), Ok(Vec::new()), 0);
@@ -11950,7 +14181,7 @@ mod tests {
         }
         type_text(&mut app, &f, &i, "b");
         let rename = Effect::Rename { path: "/sdcard/a.zip".into(), name: "ab".into() };
-        assert_eq!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)), vec![rename]);
+        assert_eq!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))), vec![rename]);
         app.renamed(Err(RenameRefused::Failed("rename /sdcard/a.zip to ab: No space left on device (os error 28)".into())), 0);
         assert_eq!(app.screen(), Screen::Rename, "a name refused can be typed again");
         app.toast = None;
@@ -12151,14 +14382,14 @@ mod tests {
         let mut app = App::new(Screen::Advanced, W, H, PPD);
         tap(&mut app, &f, &i, Action::Open(Screen::Relabel));
         assert_eq!(app.screen(), Screen::Relabel);
-        assert!(swipe(&mut app, &f, &i, Confirm::Relabel).is_empty());
+        assert!(swiped(&mut app, &f, &i, Confirm::Relabel).is_empty());
         assert_eq!(toast(&app), Some("请先在「解密」中打开 data 分区"));
         app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false };
         app.refresh();
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Relabel), vec![Effect::Relabel], "open, though a user has yet to unlock");
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Relabel), vec![Effect::Relabel], "open, though a user has yet to unlock");
         app.state.data = Data::Open;
         app.refresh();
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Relabel), vec![Effect::Relabel]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Relabel), vec![Effect::Relabel]);
         app.relabel_started();
         assert!(!app.frame(&f, &i).back, "no going back while it works");
         app.key(Key::Back, 0);
@@ -12204,7 +14435,7 @@ mod tests {
         tap(&mut app, &f, &i, Action::ChooseFs(FsChoice::Remake(0)));
         assert_eq!(app.state.fs_action, FsAction::Remake("f2fs".into()));
         let remake = Effect::Filesystem { name: "cache".into(), action: FsAction::Remake("f2fs".into()) };
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Filesystem), vec![remake]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Filesystem), vec![remake]);
         app.part_work_started(PartKind::Remake("f2fs".into()), false);
         assert_eq!(app.screen(), Screen::PartWork);
         app.part_listed(vec!["cache".into()]);
@@ -12230,12 +14461,12 @@ mod tests {
         tap(&mut app, &f, &i, Action::ChooseFs(FsChoice::Repair));
         app.state.data = Data::Opening;
         app.refresh();
-        assert!(swipe(&mut app, &f, &i, Confirm::Filesystem).is_empty());
+        assert!(swiped(&mut app, &f, &i, Confirm::Filesystem).is_empty());
         assert_eq!(toast(&app), Some("正在打开 data 分区，请稍后再试"));
         app.state.data = Data::Open;
         app.refresh();
         let repair = Effect::Filesystem { name: "data".into(), action: FsAction::Repair };
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Filesystem), vec![repair]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::Filesystem), vec![repair]);
         app.part_work_started(PartKind::Repair, false);
         app.part_listed(vec!["data".into()]);
         app.part_at(0);
@@ -12420,11 +14651,11 @@ mod tests {
             }
         };
         type_in(&mut app, "secret");
-        assert!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)).is_empty());
+        assert!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))).is_empty());
         assert_eq!(toast(&app), Some("请输入 8 到 63 位密码"));
         tap(&mut app, &f, &i, Action::Type(Cap::Show(Layer::Digits)));
         type_in(&mut app, "12");
-        let fx = tap(&mut app, &f, &i, Action::Type(Cap::Enter));
+        let fx = acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter)));
         let join = Effect::JoinWlan { ssid: b"Skyward".to_vec(), name: "Skyward".into(), security: Security::Psk, password: Secret("secret12".into()) };
         assert_eq!(format!("{join:?}"), r#"JoinWlan { ssid: [83, 107, 121, 119, 97, 114, 100], name: "Skyward", security: Psk, password: Secret(8 characters) }"#, "what is printed leaves the password out");
         assert_eq!(fx, vec![join]);
@@ -12490,7 +14721,7 @@ mod tests {
                 tap(app, &f, &i, Action::Type(Cap::Char(ch)));
             }
         };
-        assert!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)).is_empty());
+        assert!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))).is_empty());
         assert_eq!(toast(&app), Some("请输入网络名称"));
         type_in(&mut app, "skyward");
         let frame = app.frame(&f, &i);
@@ -12518,12 +14749,12 @@ mod tests {
         type_in(&mut app, "secret");
         tap(&mut app, &f, &i, Action::TypeInto(Field::Name));
         assert_eq!((app.state.adding.as_ref().unwrap().name.as_str(), app.state.password.as_str()), ("skyward", "secret"));
-        assert!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)).is_empty());
+        assert!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))).is_empty());
         assert_eq!(toast(&app), Some("请输入 8 到 63 位密码"));
         assert_eq!(app.state.adding.as_ref().unwrap().field, Field::Password, "the keyboard types into the field turned down");
         tap(&mut app, &f, &i, Action::Type(Cap::Show(Layer::Digits)));
         type_in(&mut app, "12");
-        let fx = tap(&mut app, &f, &i, Action::Type(Cap::Enter));
+        let fx = acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter)));
         let join = Effect::JoinWlan { ssid: b"skyward".to_vec(), name: "skyward".into(), security: Security::Psk, password: Secret("secret12".into()) };
         assert_eq!(fx, vec![join]);
         assert_eq!(app.screen(), Screen::Wlan, "the WLAN page shows how joining goes");
@@ -12547,10 +14778,10 @@ mod tests {
         for _ in 0..33 {
             tap(&mut app, &f, &i, Action::Type(Cap::Char('a')));
         }
-        assert!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)).is_empty());
+        assert!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))).is_empty());
         assert_eq!(toast(&app), Some("网络名称不能超过 32 个字符"));
         tap(&mut app, &f, &i, Action::Type(Cap::Backspace));
-        let fx = tap(&mut app, &f, &i, Action::Type(Cap::Enter));
+        let fx = acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter)));
         let name = "a".repeat(32);
         assert_eq!(fx, vec![Effect::JoinWlan { ssid: name.clone().into_bytes(), name, security: Security::Open, password: Secret::default() }]);
     }
@@ -12820,12 +15051,12 @@ mod tests {
         for (name, said) in refused {
             app.state.new_name = name.into();
             app.toast = None;
-            assert!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)).is_empty(), "{name:?} is not renamed to");
+            assert!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))).is_empty(), "{name:?} is not renamed to");
             assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some(said));
             assert_eq!(app.screen(), Screen::Rename);
         }
         app.state.new_name = "a.zip".into();
-        assert!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)).is_empty());
+        assert!(acts(tap(&mut app, &f, &i, Action::Type(Cap::Enter))).is_empty());
         assert_eq!(app.screen(), Screen::FileInfo, "the name left as it was, the page goes");
     }
 
@@ -12836,7 +15067,7 @@ mod tests {
         hold_entry(&mut app, &f, &i, 1);
         assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::Confirm(Confirm::DeleteEntry)));
         tap(&mut app, &f, &i, Action::AskDelete);
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::DeleteEntry), vec![Effect::Delete("/sdcard/a.zip".into())]);
+        assert_eq!(swiped(&mut app, &f, &i, Confirm::DeleteEntry), vec![Effect::Delete("/sdcard/a.zip".into())]);
         app.file_job_started(FileTask::Delete { path: "/sdcard/a.zip".into() });
         assert_eq!(app.screen(), Screen::FileJob);
         assert_eq!(tap(&mut app, &f, &i, Action::StopJob), vec![Effect::StopJob]);
@@ -12895,7 +15126,8 @@ mod tests {
         let mut app = App::new(Screen::Files, W, H, PPD);
         app.set_files("/data".into(), Err("read /data: Permission denied (os error 13)".into()), LISTED);
         let fr = app.frame(&f, &i);
-        assert!(fr.hits.is_empty() && fr.rows.is_none());
+        assert!(fr.rows.is_none(), "nothing to open");
+        assert!(fr.hits.iter().all(|h| h.action == Action::FilesSearch), "only the search box is left");
     }
 
     #[test]
@@ -13011,9 +15243,10 @@ mod tests {
         assert!(app.key(Key::Power, 0).is_empty());
         assert_eq!(app.panel(0), Some(SLIDER_START), "it waits for volume down first");
         assert_eq!(app.deadline(0), Some(CHORD_MS));
-        assert_eq!(app.tick(CHORD_MS), vec![Effect::Ticks], "held on alone, it turns the panel off, ticking the motor");
+        assert!(app.tick(CHORD_MS).is_empty(), "a key still held does not darken the panel yet");
+        assert!(app.display_on(), "the panel stays lit while the hold is weighed");
+        assert_eq!(app.key_up(Key::Power, CHORD_MS + 50), vec![Effect::Ticks], "let go, it turns the panel off");
         assert!(!app.display_on());
-        assert!(app.key_up(Key::Power, CHORD_MS + 50).is_empty());
         assert!(app.key(Key::Power, CHORD_MS + 60).is_empty());
         assert_eq!(app.panel(CHORD_MS + 60), Some(SLIDER_START));
         assert!(app.key_up(Key::Power, CHORD_MS + 100).is_empty());
@@ -13162,16 +15395,132 @@ mod tests {
     }
 
     #[test]
-    fn a_touch_on_the_dark_panel_lights_nothing() {
+    fn a_double_tap_on_the_dark_panel_lights_it_onto_the_page_it_left() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Settings, &f, &i);
+        press(&mut app, Key::Power, 0);
+        assert!(!app.display_on());
+        app.touch(Touch::Down(700.0, 1600.0), &f, 1_000);
+        app.touch(Touch::Up, &f, 1_080);
+        assert!(!app.display_on(), "one tap does nothing");
+        app.touch(Touch::Down(706.0, 1604.0), &f, 1_200);
+        app.touch(Touch::Up, &f, 1_280);
+        assert!(app.display_on(), "the second tap lights it");
+        assert_eq!(app.screen(), Screen::Settings, "straight back to the page, no lock screen");
+        assert!(!app.power_menu_open());
+    }
+
+    #[test]
+    fn a_dark_panel_hears_nothing_with_double_tap_turned_off() {
+        let f = fonts();
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.double_tap = false;
+        press(&mut app, Key::Power, 0);
+        app.touch(Touch::Down(700.0, 1600.0), &f, 1_000);
+        app.touch(Touch::Up, &f, 1_080);
+        app.touch(Touch::Down(706.0, 1604.0), &f, 1_200);
+        app.touch(Touch::Up, &f, 1_280);
+        assert!(!app.display_on());
+    }
+
+    #[test]
+    fn holding_the_power_key_three_seconds_opens_the_menu_without_darkening_first() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        assert!(app.key(Key::Power, 0).is_empty());
+        assert!(app.tick(CHORD_MS).is_empty(), "a hold does not darken the panel");
+        assert!(app.display_on());
+        assert_eq!(app.deadline(CHORD_MS), Some(POWER_MENU_MS), "the loop wakes at three seconds");
+        assert!(app.tick(POWER_MENU_MS - 1).is_empty());
+        assert!(!app.power_menu_open());
+        assert!(app.tick(POWER_MENU_MS).is_empty(), "time passing asks nothing of the runtime");
+        assert!(app.power_menu_open());
+        assert!(app.display_on());
+        assert!(app.key_up(Key::Power, POWER_MENU_MS + 100).is_empty(), "the release is spent");
+        assert!(app.power_menu_open(), "and does not turn the panel off");
+    }
+
+    #[test]
+    fn a_short_power_press_never_opens_the_menu() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        assert_eq!(press(&mut app, Key::Power, 1_000), vec![Effect::Ticks]);
+        assert!(!app.power_menu_open());
+        assert!(!app.display_on());
+        app.tick(POWER_MENU_MS + 1_000);
+        assert!(!app.power_menu_open(), "a released key starts no hold");
+    }
+
+    #[test]
+    fn each_pill_reboots_into_its_own_target() {
+        let f = fonts();
+        let targets = [Target::PowerOff, Target::System, Target::Recovery, Target::Fastboot];
+        for (i, target) in targets.into_iter().enumerate() {
+            let mut app = App::new(Screen::Home, W, H, PPD);
+            app.key(Key::Power, 0);
+            app.tick(POWER_MENU_MS);
+            app.key_up(Key::Power, POWER_MENU_MS + 50);
+            assert!(app.power_menu_open());
+            let g = crate::powermenu::geometry(&app.theme().m);
+            let row = g.rows[i];
+            app.touch(Touch::Down(row.rest_x(), row.cy()), &f, 5_000);
+            app.touch(Touch::Move(row.rest_x() + row.travel(), row.cy()), &f, 5_100);
+            assert_eq!(app.touch(Touch::Up, &f, 5_200), vec![Effect::Reboot(target)]);
+            assert!(!app.power_menu_open());
+        }
+    }
+
+    #[test]
+    fn a_short_slide_confirms_nothing_and_a_tap_outside_closes_the_menu() {
+        let f = fonts();
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.key(Key::Power, 0);
+        app.tick(POWER_MENU_MS);
+        app.key_up(Key::Power, POWER_MENU_MS + 50);
+        let g = crate::powermenu::geometry(&app.theme().m);
+        let row = g.rows[0];
+        app.touch(Touch::Down(row.rest_x(), row.cy()), &f, 4_000);
+        app.touch(Touch::Move(row.rest_x() + row.travel() * 0.3, row.cy()), &f, 4_100);
+        assert!(app.touch(Touch::Up, &f, 4_200).is_empty(), "not far enough");
+        assert!(app.power_menu_open());
+        app.touch(Touch::Down(20.0, 20.0), &f, 4_300);
+        assert!(!app.power_menu_open(), "a tap outside sends it away");
+    }
+
+    #[test]
+    fn a_power_key_tap_dismisses_the_menu_and_touches_nothing_behind_it() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.key(Key::Power, 0);
+        app.tick(POWER_MENU_MS);
+        app.key_up(Key::Power, POWER_MENU_MS + 50);
+        assert!(app.power_menu_open());
+        assert!(press(&mut app, Key::Power, POWER_MENU_MS + 200).is_empty());
+        assert!(!app.power_menu_open());
+        assert_eq!(app.screen(), Screen::Home);
+        assert!(app.display_on());
+    }
+
+    #[test]
+    fn the_double_tap_switch_is_kept_in_the_settings() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Settings, &f, &i);
+        assert!(app.state.double_tap);
+        assert!(tap_at(&mut app, &f, &i, Action::Toggle(Switch::DoubleTap), 1_000).is_empty());
+        assert!(!app.state.double_tap);
+        assert!(!Settings::of(&app.state).double_tap);
+    }
+
+    #[test]
+    fn a_touch_on_the_dark_panel_lights_it_only_when_swiped_up() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Home, W, H, PPD);
+        // The swipe up is the way in where the double tap is not the
+        // gesture offered.
+        app.state.double_tap = false;
         let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
         press(&mut app, Key::Power, 0);
         // One tap alone is not the second of a double tap, so the panel stays
         // dark and the page under it is not worked.
         assert!(app.touch(Touch::Down(x, y), &f, 100).is_empty());
-        assert!(app.touch(Touch::Move(x, y - 300.0), &f, 120).is_empty());
-        assert!(app.touch(Touch::Up, &f, 140).is_empty());
+        assert!(app.touch(Touch::Up, &f, 120).is_empty());
         assert!(!app.display_on(), "the panel stays dark");
         assert_eq!(app.screen(), Screen::Home, "the tap pressed nothing");
         assert_eq!(app.top().1, 0.0, "nor scrolled the page");

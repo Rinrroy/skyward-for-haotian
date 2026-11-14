@@ -22,3 +22,7 @@ sha2 = "0.10.9"
 # The resolver ureq takes is under its unversioned API, which may change
 # between any two releases.
 ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+# The tests of the LocalSend endpoint write into a folder of their own.
+tempfile = "3.27.0"

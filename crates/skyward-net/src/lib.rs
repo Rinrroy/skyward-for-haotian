@@ -3,12 +3,14 @@ pub mod dns;
 pub mod download;
 pub mod github;
 pub mod http;
+pub mod localsend;
 #[cfg(target_os = "android")]
 pub mod iface;
 pub mod mirror;
 pub mod reach;
 pub mod release;
 pub mod supplicant;
+pub mod web;
 pub mod wlan;
 
 /// Work stopped because it was asked to.

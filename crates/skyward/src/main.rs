@@ -11,7 +11,12 @@ use std::path::{Path, PathBuf};
 mod aod;
 mod art;
 #[cfg(target_os = "android")]
+#[cfg(target_os = "android")]
 mod backup;
+#[cfg(target_os = "android")]
+mod browser;
+#[cfg(target_os = "android")]
+mod cdp;
 #[cfg(target_os = "android")]
 mod decrypt;
 #[cfg(target_os = "android")]
@@ -24,6 +29,8 @@ mod haptics;
 mod input;
 #[cfg(target_os = "android")]
 mod keys;
+#[cfg(target_os = "android")]
+mod magisk;
 #[cfg(target_os = "android")]
 mod merge;
 #[cfg(target_os = "android")]

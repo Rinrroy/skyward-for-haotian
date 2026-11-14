@@ -5,7 +5,7 @@
 //! a time zone, a part or a place by its name, so a later version that lists
 //! them otherwise reads them the same.
 
-use crate::app::{Place, SortKey, State, SCREEN_OFF, TIME_ZONES};
+use crate::app::{AodStyle, Place, SortKey, State, SCREEN_OFF, TIME_ZONES};
 use crate::Lang;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -29,7 +29,7 @@ const USB_DRIVE: &str = "usb_drive";
 const SORTS: [&str; 3] = ["name", "modified", "kind"];
 /// The logs exported, and where they go, by name, in the order of the page
 /// that exports them.
-const LOGS: [&str; 2] = ["recovery", "kernel"];
+const LOGS: [&str; 4] = ["recovery", "kernel", "browser", "full"];
 const LOG_PLACES: [&str; 2] = ["temporary", "storage"];
 
 /// The settings as they are kept. A value missing is the one a recovery
@@ -55,18 +55,14 @@ pub struct Settings {
     pub vibrate: bool,
     /// The vibration slider's place, from 0 at its left end to 1.
     pub vibration: f32,
+    /// The look the always-on panel's clock takes.
+    pub aod_style: AodStyle,
     /// A computer connected over USB is offered internal storage.
     pub file_transfer: bool,
-    /// A dark panel keeps the clock and the phone's readings on the glass in
-    /// the panel's own doze, rather than being put out. A file that names
-    /// none leaves it off, which is what a freshly flashed phone starts with:
-    /// the face is asked for on the settings page, not found already lit.
-    pub always_on: bool,
-    /// Two taps on the dark panel light it again. A file that names none
-    /// leaves it off, which is what a freshly flashed phone starts with: the
-    /// gesture costs the phone its suspend, since the panel has to keep
-    /// dozing for the taps to be felt, so it is asked for rather than given.
+    /// A double tap on the dark panel lights it.
     pub double_tap: bool,
+    /// A dark panel keeps a clock on the glass rather than being put out.
+    pub always_on: bool,
     /// Turn both AVB checks off after a ROM is installed.
     pub disable_avb: bool,
     /// Remember the screen lock that opens the data partition, and try it
@@ -158,9 +154,10 @@ impl Settings {
             time_zone: TIME_ZONES[state.time_zone].2.to_string(),
             vibrate: state.vibrate,
             vibration: state.vibration,
+            aod_style: state.aod_style,
             file_transfer: state.file_transfer,
-            always_on: state.always_on,
             double_tap: state.double_tap,
+            always_on: state.always_on,
             disable_avb: state.disable_avb,
             remember_password: state.remember_password,
             sort: SORTS[match state.sort {
@@ -227,9 +224,10 @@ impl Settings {
         if (0.0..=1.0).contains(&self.vibration) {
             state.vibration = self.vibration;
         }
+        state.aod_style = self.aod_style;
         state.file_transfer = self.file_transfer;
-        state.always_on = self.always_on;
         state.double_tap = self.double_tap;
+        state.always_on = self.always_on;
         state.disable_avb = self.disable_avb;
         state.remember_password = self.remember_password;
         state.mirror = self.mirror;
@@ -394,7 +392,36 @@ mod tests {
     }
 
     #[test]
-    fn the_settings_go_round_through_their_file() {        let state = State {
+    fn a_file_without_the_double_tap_setting_keeps_the_gesture_on() {
+        let kept = Settings::read(r#"{ "dark": true }"#).unwrap();
+        assert!(kept.double_tap, "an older file starts with the gesture on");
+        let mut state = State::default();
+        kept.apply(&mut state);
+        assert!(state.double_tap);
+    }
+
+    #[test]
+    fn a_file_without_the_clock_setting_keeps_the_clock_on() {
+        let kept = Settings::read(r#"{ "dark": true }"#).unwrap();
+        assert!(kept.always_on, "an older file starts with the clock on");
+        let mut state = State::default();
+        kept.apply(&mut state);
+        assert!(state.always_on);
+    }
+
+    #[test]
+    fn turning_the_double_tap_off_goes_round_through_the_file() {
+        let state = State { double_tap: false, ..State::default() };
+        let kept = Settings::read(&Settings::of(&state).text()).unwrap();
+        assert!(!kept.double_tap);
+        let mut back = State::default();
+        kept.apply(&mut back);
+        assert!(!back.double_tap);
+    }
+
+    #[test]
+    fn the_settings_go_round_through_their_file() {
+        let state = State {
             lang: Lang::En,
             language_chosen: true,
             dark: true,
@@ -403,6 +430,7 @@ mod tests {
             time_zone: 7,
             vibrate: false,
             vibration: 0.4,
+            aod_style: AodStyle::Dial,
             file_transfer: false,
             always_on: true,
             double_tap: true,
@@ -412,7 +440,7 @@ mod tests {
             backup_to: Place::UsbDrive,
             compress: true,
             verify: false,
-            logs: [false, true],
+            logs: [false, true, false, false],
             logs_to: 1,
             ..State::default()
         };
@@ -434,11 +462,12 @@ mod tests {
 
     #[test]
     fn each_value_is_kept_as_what_it_means() {
-        let state = State { screen_off: 3, time_zone: 1, backup: [true, false, false, true], ..State::default() };
+        let state = State { screen_off: 3, time_zone: 1, aod_style: AodStyle::Dial, backup: [true, false, false, true], ..State::default() };
         let text = Settings::of(&state).text();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(json["screen_off"], 120, "two minutes, in seconds");
         assert_eq!(json["time_zone"], "Asia/Hong_Kong");
+        assert_eq!(json["aod_style"], "dial");
         assert_eq!(json["backup"]["parts"], serde_json::json!(["boot", "modem"]));
         assert_eq!(json["logs"]["to"], "temporary");
         assert_eq!(json["spoken"], "zh-Hans");
@@ -479,7 +508,7 @@ mod tests {
         assert_eq!((state.screen_off, state.time_zone, state.backup_to, state.logs_to), (start.screen_off, start.time_zone, start.backup_to, start.logs_to));
         assert!(!state.language_chosen);
         assert_eq!(state.backup, [true, false, false, false], "a part this version has not is left out");
-        assert_eq!(state.logs, [false, true]);
+        assert_eq!(state.logs, [false, true, false, false]);
     }
 
     #[test]

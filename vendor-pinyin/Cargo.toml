@@ -1,0 +1,35 @@
+[package]
+name = "pinyin"
+version = "0.11.0"
+authors = ["mozillazg <mozillazg101@gmail.com>", "Xidorn Quan <me@upsuper.org>"]
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/mozillazg/rust-pinyin"
+repository = "https://github.com/mozillazg/rust-pinyin"
+description = "Convert Chinese to pinyin"
+documentation = "https://docs.rs/pinyin/"
+keywords = ["pinyin", "hanzi", "Chinese"]
+include = [
+    "/build.rs",
+    "/examples/*",
+    "/pinyin-data/pinyin.txt",
+    "/src/**/*",
+    "/tests/**/*",
+    "/Cargo.toml",
+    "/LICENSE",
+    "/README.md",
+]
+edition = "2018"
+
+[features]
+default = ["plain"]
+plain = []
+# The build script writes a `split` field for the cut between a syllable's
+# initial and its final when this is on; it reads `cfg(feature = "compat")`,
+# which a compiler that checks its `cfg`s wants declared even off.
+compat = []
+with_tone = []
+with_tone_num = []
+with_tone_num_end = []
+heteronym = []
+

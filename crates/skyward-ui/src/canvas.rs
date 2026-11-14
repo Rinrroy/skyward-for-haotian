@@ -67,6 +67,12 @@ fn kept(n: usize) -> Vec<u8> {
 // Drawing primitives take geometry plus style as plain arguments.
 #[allow(clippy::too_many_arguments)]
 impl Canvas {
+    /// A canvas holding `w` by `h` pixels of RGBA, as a picture decodes.
+    pub fn from_rgba(w: u32, h: u32, data: Vec<u8>) -> Canvas {
+        assert_eq!(data.len(), w as usize * h as usize * 4, "a picture has four bytes a pixel");
+        Canvas { w, h, data, top: 0, bottom: h, left: 0, span: w }
+    }
+
     pub fn new(w: u32, h: u32) -> Self {
         Self::filled(w, h, Rgba { r: 0, g: 0, b: 0, a: 0 })
     }
@@ -275,6 +281,44 @@ impl Canvas {
         for p in self.data.as_chunks_mut::<4>().0 {
             *p = darken(*p, keep);
         }
+    }
+
+    /// Take everything on this canvas up by `dy` pixels, and let `level` of
+    /// its light go as it goes.
+    ///
+    /// What was at the top is gone off it, and what was at the bottom
+    /// comes up to take its place, over black: the canvas is a window on
+    /// a panel, and the panel shows nothing that is not on it.
+    pub fn lift(&mut self, dy: f32, level: f32) {
+        let shift = dy.round() as i32;
+        if shift != 0 {
+            self.rows_moved(shift);
+        }
+        self.dim(level);
+    }
+
+    /// Move the rows of this canvas up by `shift` rows: a negative shift
+    /// moves them down.
+    fn rows_moved(&mut self, shift: i32) {
+        let (top, bottom) = (self.top as i32, self.bottom as i32);
+        if bottom <= top {
+            return;
+        }
+        let row = self.span as usize * 4;
+        // Where each row of the panel comes from: a row that has come
+        // from above the panel is black, and one that has gone off its
+        // top is not there.
+        let from = |y: i32| (y - shift).clamp(0, self.h as i32 - 1);
+        let mut moved: Vec<u8> = vec![0; self.data.len()];
+        for y in top..bottom {
+            let src = from(y) as usize;
+            let (a, b) = ((y - top) as usize * row, ((y - top) as usize + 1) * row);
+            let (c, d) = (src * row, src * row + row);
+            if d <= self.data.len() {
+                moved[a..b].copy_from_slice(&self.data[c..d]);
+            }
+        }
+        self.data = moved;
     }
 
     /// Lay `layer`, whose top-left corner goes at (`x`, `y`), over this
