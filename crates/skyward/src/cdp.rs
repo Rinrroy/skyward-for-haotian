@@ -19,6 +19,11 @@ const CSS_W: f64 = 412.0;
 /// a phone viewport at three device pixels to the CSS one.
 const FALLBACK_CSS_H: f64 = 915.0;
 const FALLBACK_SCALE: f64 = 3.0;
+/// How much of the distance a gesture asks for the page actually moves, which
+/// was measured at a little over half: a touch that goes down, moves and comes
+/// up settles short of where it was taken. The recovery asks for the distance
+/// its finger went, so the distance the page is asked for is this much larger.
+const GAIN: f64 = 0.42;
 
 pub struct Cdp {
     stream: TcpStream,
@@ -26,9 +31,6 @@ pub struct Cdp {
     /// The viewport being drawn, in CSS pixels: with the page's own scale it
     /// is the frame's size in device pixels, so the recovery never resizes one.
     view: (f64, f64),
-    /// Where the finger a drag put down on the page is, in CSS pixels from
-    /// the top of the viewport, while it is still down.
-    finger: Option<f64>,
 }
 
 impl Cdp {
@@ -91,7 +93,7 @@ impl Cdp {
         if !headers.starts_with("HTTP/1.1 101") && !headers.starts_with("HTTP/1.0 101") {
             bail!("Chromium refused the debugging socket: {}", headers.lines().next().unwrap_or(""));
         }
-        let mut cdp = Cdp { stream, next: 1, view: css, finger: None };
+        let mut cdp = Cdp { stream, next: 1, view: css };
         cdp.call("Page.enable", json!({}))?;
         cdp.call(
             "Emulation.setDeviceMetricsOverride",
@@ -153,9 +155,6 @@ impl Cdp {
     }
 
     pub fn touch(&mut self, x: u32, y: u32) -> Result<()> {
-        // A finger left on the page by a drag is lifted first: this Chromium
-        // would take the tap for a second one.
-        self.drag_end(0)?;
         let point = json!([{"x": x, "y": y, "id": 1, "radiusX": 2, "radiusY": 2, "force": 1.0}]);
         self.call("Input.dispatchTouchEvent", json!({"type": "touchStart", "touchPoints": point}))?;
         std::thread::sleep(Duration::from_millis(50));
@@ -177,65 +176,60 @@ impl Cdp {
 
     /// Scroll the page itself, `dy` being thousandths of the frame's height
     /// and positive meaning the page moves up under the finger, as a drag
-    /// does. The first move of a drag puts a finger down on the page, and the
-    /// finger stays there until `drag_end` lifts it.
+    /// does.
     ///
-    /// What moves this page is that finger: Chromium answers a synthesized
-    /// scroll gesture only once it has carried the whole gesture out, and that
-    /// took most of a second, so a drag sent at the speed a finger moves held
-    /// every move after it. A touch that stays down is one event per move, and
-    /// a page scrolled that way keeps its own inertia.
+    /// Each move is a whole gesture of its own — a finger down, taken along
+    /// the frame, and lifted — because that is what moves this page: a page
+    /// answers a synthesized scroll gesture only once it has carried the whole
+    /// gesture out, which took most of a second, and a finger held down across
+    /// several moves either did nothing or took the page back. One gesture
+    /// costs a little over forty milliseconds, which is fast enough for the
+    /// moves a finger makes.
     pub fn scroll(&mut self, dy: i32) -> Result<()> {
+        // The page follows the finger: it goes up the frame by the distance
+        // the page is to move down.
+        let want = f64::from(dy) * self.view.1 / 1000.0;
+        self.gesture(-want / GAIN)
+    }
+
+    /// Let the page go where it was thrown, at `speed` CSS pixels a second in
+    /// the same direction as `dy`: the flick a finger makes when it lifts
+    /// while still moving.
+    pub fn drag_end(&mut self, speed: i32) -> Result<()> {
+        if speed == 0 {
+            return Ok(());
+        }
+        // A quarter of a second of the finger's speed is where the page comes
+        // to rest, which is a throw rather than a jump.
+        self.gesture(-f64::from(speed) * 0.25 / GAIN)
+    }
+
+    /// Take a finger `ask` CSS pixels down the frame — up it, when `ask` is
+    /// negative — as one whole gesture: down, moved, up.
+    fn gesture(&mut self, ask: f64) -> Result<()> {
         let (w, h) = self.view;
-        let distance = dy as f64 * h / 1000.0;
-        if distance.abs() < 1.0 {
+        if ask.abs() < 1.0 {
             return Ok(());
         }
         let x = (w / 2.0).round();
         let (low, high) = (24.0, (h - 24.0).max(24.0));
-        let at = match self.finger {
-            Some(at) => at,
-            None => {
-                // The finger goes down where the drag will take it from, so
-                // that the whole of the move is still on the frame.
-                let at = (h / 2.0 - distance / 2.0).clamp(low, high);
-                self.call("Input.dispatchTouchEvent", json!({"type": "touchStart", "touchPoints": [{"x": x, "y": at, "id": 1}]}))?;
-                self.finger = Some(at);
-                at
-            }
-        };
-        let mut to = at - distance;
+        // The finger goes down where the drag will take it from, so that the
+        // whole of the move is still on the frame.
+        let mut at = (h / 2.0 - ask / 2.0).clamp(low, high);
+        let mut to = at + ask;
         if to < low || to > high {
-            // A drag longer than the frame takes the finger off it: it is put
-            // down again in the middle and the page is handed to the rest.
-            self.call("Input.dispatchTouchEvent", json!({"type": "touchEnd", "touchPoints": []}))?;
-            let middle = (h / 2.0).clamp(low, high);
-            self.call("Input.dispatchTouchEvent", json!({"type": "touchStart", "touchPoints": [{"x": x, "y": middle, "id": 1}]}))?;
-            to = (middle - distance).clamp(low, high);
+            // A move longer than the frame takes the finger off it: it is put
+            // down at one end and the page takes the whole of the frame.
+            at = if ask > 0.0 { low } else { high };
+            to = if ask > 0.0 { high } else { low };
         }
+        // Each event is waited for, and that spacing is what keeps the page
+        // from taking the move for a throw: sent within a millisecond of each
+        // other, three events read as an enormously fast flick and the page
+        // went the whole length of the document.
+        self.call("Input.dispatchTouchEvent", json!({"type": "touchStart", "touchPoints": [{"x": x, "y": at, "id": 1}]}))?;
         self.call("Input.dispatchTouchEvent", json!({"type": "touchMove", "touchPoints": [{"x": x, "y": to, "id": 1}]}))?;
-        self.finger = Some(to);
-        Ok(())
-    }
-
-    /// Lift the finger a drag put down, going the way it was going at `speed`
-    /// CSS pixels a second, so the page keeps gliding after it has gone.
-    pub fn drag_end(&mut self, speed: i32) -> Result<()> {
-        let at = match self.finger {
-            Some(at) => at,
-            None => return Ok(()),
-        };
-        let (w, h) = self.view;
-        let x = (w / 2.0).round();
-        if speed != 0 {
-            let (low, high) = (24.0, (h - 24.0).max(24.0));
-            let to = (at - f64::from(speed) * 0.12).clamp(low, high);
-            if (to - at).abs() >= 1.0 {
-                self.call("Input.dispatchTouchEvent", json!({"type": "touchMove", "touchPoints": [{"x": x, "y": to, "id": 1}]}))?;
-            }
-        }
         self.call("Input.dispatchTouchEvent", json!({"type": "touchEnd", "touchPoints": []}))?;
-        self.finger = None;
         Ok(())
     }
 
