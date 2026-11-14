@@ -34,13 +34,21 @@ pub enum Task {
     Save { url: String, path: PathBuf },
     /// Unpack the plugin package at `archive` into `dir`.
     Install { archive: PathBuf, dir: PathBuf },
-    /// Start the persistent Chromium session used by the full browser.
-    FullStart { dir: PathBuf, url: String },
+    /// Start the persistent Chromium session used by the full browser, drawn
+    /// for a box `view` device pixels wide and tall.
+    FullStart { dir: PathBuf, url: String, view: (u32, u32) },
+    /// Touch the page where the frame was touched, in thousandths of it.
     FullTap { x: u16, y: u16 },
+    /// Scroll the page under the frame: `dy` thousandths of the frame's
+    /// height, and `speed` in CSS pixels a second, which is what a flick
+    /// keeps gliding at.
+    FullScroll { dy: i32, speed: i32 },
     FullPinch { scale: f64 },
     FullText { text: String },
     FullReload,
     FullStop,
+    /// End the worker's thread: nothing more is asked of it.
+    Halt,
 }
 
 pub enum Event {
@@ -65,8 +73,33 @@ struct FullSession {
 
 static FULL: OnceLock<Mutex<Option<FullSession>>> = OnceLock::new();
 
+/// The box the recovery draws the full mode's frame in, in its own pixels.
+/// Every frame is drawn for it, so that what Chromium paints is what the
+/// screen shows and nothing has to be scaled afterwards - which is most of
+/// what showing a frame costs.
+static VIEW: Mutex<(u32, u32)> = Mutex::new((0, 0));
+
+fn set_view(view: (u32, u32)) {
+    *VIEW.lock().expect("the frame's box is not held by a thread that panicked") = view;
+}
+
 fn full_slot() -> &'static Mutex<Option<FullSession>> {
     FULL.get_or_init(|| Mutex::new(None))
+}
+
+/// Where the screen is told what the page did, from whichever thread is
+/// drawing it: the worker that takes the gestures, or the one that keeps
+/// drawing the page while it moves.
+struct Alerts {
+    events: Mutex<mpsc::Sender<Event>>,
+    wake: OwnedFd,
+}
+
+impl Alerts {
+    fn tell(&self, event: Event) {
+        let _ = self.events.lock().expect("the browser's events are not held by a thread that panicked").send(event);
+        unsafe { libc::write(self.wake.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+    }
 }
 
 fn stop_full() {
@@ -181,11 +214,7 @@ fn start_full(dir: &Path, url: &str) -> Result<()> {
 
 fn full_started(dir: &Path, url: &str) -> Result<Cdp> {
     start_full(dir, url)?;
-    Cdp::connect()
-}
-
-fn full_page_shot(cdp: &mut Cdp) -> Result<Vec<u8>> {
-    cdp.screenshot()
+    attach_page()
 }
 
 /// Whether the plugin's locale folder is there and empty of packs, in which
@@ -197,9 +226,144 @@ fn locales_empty(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn full_result(cdp: &mut Cdp) -> (Result<Vec<u8>, String>, bool) {
-    let focus = cdp.focus_is_text();
-    (full_page_shot(cdp).map_err(|e| format!("{e:#}")), focus)
+/// The page the full mode is showing. Attaching to it costs more than drawing
+/// one more frame of it, and a finger moves many times, so the connection is
+/// kept between gestures and put back whenever it breaks.
+static PAGE: Mutex<Option<Cdp>> = Mutex::new(None);
+
+fn attach_page() -> Result<Cdp> {
+    let view = *VIEW.lock().expect("the frame's box is not held by a thread that panicked");
+    if view.0 == 0 || view.1 == 0 {
+        Cdp::connect_default()
+    } else {
+        Cdp::connect(view)
+    }
+}
+
+/// Use the page, attaching to it first if it is not attached. A page that
+/// fails is let go, so the next gesture attaches to it afresh rather than
+/// speaking to a socket that no longer answers.
+fn with_page<T>(act: impl FnOnce(&mut Cdp) -> Result<T>) -> Result<T> {
+    let mut slot = PAGE.lock().expect("the page is not held by a thread that panicked");
+    if slot.is_none() {
+        *slot = Some(attach_page()?);
+    }
+    let page = slot.as_mut().expect("the page was attached just above");
+    match act(page) {
+        Ok(value) => Ok(value),
+        Err(e) => {
+            *slot = None;
+            Err(e)
+        }
+    }
+}
+
+/// What the page drew before, and whether it was the same as the frame before
+/// that: a page whose picture keeps changing is one to go on drawing.
+static LAST_DREW: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+static MOVING: AtomicBool = AtomicBool::new(false);
+
+/// The thread that goes on drawing the page while it moves, so that a drag, an
+/// animation or a video is seen moving with the finger still on the glass.
+/// A gesture only sends what the finger did and never waits for a frame, so it
+/// costs what the page takes to answer rather than what it takes to draw.
+static PUMP: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+static PUMPING: AtomicBool = AtomicBool::new(false);
+/// Set by a gesture that changed the page, so that the frame it left is drawn
+/// at once rather than at the next look when nothing is happening.
+static ASK: AtomicBool = AtomicBool::new(false);
+
+/// How far apart the frames are while the page moves, and how often it is
+/// looked at when nothing is happening.
+const MOVING_GAP_MS: u64 = 90;
+const IDLE_GAP_MS: u64 = 400;
+
+fn poke() {
+    ASK.store(true, Ordering::Relaxed);
+}
+
+/// Whether the frame differs from the one before it: one that stands still is
+/// drawn again rarely, one that moves is drawn as fast as it comes.
+fn drew_again(png: &[u8]) -> bool {
+    let mut last = LAST_DREW.lock().expect("the last frame is not held by a thread that panicked");
+    let changed = last.as_deref() != Some(png);
+    if changed {
+        *last = Some(png.to_vec());
+    }
+    MOVING.store(changed, Ordering::Relaxed);
+    changed
+}
+
+/// Start drawing the page, or start over on a page that was started again.
+fn start_pump(alerts: Arc<Alerts>) {
+    stop_pump();
+    PUMPING.store(true, Ordering::Relaxed);
+    poke();
+    let spawned = thread::Builder::new().name("browser-frame".into()).spawn(move || {
+        let mut cdp = match attach_page() {
+            Ok(cdp) => cdp,
+            // The page has not woken yet: the next gesture starts it again.
+            Err(_) => return,
+        };
+        let mut drew = Instant::now() - Duration::from_secs(1);
+        while PUMPING.load(Ordering::Relaxed) {
+            let asked = ASK.swap(false, Ordering::Relaxed);
+            // A page still filling in is drawn as fast as one that moves:
+            // what it paints on the way is what the screen is showing.
+            let busy = MOVING.load(Ordering::Relaxed) || !cdp.ready();
+            let gap = Duration::from_millis(if busy || asked { MOVING_GAP_MS } else { IDLE_GAP_MS });
+            if !asked && drew.elapsed() < gap {
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            let png = match cdp.screenshot() {
+                Ok(png) => png,
+                // A page that stops answering is let go rather than drawn as it
+                // was: the next gesture attaches to it afresh.
+                Err(_) => break,
+            };
+            drew = Instant::now();
+            if drew_again(&png) {
+                alerts.tell(Event::Shot(Ok(png)));
+            }
+        }
+    });
+    if let Ok(handle) = spawned {
+        *PUMP.lock().expect("the frame thread is not held by a thread that panicked") = Some(handle);
+    }
+}
+
+fn stop_pump() {
+    PUMPING.store(false, Ordering::Relaxed);
+    if let Some(handle) = PUMP.lock().expect("the frame thread is not held by a thread that panicked").take() {
+        let _ = handle.join();
+    }
+}
+
+/// Tell the thread drawing the page to stop, without waiting for a frame of a
+/// page that may not answer any more: it lets go of its own account when the
+/// frame it is waiting on comes back or fails.
+fn halt_pump() {
+    PUMPING.store(false, Ordering::Relaxed);
+    *PUMP.lock().expect("the frame thread is not held by a thread that panicked") = None;
+}
+
+/// Do one thing to the page and ask for the frame it left, or say why it could
+/// not: the frame itself comes from the pump, which is drawing already.
+fn full_after(tell: &dyn Fn(Event), act: impl FnOnce(&mut Cdp) -> Result<()>) {
+    match with_page(|cdp| {
+        act(cdp)?;
+        Ok(cdp.focus_is_text())
+    }) {
+        Ok(focus) => {
+            poke();
+            tell(Event::Focus(focus));
+        }
+        Err(e) => {
+            stop_full();
+            tell(Event::Shot(Err(format!("{e:#}"))));
+        }
+    }
 }
 
 /// What Chromium itself said last, for a page that has to say why the full
@@ -246,6 +410,8 @@ pub struct Worker {
     stop: Arc<AtomicBool>,
     /// The connection in use, which stopping cuts at once.
     agent: Arc<Mutex<Option<ureq::Agent>>>,
+    /// What is asked of the thread, which keeps working through the list.
+    asking: mpsc::Sender<Task>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -257,19 +423,23 @@ impl Worker {
         }
         let (wake, signal) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
         let (tx, events) = mpsc::channel();
+        let alerts = Arc::new(Alerts { events: Mutex::new(tx), wake: signal });
         let stop = Arc::new(AtomicBool::new(false));
         let agent: Arc<Mutex<Option<ureq::Agent>>> = Arc::new(Mutex::new(None));
         let (stopping, using) = (stop.clone(), agent.clone());
+        let (asking, queue) = mpsc::channel::<Task>();
+        let told = alerts.clone();
         let thread = thread::Builder::new()
             .name("browser".into())
             .spawn(move || {
-                let tell = |event: Event| {
-                    let _ = tx.send(event);
-                    unsafe { libc::write(signal.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
-                };
                 let a = http::agent(servers);
                 *using.lock().expect("the agent is not held by a thread that panicked") = Some(a.clone());
-                match task {
+                // One worker for as long as the screen keeps it: a gesture is a
+                // task handed to it, not a worker of its own, so that a drag
+                // never waits for a connection to be made first.
+                let run = |task: Task| {
+                    let tell = |event: Event| told.tell(event);
+                    match task {
                     Task::Open { url, cookie } => {
                         note(&format!("open {url}"));
                         let opened = web::open_with(&a, &url, cookie.as_deref()).map_err(|e| format!("{e:#}"));
@@ -341,21 +511,24 @@ impl Worker {
                         });
                         tell(Event::Installed(ended));
                     }
-                    Task::FullStart { dir, url } => {
-                        let result = (|| -> Result<(Vec<u8>, bool)> {
+                    Task::FullStart { dir, url, view } => {
+                        set_view(view);
+                        let result = (|| -> Result<()> {
                             let mut cdp = full_started(&dir, &url)?;
                             cdp.navigate(&url)?;
                             let focus = cdp.focus_is_text();
-                            let png = cdp.screenshot()?;
-                            Ok((png, focus))
+                            tell(Event::Focus(focus));
+                            *PAGE.lock().expect("the page is not held by a thread that panicked") = Some(cdp);
+                            Ok(())
                         })();
                         match result {
-                            Ok((png, focus)) => {
-                                tell(Event::Shot(Ok(png)));
-                                tell(Event::Focus(focus));
-                            }
+                            // The page is drawn by the thread that goes on
+                            // drawing it, from a connection of its own, so that
+                            // a gesture never waits for a frame.
+                            Ok(()) => start_pump(told.clone()),
                             Err(e) => {
                                 stop_full();
+                                *LAST_DREW.lock().expect("the last frame is not held by a thread that panicked") = None;
                                 let mut why = format!("{e:#}");
                                 if let Some(said) = chromium_said(&dir) {
                                     note(&format!("the full browser said: {}", said.replace('\n', " ⏎ ")));
@@ -370,75 +543,35 @@ impl Worker {
                             }
                         }
                     }
-                    Task::FullTap { x, y } => {
-                        let result = Cdp::connect().and_then(|mut cdp| {
-                            cdp.touch_page(x as u32, y as u32)?;
-                            Ok(full_result(&mut cdp))
-                        });
-                        match result {
-                            Ok((png, focus)) => {
-                                tell(Event::Shot(png));
-                                tell(Event::Focus(focus));
-                            }
-                            Err(e) => {
-                                stop_full();
-                                tell(Event::Shot(Err(format!("{e:#}"))));
-                            }
-                        }
+                    Task::FullTap { x, y } => full_after(&tell, |cdp| cdp.tap(x as u32, y as u32)),
+                    Task::FullScroll { dy, speed } => full_after(&tell, |cdp| cdp.scroll(dy, speed)),
+                    Task::FullPinch { scale } => full_after(&tell, |cdp| cdp.pinch(scale)),
+                    Task::FullText { text } => full_after(&tell, |cdp| cdp.insert_text(&text)),
+                    Task::FullReload => full_after(&tell, |cdp| cdp.reload()),
+                    Task::FullStop => {
+                        // The browser is stopped before the thread drawing it,
+                        // so that a frame waiting on it comes back at once.
+                        stop_full();
+                        stop_pump();
+                        *PAGE.lock().expect("the page is not held by a thread that panicked") = None;
+                        *LAST_DREW.lock().expect("the last frame is not held by a thread that panicked") = None;
+                        MOVING.store(false, Ordering::Relaxed);
                     }
-                    Task::FullPinch { scale } => {
-                        let result = Cdp::connect().and_then(|mut cdp| {
-                            cdp.pinch(crate::cdp::WIDTH / 2, crate::cdp::HEIGHT / 2, scale)?;
-                            Ok(full_result(&mut cdp))
-                        });
-                        match result {
-                            Ok((png, focus)) => {
-                                tell(Event::Shot(png));
-                                tell(Event::Focus(focus));
-                            }
-                            Err(e) => {
-                                stop_full();
-                                tell(Event::Shot(Err(format!("{e:#}"))));
-                            }
-                        }
+                    // The loop below ends on this rather than doing anything
+                    // with it, so this arm is only here to make the match whole.
+                    Task::Halt => {}
                     }
-                    Task::FullText { text } => {
-                        let result = Cdp::connect().and_then(|mut cdp| {
-                            cdp.insert_text(&text)?;
-                            Ok(full_result(&mut cdp))
-                        });
-                        match result {
-                            Ok((png, _focus)) => {
-                                tell(Event::Shot(png));
-                                tell(Event::Focus(false));
-                            }
-                            Err(e) => {
-                                stop_full();
-                                tell(Event::Shot(Err(format!("{e:#}"))));
-                            }
-                        }
+                };
+                while let Ok(task) = queue.recv() {
+                    if stopping.load(Ordering::Relaxed) || matches!(task, Task::Halt) {
+                        break;
                     }
-                    Task::FullReload => {
-                        let result = Cdp::connect().and_then(|mut cdp| {
-                            cdp.reload()?;
-                            Ok(full_result(&mut cdp))
-                        });
-                        match result {
-                            Ok((png, focus)) => {
-                                tell(Event::Shot(png));
-                                tell(Event::Focus(focus));
-                            }
-                            Err(e) => {
-                                stop_full();
-                                tell(Event::Shot(Err(format!("{e:#}"))));
-                            }
-                        }
-                    }
-                    Task::FullStop => stop_full(),
+                    run(task);
                 }
             })
             .map_err(|e| anyhow::anyhow!("start the browser's worker: {e}"))?;
-        Ok(Worker { events, wake, stop, agent, thread: Some(thread) })
+        let _ = asking.send(task);
+        Ok(Worker { events, wake, stop, agent, asking, thread: Some(thread) })
     }
 
     pub fn fd(&self) -> RawFd {
@@ -452,9 +585,18 @@ impl Worker {
         self.events.try_iter().collect()
     }
 
+    /// Hand the thread one more thing to do, without waiting for it.
+    pub fn tell(&self, task: Task) {
+        let _ = self.asking.send(task);
+    }
+
     /// Stop at once, cutting the connection in use.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        // The thread drawing the page is let go of here rather than waited for
+        // in the drop: a frame it is waiting on would hold the screen up.
+        halt_pump();
+        let _ = self.asking.send(Task::Halt);
         if let Some(a) = self.agent.lock().expect("the agent is not held by a thread that panicked").take() {
             a.shutdown();
         }
@@ -463,6 +605,9 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
+        // The thread ends on this, so that a worker dropped while its list is
+        // empty still lets its thread go.
+        let _ = self.asking.send(Task::Halt);
         if let Some(thread) = self.thread.take() {
             thread.join().expect("the browser's worker does not panic");
         }
@@ -489,7 +634,8 @@ fn note(line: &str) {
     }
 }
 
-fn run(command: &str, args: &[&str]) -> Result<(), String> {    let output = std::process::Command::new(command)
+fn run(command: &str, args: &[&str]) -> Result<(), String> {
+    let output = std::process::Command::new(command)
         .args(args)
         .output()
         .map_err(|e| format!("run {command}: {e}"))?;

@@ -2542,12 +2542,13 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                         read = true;
                     }
                     browser::Event::Shot(shot) => {
+                        // A frame of the full mode: the worker is kept, since
+                        // it is still the one the gestures go to and the one
+                        // drawing the page while it moves.
                         app.browser_plugin_shot(shot);
-                        read = true;
                     }
                     browser::Event::Focus(focus) => {
                         app.browser_plugin_focus(focus);
-                        read = true;
                     }
                 }
             }
@@ -2565,7 +2566,9 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                         saved = true;
                     }
                     browser::Event::Opened(_) => unreachable!("saving a file reads no page"),
-                    browser::Event::Installed(_) | browser::Event::Shot(_) | browser::Event::Focus(_) => unreachable!("saving a file runs no plugin"),
+                    browser::Event::Installed(_) | browser::Event::Shot(_) | browser::Event::Focus(_) => {
+                        unreachable!("saving a file runs no plugin")
+                    }
                 }
             }
         }
@@ -3531,53 +3534,54 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                             Err(e) => app.browser_plugin_installed(Err(format!("{e:#}"))),
                         }
                     }
-                    Effect::BrowserPluginStart { dir, url, out } => {
+                    Effect::BrowserPluginStart { dir, url, view } => {
                         if let Some(worker) = reader.take() {
                             worker.stop();
                         }
-                        let task = browser::Task::FullStart { dir: PathBuf::from(dir), url };
-                        let _ = out;
+                        let task = browser::Task::FullStart { dir: PathBuf::from(dir), url, view };
                         match browser::Worker::start(task, servers.clone()) {
                             Ok(worker) => reader = Some(worker),
                             Err(e) => app.browser_plugin_shot(Err(format!("{e:#}"))),
                         }
                     }
-                    Effect::BrowserPluginTap { x, y } => {
-                        if let Some(worker) = reader.take() {
-                            worker.stop();
-                        }
-                        match browser::Worker::start(browser::Task::FullTap { x, y }, servers.clone()) {
+                    // A gesture is handed to the worker already there: the one
+                    // holding the page open, which goes on drawing it. Only a
+                    // gesture with no worker behind it starts one.
+                    Effect::BrowserPluginTap { x, y } => match &reader {
+                        Some(worker) => worker.tell(browser::Task::FullTap { x, y }),
+                        None => match browser::Worker::start(browser::Task::FullTap { x, y }, servers.clone()) {
                             Ok(worker) => reader = Some(worker),
                             Err(e) => app.browser_plugin_shot(Err(format!("{e:#}"))),
-                        }
-                    }
-                    Effect::BrowserPluginPinch { scale } => {
-                        if let Some(worker) = reader.take() {
-                            worker.stop();
-                        }
-                        match browser::Worker::start(browser::Task::FullPinch { scale }, servers.clone()) {
+                        },
+                    },
+                    Effect::BrowserPluginScroll { dy, speed } => match &reader {
+                        Some(worker) => worker.tell(browser::Task::FullScroll { dy, speed }),
+                        None => match browser::Worker::start(browser::Task::FullScroll { dy, speed }, servers.clone()) {
                             Ok(worker) => reader = Some(worker),
                             Err(e) => app.browser_plugin_shot(Err(format!("{e:#}"))),
-                        }
-                    }
-                    Effect::BrowserPluginText(text) => {
-                        if let Some(worker) = reader.take() {
-                            worker.stop();
-                        }
-                        match browser::Worker::start(browser::Task::FullText { text }, servers.clone()) {
+                        },
+                    },
+                    Effect::BrowserPluginPinch { scale } => match &reader {
+                        Some(worker) => worker.tell(browser::Task::FullPinch { scale }),
+                        None => match browser::Worker::start(browser::Task::FullPinch { scale }, servers.clone()) {
                             Ok(worker) => reader = Some(worker),
                             Err(e) => app.browser_plugin_shot(Err(format!("{e:#}"))),
-                        }
-                    }
-                    Effect::BrowserPluginReload => {
-                        if let Some(worker) = reader.take() {
-                            worker.stop();
-                        }
-                        match browser::Worker::start(browser::Task::FullReload, servers.clone()) {
+                        },
+                    },
+                    Effect::BrowserPluginText(text) => match &reader {
+                        Some(worker) => worker.tell(browser::Task::FullText { text }),
+                        None => match browser::Worker::start(browser::Task::FullText { text }, servers.clone()) {
                             Ok(worker) => reader = Some(worker),
                             Err(e) => app.browser_plugin_shot(Err(format!("{e:#}"))),
-                        }
-                    }
+                        },
+                    },
+                    Effect::BrowserPluginReload => match &reader {
+                        Some(worker) => worker.tell(browser::Task::FullReload),
+                        None => match browser::Worker::start(browser::Task::FullReload, servers.clone()) {
+                            Ok(worker) => reader = Some(worker),
+                            Err(e) => app.browser_plugin_shot(Err(format!("{e:#}"))),
+                        },
+                    },
                     Effect::BrowserPluginStop => {
                         if let Some(worker) = &reader {
                             worker.stop();

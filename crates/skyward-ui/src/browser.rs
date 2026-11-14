@@ -250,10 +250,22 @@ fn home(cx: &Ctx) -> Frame {
 
 /// A page the external Chromium drew, under the normal address bar and
 /// dock: the plugin is the webview, the recovery still owns the controls.
+/// The box the full mode draws the page in: everything between the margins,
+/// under the bar and above the dock. The page is laid out for exactly this
+/// box, so the frame it draws goes in without being scaled, and the box never
+/// moves: scrolling happens inside the page.
+pub fn full_box(t: &Theme) -> Rect {
+    let m = &t.m;
+    let top = widgets::bar_bottom(t) + m.dp(8.0) + m.dp(44.0) + m.dp(8.0);
+    let dock = m.dp(12.0) + m.dp(48.0) + m.dp(26.0);
+    let bottom = m.h as f32 - dock - m.dp(8.0);
+    Rect::new(m.margin, top, m.w as f32 - m.margin * 2.0, (bottom - top).max(m.dp(160.0)))
+}
+
 fn full_page(cx: &Ctx) -> Frame {
     let (t, l) = (cx.t, cx.state.lang);
     let m = &t.m;
-    let mut c = long_page(cx);
+    let mut c = page(cx);
     let top = widgets::bar_bottom(t) + m.dp(8.0);
     let mut out = Vec::new();
     let back = Rect::new(m.margin, top, m.dp(44.0), m.dp(44.0));
@@ -265,19 +277,18 @@ fn full_page(cx: &Ctx) -> Frame {
     let bar = Rect::new(back.x + back.w + m.dp(10.0), top, m.w as f32 - back.x - back.w - m.margin - m.dp(10.0), m.dp(44.0));
     widgets::search_capsule(&mut c, t, cx.f, bar, &cx.state.browser.url);
     out.push(Hit { rect: bar, action: Action::BrowserAddress });
-    let mut y = top + back.h + m.dp(8.0);
-    let max_w = (m.w as f32 - m.margin * 2.0).max(m.dp(80.0)) as u32;
+    let box_ = full_box(t);
     if let Some(shot) = &cx.state.browser.full_shot {
-        if let Some((w, h, rgba)) = decode_picture(shot, max_w) {
-            let x = (m.w as f32 - w as f32) / 2.0;
+        if let Some((w, h, rgba)) = decode_picture(shot, box_.w as u32) {
+            let x = box_.x + (box_.w - w as f32) / 2.0;
             let picture = Canvas::from_rgba(w, h, rgba);
-            c.lay(&picture, x.round() as i32, y.round() as i32, 1.0);
+            c.lay(&picture, x.round() as i32, box_.y.round() as i32, 1.0);
             let (cols, rows) = (12, 24);
             for gy in 0..rows {
                 for gx in 0..cols {
                     let rect = Rect::new(
                         x + gx as f32 * w as f32 / cols as f32,
-                        y + gy as f32 * h as f32 / rows as f32,
+                        box_.y + gy as f32 * h as f32 / rows as f32,
                         w as f32 / cols as f32,
                         h as f32 / rows as f32,
                     );
@@ -288,33 +299,34 @@ fn full_page(cx: &Ctx) -> Frame {
             }
             if let Some(progress) = cx.state.browser.full_progress.filter(|p| *p < 1.0) {
                 let progress = progress.clamp(0.0, 1.0);
-                c.fill_round_rect(m.margin, y - m.dp(4.0), (m.w as f32 - m.margin * 2.0) * progress, m.dp(3.0), m.dp(1.5), t.pal.accent);
+                c.fill_round_rect(m.margin, box_.y - m.dp(4.0), (m.w as f32 - m.margin * 2.0) * progress, m.dp(3.0), m.dp(1.5), t.pal.accent);
             }
-            y += h as f32;
         } else {
-            y = widgets::footnote(&mut c, t, cx.f, y, l.pick(["完整模式返回的图片无法解码", "完整模式回傳的圖片無法解碼", "Full mode returned a picture that can't be decoded"]));
+            widgets::footnote(&mut c, t, cx.f, box_.y, l.pick(["完整模式返回的图片无法解码", "完整模式回傳的圖片無法解碼", "Full mode returned a picture that can't be decoded"]));
         }
     } else {
         let progress = cx.state.browser.full_progress.unwrap_or(0.0);
-        y = widgets::progress_card(
+        widgets::progress_card(
             &mut c,
             t,
             cx.f,
-            y,
+            box_.y,
             l.pick(["正在渲染页面", "正在繪製頁面", "Drawing the page"]),
             &cx.state.browser.url,
             Some(progress),
         );
         out.push(Hit { rect: Rect::new(m.margin, top, m.w as f32 - m.margin * 2.0, m.dp(56.0)), action: Action::BrowserAddress });
     }
-    let mut frame = Frame::new(t, fit(c, t, y), out, l.pick(BROWSER), top);
+    let mut frame = Frame::new(t, fit(c, t, box_.y + box_.h), out, l.pick(BROWSER), top);
     frame.header = false;
     frame.back = false;
     frame.dock = Some(full_dock(cx));
+    frame.picture = Some(box_);
     frame
 }
 
-fn loading(cx: &Ctx, url: &str) -> Frame {    let (t, f, l) = (cx.t, cx.f, cx.state.lang);
+fn loading(cx: &Ctx, url: &str) -> Frame {
+    let (t, f, l) = (cx.t, cx.f, cx.state.lang);
     let m = &t.m;
     let mut c = page(cx);
     let mut out = Vec::new();

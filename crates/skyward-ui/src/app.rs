@@ -2056,6 +2056,10 @@ pub struct Frame {
     /// rows: a drag on it scrolls through what it holds, rather than moving
     /// the page.
     pub scrollback: Option<(Rect, f32)>,
+    /// Something else's page drawn in a box of this one, such as a whole
+    /// browser page: a drag on it scrolls that page, rather than moving
+    /// this one.
+    pub picture: Option<Rect>,
     /// A strip held at the bottom of the screen over the page; the page
     /// scrolls far enough for nothing to stay under it.
     pub dock: Option<Dock>,
@@ -2222,6 +2226,7 @@ impl Frame {
             pinned: None,
             fold: None,
             scrollback: None,
+            picture: None,
             dock: None,
             caret: None,
             button: None,
@@ -3134,10 +3139,14 @@ pub enum Effect {
     StopBrowser,
     /// Download and unpack the full browser plugin.
     BrowserPluginInstall { archive: String, dir: String },
-    /// Start the full browser plugin, which writes the page to `out`.
-    BrowserPluginStart { dir: String, url: String, out: String },
+    /// Start the full browser plugin, whose page is drawn for a box `view`
+    /// device pixels wide and tall.
+    BrowserPluginStart { dir: String, url: String, view: (u32, u32) },
     /// Tap the persistent full-mode page.
     BrowserPluginTap { x: u16, y: u16 },
+    /// Scroll the persistent full-mode page: `dy` thousandths of the frame's
+    /// height, at `speed` CSS pixels a second once the finger is gone.
+    BrowserPluginScroll { dy: i32, speed: i32 },
     /// Pinch the persistent full-mode page.
     BrowserPluginPinch { scale: f64 },
     /// Type into the focused field of the persistent full-mode page.
@@ -3223,6 +3232,9 @@ enum Drag {
     /// counts until it lifts.
     Held,
     Scroll { last: f32 },
+    /// Dragging the page the browser plugin draws, from the `y` the finger
+    /// was last at: the frame stays where it is and the page under it moves.
+    Picture { last: f32 },
     /// Swiping in from a screen edge, the finger now `x` across; the cue
     /// keeps to height `cy`, set by where the swipe began. Past the
     /// threshold, lifting goes back.
@@ -6697,6 +6709,10 @@ impl App {
     /// Put `url` in the browser's history and read it.
     fn browser_read(&mut self, url: String) -> Vec<Effect> {
         let url = if self.state.browser.full_active { chromium_url(&url) } else { url };
+        // The frame is drawn for the box it is shown in, so the page's own
+        // width and the box's are one and the same.
+        let box_ = crate::browser::full_box(&self.theme());
+        let view = (box_.w.max(1.0) as u32, box_.h.max(1.0) as u32);
         let full = {
             let b = &mut self.state.browser;
             if b.history.is_empty() {
@@ -6723,8 +6739,7 @@ impl App {
                 if let Some(dir) = dir {
                     b.full_shot = None;
                     b.full_progress = Some(0.12);
-                    let out = format!("{dir}/tmp/skyward-chromium.png");
-                    Some((dir, url.clone(), out))
+                    Some((dir, url.clone(), view))
                 } else {
                     b.full_active = false;
                     None
@@ -6737,8 +6752,8 @@ impl App {
             self.top_mut().1 = 0.0;
         }
         self.refresh();
-        if let Some((dir, url, out)) = full {
-            return vec![Effect::BrowserPluginStart { dir, url, out }];
+        if let Some((dir, url, view)) = full {
+            return vec![Effect::BrowserPluginStart { dir, url, view }];
         }
         let cookie = self.browser_cookie(&url);
         vec![Effect::BrowserOpen { url, cookie }]
@@ -6752,6 +6767,8 @@ impl App {
             return Vec::new();
         }
         let url = if self.state.browser.full_active { chromium_url(&self.state.browser.history[at]) } else { self.state.browser.history[at].clone() };
+        let box_ = crate::browser::full_box(&self.theme());
+        let view = (box_.w.max(1.0) as u32, box_.h.max(1.0) as u32);
         let full = {
             let b = &mut self.state.browser;
             b.at = at;
@@ -6769,8 +6786,7 @@ impl App {
                 if let Some(dir) = dir {
                     b.full_shot = None;
                     b.full_progress = Some(0.12);
-                    let out = format!("{dir}/tmp/skyward-chromium.png");
-                    Some((dir, url.clone(), out))
+                    Some((dir, url.clone(), view))
                 } else {
                     b.full_active = false;
                     None
@@ -6783,8 +6799,8 @@ impl App {
             self.top_mut().1 = 0.0;
         }
         self.refresh();
-        if let Some((dir, url, out)) = full {
-            return vec![Effect::BrowserPluginStart { dir, url, out }];
+        if let Some((dir, url, view)) = full {
+            return vec![Effect::BrowserPluginStart { dir, url, view }];
         }
         let cookie = self.browser_cookie(&url);
         vec![Effect::BrowserOpen { url, cookie }]
@@ -7084,12 +7100,13 @@ impl App {
         self.state.browser.full_progress = Some(0.12);
         self.state.browser.url = url.clone();
         self.state.browser.address = url.clone();
-        let out = format!("{dir}/tmp/skyward-chromium.png");
+        let box_ = crate::browser::full_box(&self.theme());
+        let view = (box_.w.max(1.0) as u32, box_.h.max(1.0) as u32);
         if self.screen() != Screen::Browser {
             self.open(Screen::Browser);
         }
         self.refresh();
-        vec![Effect::BrowserPluginStart { dir, url, out }]
+        vec![Effect::BrowserPluginStart { dir, url, view }]
     }
 
     fn browser_plugin_stop(&mut self) -> Vec<Effect> {
@@ -9276,6 +9293,7 @@ impl App {
                 Drag::Press { x: x0, y: y0, action, edge: at_edge, at } => {
                     self.tracker.add(now, y);
                     let (dx, dy) = (x - x0, y - y0);
+                    let picture = self.frame.as_ref().and_then(|fr| fr.picture).filter(|r| r.contains(x0, y0 + scroll));
                     self.drag = match at_edge {
                         Some(from_left) if dx.abs() > slop && dx.abs() > dy.abs() => {
                             // A swipe in from an edge pulls the page under
@@ -9290,6 +9308,11 @@ impl App {
                                 fx.push(Effect::Haptic);
                             }
                             edge
+                        }
+                        _ if dy.abs() > slop && picture.is_some() => {
+                            // The finger is on somebody else's page: it moves
+                            // that page, and this one stays where it is.
+                            Drag::Picture { last: y }
                         }
                         _ if dy.abs() > slop => {
                             let history = self.frame.as_ref().and_then(|fr| fr.scrollback).filter(|(r, _)| r.contains(x0, y0 + scroll));
@@ -9315,6 +9338,18 @@ impl App {
                     self.tracker.add(now, y);
                     self.drag_by(last - y);
                     self.drag = Drag::Scroll { last: y };
+                }
+                Drag::Picture { last } => {
+                    self.tracker.add(now, y);
+                    let high = self.frame.as_ref().and_then(|fr| fr.picture).map_or(1.0, |r| r.h).max(1.0);
+                    // How far the finger went, in thousandths of the frame:
+                    // the page is asked to follow it, so that the frame on
+                    // screen stays a frame of the same page.
+                    let dy = ((last - y) / high * 1000.0).round();
+                    if dy != 0.0 {
+                        fx.push(Effect::BrowserPluginScroll { dy: dy as i32, speed: 0 });
+                    }
+                    self.drag = Drag::Picture { last: y };
                 }
                 Drag::Edge { start, from_left, armed, cy, .. } => {
                     let (edge, click) = self.move_edge(start, from_left, x, cy, armed);
@@ -9407,6 +9442,15 @@ impl App {
                     match glide {
                         Some(glide) if !(folding(scroll) && folding(glide.at(u64::MAX).0)) => self.fling = Some(glide),
                         _ => self.settle_fold(now),
+                    }
+                }
+                Drag::Picture { .. } => {
+                    // Lifted while the page was moving: it keeps gliding at
+                    // the speed the finger left it at, in the page's own
+                    // measure - CSS pixels a second.
+                    let speed = -self.tracker.velocity(now) / self.px_per_dp * 160.0 / 2.0;
+                    if speed.abs() >= 40.0 {
+                        fx.push(Effect::BrowserPluginScroll { dy: 0, speed: speed.round() as i32 });
                     }
                 }
                 Drag::Edge { armed: true, .. } => fx.extend(self.finish_edge(true, now)),
