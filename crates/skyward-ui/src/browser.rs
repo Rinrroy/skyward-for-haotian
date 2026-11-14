@@ -716,6 +716,17 @@ pub fn row(cx: &Ctx, i: usize, c: &mut Canvas) {
     }
 }
 
+/// The keyboard, held at the bottom of the screen rather than drawn on the
+/// page: a finger that drags the page leaves it where it is, and the page
+/// scrolls behind it, the way the file manager's search box does.
+fn keyboard_dock(cx: &Ctx, enter: &str) -> Dock {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let mut c = Canvas::new(t.m.w, widgets::keyboard_height(t).round() as u32);
+    c.clear(t.pal.bg);
+    let keys = widgets::keyboard(&mut c, t, f, l, 0.0, s.layer, s.key_held(), enter);
+    Dock { canvas: c, hits: keys.into_iter().map(|(rect, cap)| Hit { rect, action: Action::Type(cap) }).collect() }
+}
+
 /// The address field, the sites offered, and the keyboard.
 pub fn address(cx: &Ctx) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
@@ -750,11 +761,8 @@ pub fn address(cx: &Ctx) -> Frame {
         "An address opens as it is; words search Bing, laid out as readable text and links. Only http and https work.",
     ]);
     let _ = widgets::footnote(&mut c, t, f, y, note);
-    let enter = l.pick(GO);
-    let kb_top = t.m.h as f32 - widgets::keyboard_height(t);
-    let keys = widgets::keyboard(&mut c, t, f, l, kb_top, s.layer, s.key_held(), enter);
-    out.extend(keys.into_iter().map(|(rect, cap)| Hit { rect, action: Action::Type(cap) }));
-    Frame { caret: Some(caret), ..Frame::new(t, c, out, l.pick(OPEN_ADDRESS), top) }
+    let dock = keyboard_dock(cx, l.pick(GO));
+    Frame { caret: Some(caret), dock: Some(dock), ..Frame::new(t, c, out, l.pick(OPEN_ADDRESS), top) }
 }
 
 /// The files saved and being saved.
@@ -840,15 +848,13 @@ pub fn form(cx: &Ctx) -> Frame {
     let value = s.browser.form.get(form).and_then(|v| v.get(field)).cloned().unwrap_or_default();
     let y = widgets::section_first(&mut c, t, f, top, &label);
     let (below, caret) = widgets::text_field(&mut c, t, f, y, &value);
-    let mut out = vec![Hit {
+    let out = vec![Hit {
         rect: Rect::new(m.margin, y, m.w as f32 - m.margin * 2.0, m.dp(56.0)),
         action: Action::BrowserFormField(form, field),
     }];
-    let kb_top = t.m.h as f32 - widgets::keyboard_height(t);
-    let keys = widgets::keyboard(&mut c, t, f, l, kb_top, s.layer, s.key_held(), l.pick(GO));
-    out.extend(keys.into_iter().map(|(rect, cap)| Hit { rect, action: Action::Type(cap) }));
+    let dock = keyboard_dock(cx, l.pick(GO));
     let _ = below;
-    Frame { caret: Some(caret), ..Frame::new(t, c, out, l.pick(["填写", "填寫", "Fill in"]), top) }
+    Frame { caret: Some(caret), dock: Some(dock), ..Frame::new(t, c, out, l.pick(["填写", "填寫", "Fill in"]), top) }
 }
 
 /// The optional full browser plugin.

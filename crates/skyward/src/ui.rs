@@ -1822,14 +1822,21 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                 faced.clear();
             }
             if app.state.always_on {
-                if !blanked || faced != shown_clock {
-                    let facts = skyward_ui::aod::Facts {
-                        date: skyward_ui::fmt::date(app.state.lang, unix_now()?, app.state.time_zone),
-                        battery: info.battery.as_ref().map(|b| (b.level, b.plugged)),
-                        slot: info.slot.map(|s| s.letter().to_string()),
-                        data: skyward_ui::fmt::data(app.state.lang, &app.state.data).to_string(),
-                    };
-                    skyward_ui::aod::face(&mut screen, &fonts, &shown_clock, &facts, cfg.display.density as f32 / 160.0);
+                // A finger on the glass takes the face up with it, so the
+                // face is drawn again as it follows: the panel is taken out
+                // of its doze for as long as the finger is on it.
+                let drag = app.aod_drag();
+                if drag.is_some() && surface.is_dozing() {
+                    if let Err(e) = surface.wake() {
+                        let _ = skyward_sys::kmsg(&format!("the panel would not come out of its doze: {e:#}"));
+                    }
+                }
+                if !blanked || faced != shown_clock || drag.is_some() {
+                    // The face the phone's own always-on display shows: the
+                    // clock in one of three looks, the day under it, the
+                    // charge, and the word that says how to wake it.
+                    app.state.aod_date = skyward_ui::fmt::date(app.state.lang, unix_now()?, app.state.time_zone);
+                    app.compose_aod(&mut screen, &fonts, &info, &shown_clock, drag);
                     surface.present(&screen)?;
                     surface.settle()?;
                     faced.clone_from(&shown_clock);
