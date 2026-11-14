@@ -132,11 +132,13 @@ fn full_launch_script(dir: &Path, url: &str) -> String {
          # /dev/shm has to be made inside the /dev that is now bound over it,\n\
          # or the tmpfs below is asked for a folder that is not there.\n\
          mkdir -p \"$D/dev/shm\" && /system/bin/mount -t tmpfs tmpfs \"$D/dev/shm\" 2>/dev/null || true\n\
-         # The recovery's own temp folder is not in here, and Chromium asks it\n\
-         # for the socket it keeps its profile under.\n\
-         TMPDIR=/tmp TMP=/tmp HOME=/root\n\
-         export TMPDIR TMP HOME\n\
-         exec /system/bin/chroot \"$D\" /bin/sh /run.sh \"$SKYWARD_URL\" serve"
+         # The profile Chromium keeps is full of sockets, and the card this root\n\
+         # sits on is not a filesystem that has them: memory is. The log is kept\n\
+         # beside the plugin, so a tmpfs here does not hide it.\n\
+         mkdir -p \"$D/tmp\" && /system/bin/mount -t tmpfs tmpfs \"$D/tmp\" 2>/dev/null || true\n\
+         # The recovery's own PATH and temp folder are not in here, and a plugin\n\
+         # installed before this image still looks for both of them.\n\
+         exec /system/bin/env PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin TMPDIR=/tmp TMP=/tmp HOME=/root /system/bin/chroot \"$D\" /bin/sh /run.sh \"$SKYWARD_URL\" serve"
     )
 }
 
