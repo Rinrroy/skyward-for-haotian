@@ -9,8 +9,8 @@
 //! gigabyte and because it has to be there at the next start, not only
 //! while a card is in.
 //!
-//! Nothing here runs a plugin. This is the reading half; the handover is a
-//! page and a runtime of its own.
+//! Nothing here runs a plugin. This is the reading half; running one is
+//! `pluginhost`'s work, and the page only says which rows can be run.
 //!
 //! Reading is best-effort in the one way that matters: a folder that cannot
 //! be read is a row saying so, not an error that takes the page away, and

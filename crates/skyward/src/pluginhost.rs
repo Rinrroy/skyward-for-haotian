@@ -745,11 +745,12 @@ impl Drop for Lay {
 
 /// Where the plugins are installed. The page that installs them writes here,
 /// and a plugin reads its own neighbours through this.
-const STORE: &str = "/skyward/plugins";
+const STORE: &str = skyward_ui::app::PLUGIN_STORE;
 
 /// What a plugin is told it is, so that a site can tell a recovery from a
-/// desktop browser.
-const USER_AGENT: &str = "Skyward/0.4.0 (recovery plugin)";
+/// desktop browser. The version is this build's own, so the string cannot
+/// drift away from what a site is being told.
+const USER_AGENT: &str = concat!("Skyward/", env!("CARGO_PKG_VERSION"), " (recovery plugin)");
 
 /// Where the plugin opens. The recovery's own note of what a browser should
 /// open with, and a name that answers from the mainland otherwise.
