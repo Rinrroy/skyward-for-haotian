@@ -11708,7 +11708,7 @@ mod tests {
         );
         // The second step has its own swipe, and that one writes.
         assert_eq!(
-            swiped(&mut app, &f, &i, Confirm::AvbDisable),
+            acts(app.act(Action::Confirm(Confirm::AvbDisable), 4000)),
             vec![Effect::SetAvb { expected: state, check: avbctl::Check::Verification, disabled: true }],
             "the second step's swipe is the one that writes it"
         );
@@ -11726,7 +11726,7 @@ mod tests {
         assert!(app.act(Action::AvbToggle(avbctl::Check::Verification), 1000).is_empty());
         assert_eq!(app.state.avb_pending, Some((state.clone(), avbctl::Check::Verification, false)));
         assert_eq!(
-            swiped(&mut app, &f, &i, Confirm::Avb),
+            acts(app.act(Action::Confirm(Confirm::Avb), 2000)),
             vec![Effect::SetAvb { expected: state, check: avbctl::Check::Verification, disabled: false }],
             "turning one on is the one direction that writes from a single swipe"
         );
@@ -13123,27 +13123,6 @@ mod tests {
     }
 
     fn swipe(app: &mut App, f: &Fonts, i: &DeviceInfo, which: Confirm) -> Vec<Effect> {
-        // A page taller than the glass keeps its track below the fold: the
-        // page is dragged up until the track is on it, as a finger would.
-        let edge = app.theme().m.dp(24.0);
-        for _ in 0..12 {
-            let scroll = app.top().1;
-            let shown = app
-                .frame(f, i)
-                .hits
-                .iter()
-                .find(|h| h.action == Action::Confirm(which))
-                .map(|h| h.rect.centre().1 - scroll);
-            match shown {
-                Some(y) if y > edge && y < app.h as f32 - edge => break,
-                _ => {
-                    let x = app.w as f32 / 2.0;
-                    app.touch(Touch::Down(x, app.h as f32 * 0.75), f, 0);
-                    app.touch(Touch::Move(x, app.h as f32 * 0.25), f, 0);
-                    app.touch(Touch::Up, f, 0);
-                }
-            }
-        }
         let track = app.frame(f, i).hits.iter().find(|h| h.action == Action::Confirm(which)).expect("the track is on the page").rect;
         let y = track.centre().1 - app.top().1;
         let mut fx = app.touch(Touch::Down(track.x + track.h / 2.0, y), f, 0);
