@@ -83,7 +83,7 @@ fn stop_full() {
             .args([
                 "-c",
                 &format!(
-                    "umount '{d}/dev/shm' 2>/dev/null || true; umount '{d}/sys' 2>/dev/null || true; umount '{d}/proc' 2>/dev/null || true; umount '{d}/dev' 2>/dev/null || true; rm -rf '{d}/tmp/chromium-profile'"
+                    "umount '{d}/dev/shm' 2>/dev/null || true; umount '{d}/tmp' 2>/dev/null || true; umount '{d}/sys' 2>/dev/null || true; umount '{d}/proc' 2>/dev/null || true; umount '{d}/dev' 2>/dev/null || true; rm -rf '{d}/tmp/chromium-profile'"
                 ),
             ])
             .status();
