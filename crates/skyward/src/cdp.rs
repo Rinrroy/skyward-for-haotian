@@ -23,9 +23,12 @@ const FALLBACK_SCALE: f64 = 3.0;
 pub struct Cdp {
     stream: TcpStream,
     next: u64,
-    /// The viewport being drawn, in CSS pixels: with the scale below it is
-    /// the frame's own size, so the recovery never resizes one.
+    /// The viewport being drawn, in CSS pixels: with the page's own scale it
+    /// is the frame's size in device pixels, so the recovery never resizes one.
     view: (f64, f64),
+    /// Where the finger a drag put down on the page is, in CSS pixels from
+    /// the top of the viewport, while it is still down.
+    finger: Option<f64>,
 }
 
 impl Cdp {
@@ -35,8 +38,14 @@ impl Cdp {
     /// recovery's own page never moves under it.
     pub fn connect(pixels: (u32, u32)) -> Result<Cdp> {
         let (w, h) = (pixels.0.max(1) as f64, pixels.1.max(1) as f64);
-        let scale = (w / CSS_W).max(0.5);
-        let css = (CSS_W, (h / scale).max(120.0));
+        // A box narrower than a phone's own width would ask for a scale below
+        // one, which draws a page smaller than it reads: the page keeps the
+        // device pixels it was written for and the frame is captured at them.
+        let scale = (w / CSS_W).clamp(1.0, 4.0);
+        // The height has to be a whole number of CSS pixels: Chromium takes
+        // this one as an integer and refuses the whole command otherwise,
+        // which is a page that never attaches at all.
+        let css = (CSS_W, (h / scale).max(120.0).round());
         Cdp::attach(css, scale)
     }
 
@@ -48,22 +57,30 @@ impl Cdp {
 
     fn attach(css: (f64, f64), scale: f64) -> Result<Cdp> {
         let deadline = Instant::now() + Duration::from_secs(15);
-        let list = loop {
-            match http_get("/json/list") {
-                Ok(text) => break text,
-                Err(e) if Instant::now() < deadline => {
-                    let _ = e;
+        let ws = loop {
+            // Chromium answers its page list as soon as it listens, which is a
+            // moment before it has a page in it: what is looked for is the
+            // page, not the answer, so this waits for the one it opened rather
+            // than giving up on the first list that came back empty.
+            let list = match http_get("/json/list").ok().and_then(|list| serde_json::from_str::<Value>(&list).ok()) {
+                Some(list) => list,
+                None if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(200));
+                    continue;
                 }
-                Err(e) => return Err(e).context("wait for Chromium's debugging port"),
+                None => return Err(anyhow!("wait for Chromium's debugging port")).context("attach to the page"),
+            };
+            let found = list
+                .as_array()
+                .and_then(|pages| pages.iter().find(|page| page["type"] == "page"))
+                .and_then(|page| page["webSocketDebuggerUrl"].as_str())
+                .map(str::to_owned);
+            match found {
+                Some(ws) => break ws,
+                None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
+                None => return Err(anyhow!("Chromium lists no page to attach to")).context("attach to the page"),
             }
         };
-        let pages: Value = serde_json::from_str(&list).context("read Chromium's page list")?;
-        let ws = pages
-            .as_array()
-            .and_then(|pages| pages.iter().find(|page| page["type"] == "page"))
-            .and_then(|page| page["webSocketDebuggerUrl"].as_str())
-            .context("Chromium lists no page to attach to")?;
         let path = ws.strip_prefix("ws://127.0.0.1:9222").or_else(|| ws.strip_prefix("ws://localhost:9222")).context("unexpected debugging socket")?;
         let mut stream = TcpStream::connect(("127.0.0.1", PORT)).context("connect to Chromium")?;
         stream.set_read_timeout(Some(Duration::from_secs(20)))?;
@@ -74,7 +91,7 @@ impl Cdp {
         if !headers.starts_with("HTTP/1.1 101") && !headers.starts_with("HTTP/1.0 101") {
             bail!("Chromium refused the debugging socket: {}", headers.lines().next().unwrap_or(""));
         }
-        let mut cdp = Cdp { stream, next: 1, view: css };
+        let mut cdp = Cdp { stream, next: 1, view: css, finger: None };
         cdp.call("Page.enable", json!({}))?;
         cdp.call(
             "Emulation.setDeviceMetricsOverride",
@@ -85,10 +102,7 @@ impl Cdp {
     }
 
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value> {
-        let id = self.next;
-        self.next += 1;
-        let message = json!({"id": id, "method": method, "params": params});
-        write_frame(&mut self.stream, message.to_string().as_bytes())?;
+        let id = self.send(method, params)?;
         loop {
             let payload = read_frame(&mut self.stream)?;
             let answer: Value = match serde_json::from_slice(&payload) {
@@ -105,9 +119,30 @@ impl Cdp {
         }
     }
 
+    /// Ask the page for something and give it `within` to answer: a page that
+    /// is still loading holds its own scripts for seconds, and a gesture that
+    /// waited that long would feel stuck. An answer that comes too late is
+    /// skipped by the next call, since answers say which ask they belong to.
+    pub fn call_within(&mut self, method: &str, params: Value, within: Duration) -> Result<Value> {
+        self.stream.set_read_timeout(Some(within))?;
+        let answer = self.call(method, params);
+        self.stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+        answer
+    }
+
+    /// Ask the page for something without waiting for the answer, which is what
+    /// a navigation is: it is the page that takes the time, not the asking, and
+    /// waiting would hold every gesture behind it.
+    fn send(&mut self, method: &str, params: Value) -> Result<u64> {
+        let id = self.next;
+        self.next += 1;
+        let message = json!({"id": id, "method": method, "params": params});
+        write_frame(&mut self.stream, message.to_string().as_bytes())?;
+        Ok(id)
+    }
+
     pub fn navigate(&mut self, url: &str) -> Result<()> {
-        self.call("Page.navigate", json!({"url": url}))?;
-        std::thread::sleep(Duration::from_millis(1200));
+        self.send("Page.navigate", json!({"url": url}))?;
         Ok(())
     }
 
@@ -118,6 +153,9 @@ impl Cdp {
     }
 
     pub fn touch(&mut self, x: u32, y: u32) -> Result<()> {
+        // A finger left on the page by a drag is lifted first: this Chromium
+        // would take the tap for a second one.
+        self.drag_end(0)?;
         let point = json!([{"x": x, "y": y, "id": 1, "radiusX": 2, "radiusY": 2, "force": 1.0}]);
         self.call("Input.dispatchTouchEvent", json!({"type": "touchStart", "touchPoints": point}))?;
         std::thread::sleep(Duration::from_millis(50));
@@ -139,30 +177,65 @@ impl Cdp {
 
     /// Scroll the page itself, `dy` being thousandths of the frame's height
     /// and positive meaning the page moves up under the finger, as a drag
-    /// does. `speed` is how fast the finger was going, in CSS pixels a
-    /// second: the page keeps its own inertia, so a flick goes on gliding
-    /// after the finger has lifted.
-    pub fn scroll(&mut self, dy: i32, speed: i32) -> Result<()> {
-        // A finger lifted while still moving asks for a glide: the page is
-        // thrown the way it was going and Chromium carries it on.
-        let distance = if dy == 0 { speed as f64 * 0.12 } else { (dy as f64 * self.view.1 / 1000.0).round() };
+    /// does. The first move of a drag puts a finger down on the page, and the
+    /// finger stays there until `drag_end` lifts it.
+    ///
+    /// What moves this page is that finger: Chromium answers a synthesized
+    /// scroll gesture only once it has carried the whole gesture out, and that
+    /// took most of a second, so a drag sent at the speed a finger moves held
+    /// every move after it. A touch that stays down is one event per move, and
+    /// a page scrolled that way keeps its own inertia.
+    pub fn scroll(&mut self, dy: i32) -> Result<()> {
+        let (w, h) = self.view;
+        let distance = dy as f64 * h / 1000.0;
         if distance.abs() < 1.0 {
             return Ok(());
         }
-        let x = (self.view.0 / 2.0).round();
-        let y = (self.view.1 / 2.0).round();
-        self.call(
-            "Input.synthesizeScrollGesture",
-            json!({
-                "x": x,
-                "y": y,
-                "xDistance": 0,
-                "yDistance": distance,
-                "speed": speed.clamp(200, 8000),
-                "gestureSourceType": "touch",
-                "preventFling": false,
-            }),
-        )?;
+        let x = (w / 2.0).round();
+        let (low, high) = (24.0, (h - 24.0).max(24.0));
+        let at = match self.finger {
+            Some(at) => at,
+            None => {
+                // The finger goes down where the drag will take it from, so
+                // that the whole of the move is still on the frame.
+                let at = (h / 2.0 - distance / 2.0).clamp(low, high);
+                self.call("Input.dispatchTouchEvent", json!({"type": "touchStart", "touchPoints": [{"x": x, "y": at, "id": 1}]}))?;
+                self.finger = Some(at);
+                at
+            }
+        };
+        let mut to = at - distance;
+        if to < low || to > high {
+            // A drag longer than the frame takes the finger off it: it is put
+            // down again in the middle and the page is handed to the rest.
+            self.call("Input.dispatchTouchEvent", json!({"type": "touchEnd", "touchPoints": []}))?;
+            let middle = (h / 2.0).clamp(low, high);
+            self.call("Input.dispatchTouchEvent", json!({"type": "touchStart", "touchPoints": [{"x": x, "y": middle, "id": 1}]}))?;
+            to = (middle - distance).clamp(low, high);
+        }
+        self.call("Input.dispatchTouchEvent", json!({"type": "touchMove", "touchPoints": [{"x": x, "y": to, "id": 1}]}))?;
+        self.finger = Some(to);
+        Ok(())
+    }
+
+    /// Lift the finger a drag put down, going the way it was going at `speed`
+    /// CSS pixels a second, so the page keeps gliding after it has gone.
+    pub fn drag_end(&mut self, speed: i32) -> Result<()> {
+        let at = match self.finger {
+            Some(at) => at,
+            None => return Ok(()),
+        };
+        let (w, h) = self.view;
+        let x = (w / 2.0).round();
+        if speed != 0 {
+            let (low, high) = (24.0, (h - 24.0).max(24.0));
+            let to = (at - f64::from(speed) * 0.12).clamp(low, high);
+            if (to - at).abs() >= 1.0 {
+                self.call("Input.dispatchTouchEvent", json!({"type": "touchMove", "touchPoints": [{"x": x, "y": to, "id": 1}]}))?;
+            }
+        }
+        self.call("Input.dispatchTouchEvent", json!({"type": "touchEnd", "touchPoints": []}))?;
+        self.finger = None;
         Ok(())
     }
 
@@ -187,17 +260,14 @@ impl Cdp {
         Ok(())
     }
 
-    /// Whether the page has finished loading the things it needs to draw
-    /// itself, which is when a picture of it stops changing on its own.
-    pub fn ready(&mut self) -> bool {
-        let answer = self.call("Runtime.evaluate", json!({"expression": "document.readyState", "returnByValue": true}));
-        answer.ok().and_then(|answer| answer["result"]["value"].as_str().map(|state| state == "complete")).unwrap_or(false)
-    }
-
     pub fn focus_is_text(&mut self) -> bool {
-        let answer = self.call(
+        let answer = self.call_within(
             "Runtime.evaluate",
             json!({"expression": "(()=>{const e=document.activeElement;return e?`${e.tagName}:${e.type||''}:${e.isContentEditable}`:''})()", "returnByValue": true}),
+            // A page in the middle of loading can hold a script of its own for
+            // ten seconds: the keyboard waits for the next tap rather than the
+            // gesture waiting for the page.
+            Duration::from_millis(700),
         );
         let Ok(answer) = answer else { return false };
         let value = answer["result"]["value"].as_str().unwrap_or("");
@@ -205,7 +275,11 @@ impl Cdp {
     }
 
     /// The frame the recovery draws: the viewport itself, at the size the box
-    /// it goes in has, so it is laid on the screen as it comes.
+    /// it goes in has, so it is laid on the screen as it comes. The viewport is
+    /// four hundred and twelve CSS pixels across and Chromium multiplies a
+    /// clip by the page's own scale, so the clip is taken at one and comes back
+    /// exactly as many device pixels wide as the box is: the recovery never
+    /// stretches a frame to fit, which is what made the picture soft and slow.
     pub fn screenshot(&mut self) -> Result<Vec<u8>> {
         let answer = self.call(
             "Page.captureScreenshot",
@@ -229,13 +303,52 @@ impl Cdp {
 
 fn http_get(path: &str) -> Result<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", PORT)).context("connect to Chromium")?;
-    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+    // Chromium writes the page list in one go and then holds the connection
+    // open rather than closing it, so reading until the socket ends waits for
+    // a close that never comes: the body's own length says when it is all in.
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     write!(stream, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\nConnection: close\r\n\r\n")?;
     let mut bytes = Vec::new();
-    let _ = stream.read_to_end(&mut bytes);
-    let text = String::from_utf8_lossy(&bytes);
-    let (_, body) = text.split_once("\r\n\r\n").context("Chromium answered without a body")?;
-    Ok(body.to_string())
+    let mut body = None;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                bytes.extend_from_slice(&chunk[..read]);
+                if body.is_none() {
+                    body = bytes.windows(4).position(|window| window == b"\r\n\r\n").map(|at| at + 4);
+                }
+                if whole_answer(&bytes, body) {
+                    break;
+                }
+            }
+            // The wait running out after the body is in is not a failure: it
+            // means Chromium is keeping the socket, which is what it does.
+            Err(_) => break,
+        }
+    }
+    let at = body.or_else(|| bytes.windows(4).position(|window| window == b"\r\n\r\n").map(|at| at + 4)).context("Chromium answered without a body")?;
+    Ok(String::from_utf8_lossy(&bytes[at..]).into_owned())
+}
+
+/// Whether an HTTP answer that has been read so far holds all of its body.
+fn whole_answer(bytes: &[u8], body: Option<usize>) -> bool {
+    let Some(at) = body else { return false };
+    let Some(length) = content_length(&bytes[..at]) else { return false };
+    bytes.len() >= at + length
+}
+
+/// How many bytes the body of an HTTP answer takes, as its headers say.
+fn content_length(headers: &[u8]) -> Option<usize> {    let text = String::from_utf8_lossy(headers);
+    text.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("content-length") {
+            value.trim().parse().ok()
+        } else {
+            None
+        }
+    })
 }
 
 fn read_headers(stream: &mut TcpStream) -> Result<String> {

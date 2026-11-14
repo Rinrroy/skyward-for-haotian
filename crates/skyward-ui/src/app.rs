@@ -9445,13 +9445,14 @@ impl App {
                     }
                 }
                 Drag::Picture { .. } => {
-                    // Lifted while the page was moving: it keeps gliding at
-                    // the speed the finger left it at, in the page's own
-                    // measure - CSS pixels a second.
+                    // The finger is lifted even when it stopped moving: a
+                    // touch left down on the page would keep it pressed and
+                    // take the next tap for a second finger. Lifted while the
+                    // page was still moving, it keeps gliding at the speed the
+                    // finger left it at, in the page's own measure - CSS
+                    // pixels a second.
                     let speed = -self.tracker.velocity(now) / self.px_per_dp * 160.0 / 2.0;
-                    if speed.abs() >= 40.0 {
-                        fx.push(Effect::BrowserPluginScroll { dy: 0, speed: speed.round() as i32 });
-                    }
+                    fx.push(Effect::BrowserPluginScroll { dy: 0, speed: speed.round() as i32 });
                 }
                 Drag::Edge { armed: true, .. } => fx.extend(self.finish_edge(true, now)),
                 Drag::Edge { start, from_left, x, cy, .. } => {

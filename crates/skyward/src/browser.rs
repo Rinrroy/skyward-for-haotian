@@ -308,9 +308,12 @@ fn start_pump(alerts: Arc<Alerts>) {
         let mut drew = Instant::now() - Duration::from_secs(1);
         while PUMPING.load(Ordering::Relaxed) {
             let asked = ASK.swap(false, Ordering::Relaxed);
-            // A page still filling in is drawn as fast as one that moves:
-            // what it paints on the way is what the screen is showing.
-            let busy = MOVING.load(Ordering::Relaxed) || !cdp.ready();
+            // A frame that differs from the one before it is a page that is
+            // still drawing, and is drawn as fast as it comes. Nothing is
+            // asked of the page itself here: a page that is still loading
+            // answers a script of its own in seconds, and a frame that waited
+            // for that answer would be the picture standing still.
+            let busy = MOVING.load(Ordering::Relaxed);
             let gap = Duration::from_millis(if busy || asked { MOVING_GAP_MS } else { IDLE_GAP_MS });
             if !asked && drew.elapsed() < gap {
                 thread::sleep(Duration::from_millis(20));
@@ -360,8 +363,27 @@ fn full_after(tell: &dyn Fn(Event), act: impl FnOnce(&mut Cdp) -> Result<()>) {
             tell(Event::Focus(focus));
         }
         Err(e) => {
+            let why = format!("{e:#}");
+            note(&format!("the page went away: {}", why.replace('\n', " ⏎ ")));
             stop_full();
-            tell(Event::Shot(Err(format!("{e:#}"))));
+            tell(Event::Shot(Err(why)));
+        }
+    }
+}
+
+/// Do one thing to the page that cannot have changed which field is being
+/// typed into, and ask for the frame it left. Asking a page what it has
+/// focused is a script run in the page, which a page in the middle of loading
+/// can hold up for seconds: a drag that waited for that answer would feel
+/// stuck, so only the gestures that can move the focus ask at all.
+fn full_do(tell: &dyn Fn(Event), act: impl FnOnce(&mut Cdp) -> Result<()>) {
+    match with_page(act) {
+        Ok(()) => poke(),
+        Err(e) => {
+            let why = format!("{e:#}");
+            note(&format!("the page went away: {}", why.replace('\n', " ⏎ ")));
+            stop_full();
+            tell(Event::Shot(Err(why)));
         }
     }
 }
@@ -513,23 +535,33 @@ impl Worker {
                     }
                     Task::FullStart { dir, url, view } => {
                         set_view(view);
-                        let result = (|| -> Result<()> {
-                            let mut cdp = full_started(&dir, &url)?;
-                            cdp.navigate(&url)?;
-                            let focus = cdp.focus_is_text();
-                            tell(Event::Focus(focus));
+                        // The page is attached, then drawn while it loads:
+                        // asking it to load first and drawing afterwards is a
+                        // screen that shows nothing until the whole page is
+                        // in, which on a phone can be ten seconds.
+                        let opened = full_started(&dir, &url).map(|cdp| {
                             *PAGE.lock().expect("the page is not held by a thread that panicked") = Some(cdp);
-                            Ok(())
-                        })();
-                        match result {
+                        });
+                        match opened {
                             // The page is drawn by the thread that goes on
                             // drawing it, from a connection of its own, so that
                             // a gesture never waits for a frame.
-                            Ok(()) => start_pump(told.clone()),
+                            Ok(()) => {
+                                start_pump(told.clone());
+                                // Loading is asked for after the drawing has
+                                // begun; what went wrong is said on the page's
+                                // own box, as a gesture's failure is.
+                                full_do(&tell, |cdp| cdp.navigate(&url));
+                            }
                             Err(e) => {
                                 stop_full();
                                 *LAST_DREW.lock().expect("the last frame is not held by a thread that panicked") = None;
                                 let mut why = format!("{e:#}");
+                                // What went wrong is said on the screen, which
+                                // is no use once the phone is in someone
+                                // else's hands: it is kept here too, on one
+                                // line, so the log says what the page said.
+                                note(&format!("the full mode stopped: {}", why.replace('\n', " ⏎ ")));
                                 if let Some(said) = chromium_said(&dir) {
                                     note(&format!("the full browser said: {}", said.replace('\n', " ⏎ ")));
                                     why.push_str("\n\n");
@@ -544,11 +576,25 @@ impl Worker {
                         }
                     }
                     Task::FullTap { x, y } => full_after(&tell, |cdp| cdp.tap(x as u32, y as u32)),
-                    Task::FullScroll { dy, speed } => full_after(&tell, |cdp| cdp.scroll(dy, speed)),
-                    Task::FullPinch { scale } => full_after(&tell, |cdp| cdp.pinch(scale)),
+                    Task::FullScroll { dy, speed } => full_do(&tell, |cdp| {
+                        if dy != 0 {
+                            cdp.scroll(dy)?;
+                        }
+                        // The finger lifted - or stopped moving, which lifts it
+                        // too: the page is let go of where it is, going the way
+                        // it was going.
+                        if dy == 0 || speed != 0 {
+                            cdp.drag_end(speed)?;
+                        }
+                        Ok(())
+                    }),
+                    Task::FullPinch { scale } => full_do(&tell, |cdp| cdp.pinch(scale)),
                     Task::FullText { text } => full_after(&tell, |cdp| cdp.insert_text(&text)),
-                    Task::FullReload => full_after(&tell, |cdp| cdp.reload()),
+                    Task::FullReload => full_do(&tell, |cdp| cdp.reload()),
                     Task::FullStop => {
+                        // A finger still down from a drag is lifted, so the
+                        // next page does not open with one held on it.
+                        let _ = with_page(|cdp| cdp.drag_end(0));
                         // The browser is stopped before the thread drawing it,
                         // so that a frame waiting on it comes back at once.
                         stop_full();
@@ -562,8 +608,32 @@ impl Worker {
                     Task::Halt => {}
                     }
                 };
-                while let Ok(task) = queue.recv() {
-                    if stopping.load(Ordering::Relaxed) || matches!(task, Task::Halt) {
+                while let Ok(mut task) = queue.recv() {
+                    if stopping.load(Ordering::Relaxed) || matches!(&task, Task::Halt) {
+                        break;
+                    }
+                    // A drag asks once per move while a page is still catching
+                    // up with the last one: what the finger did a moment ago is
+                    // already out of date, so only where it is now is sent, and
+                    // the moves it has passed are added to that one.
+                    while let Ok(newer) = queue.try_recv() {
+                        let merged = match (&task, &newer) {
+                            (Task::FullScroll { dy: passed, speed: 0 }, Task::FullScroll { dy: now, speed }) => {
+                                Some(Task::FullScroll { dy: passed.saturating_add(*now), speed: *speed })
+                            }
+                            _ => None,
+                        };
+                        if let Some(merged) = merged {
+                            task = merged;
+                            continue;
+                        }
+                        run(task);
+                        task = newer;
+                        if matches!(&task, Task::Halt) {
+                            break;
+                        }
+                    }
+                    if stopping.load(Ordering::Relaxed) || matches!(&task, Task::Halt) {
                         break;
                     }
                     run(task);
