@@ -143,12 +143,21 @@ fn start_full(dir: &Path, url: &str) -> Result<()> {
         slot.take();
     }
     let script = full_launch_script(dir, url);
+    // Chromium says why it would not start on its own output, and the page
+    // that offers to install it asks for that when it goes wrong: what it
+    // prints is kept beside the plugin, so the log outlives this session.
+    let log = dir.join("tmp").join("chromium.log");
+    let _ = std::fs::create_dir_all(dir.join("tmp"));
+    let sink = || match std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+        Ok(file) => Stdio::from(file),
+        Err(_) => Stdio::null(),
+    };
     let mut cmd = Command::new("/system/bin/sh");
     cmd.args(["-c", &script])
         .env("SKYWARD_URL", url)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(sink())
+        .stderr(sink());
     unsafe {
         cmd.pre_exec(|| {
             libc::setpgid(0, 0);
