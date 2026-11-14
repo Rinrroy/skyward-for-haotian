@@ -160,7 +160,8 @@ impl Cdp {
         let answer = self.call(
             "Page.captureScreenshot",
             json!({
-                "format": "png",
+                "format": "jpeg",
+                "quality": 72,
                 "fromSurface": true,
                 "captureBeyondViewport": true,
                 "clip": {
@@ -243,7 +244,7 @@ fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>> {
         stream.read_exact(&mut bytes)?;
         len = u64::from_be_bytes(bytes);
     }
-    if len > 16 * 1024 * 1024 {
+    if len > 48 * 1024 * 1024 {
         bail!("Chromium sent an oversized frame");
     }
     let mask = if masked {
