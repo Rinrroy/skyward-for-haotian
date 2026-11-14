@@ -19,10 +19,44 @@ const FF_SINE: u16 = 0x5a;
 /// these phones carry.
 const NOMINAL_HZ: f32 = 172.4;
 
-/// How long a click runs. The driver plays a sine for the effect's replay
-/// length, and a waveform it keeps for as long as that one is; either way
-/// the click is taken away once this has passed.
-const NOMINAL_CLICK: Duration = Duration::from_millis(30);
+/// How long a click runs, at the lightest and at the heaviest the slider asks
+/// for. The driver plays a sine for the effect's replay length, and a
+/// waveform it keeps for as long as that one is; either way the click is
+/// taken away once its length has passed.
+///
+/// Twelve milliseconds of a swing at about two hundred hertz is two or three
+/// swings and twenty-six is five or so, which is what a linear motor's click
+/// is made of. Held for much longer the same sine stops being a click and
+/// becomes a buzz: the finger is given enough swings in a row to feel the
+/// vibration rather than the tap.
+///
+/// The length carries the slider as well as the strength does, because a
+/// driver that keeps its own waveform need not make anything of the strength
+/// an effect is given: what a finger reads as how strong a click is, is how
+/// much of a swing it got, and half the swings at the same amplitude is half
+/// of that.
+const LIGHT_CLICK_MS: u16 = 12;
+const HEAVY_CLICK_MS: u16 = 26;
+
+/// How long the click takes to come up, in whole milliseconds. A swing that
+/// starts at its full strength cracks; one that starts over a millisecond is
+/// the tick of a motor that is being told to stop.
+const ATTACK_MS: u16 = 1;
+
+/// How long a click of `length` takes to go away again: two fifths of it,
+/// which is five milliseconds of the light click and ten of the heavy one.
+fn fade_of(length: u16) -> u16 {
+    u16::max(2, length * 2 / 5)
+}
+
+/// How long a click at `share` of the full strength is: the slider's position
+/// read as a length, from the light click to the heavy one.
+fn length_of(share: f32) -> Duration {
+    let share = f64::from(share.clamp(0.0, 1.0));
+    let light = f64::from(LIGHT_CLICK_MS);
+    let heavy = f64::from(HEAVY_CLICK_MS);
+    Duration::from_millis((light + (heavy - light) * share).round() as u64)
+}
 
 /// How strongly the phone's own system plays the two ticks of the screen
 /// going off, whatever the slider says.
@@ -245,8 +279,17 @@ fn takes_periodic(dev: &RawDevice) -> bool {
 }
 
 /// The share of the click's full strength at the slider's `position`.
+///
+/// The slider moves the strength in equal steps of the swing itself: from a
+/// quarter to three quarters of it, every tenth of the slider is a twentieth
+/// more of the swing. A factor per step, which is what this used to be, is
+/// the same number of decibels between every pair of neighbours, and a finger
+/// does not read a click's strength in decibels: it reads how far the motor
+/// throws the glass. Equal steps of the swing are what makes the slider's
+/// halves tell apart.
 fn share(strength: &Strength, position: f32) -> f32 {
-    strength.lightest * (strength.strongest / strength.lightest).powf(position.clamp(0.0, 1.0))
+    let at = position.clamp(0.0, 1.0);
+    strength.lightest + (strength.strongest - strength.lightest) * at
 }
 
 /// What these motors swing at, from the slowest to the fastest a linear
@@ -307,7 +350,15 @@ struct Loaded {
 /// period and the strength. Samples handed over as FIFO data are read as a
 /// wavetable the driver makes up itself, which this motor's firmware refuses
 /// ("Invalid OWT index: -1" in the kernel log), so none are handed over.
+///
+/// The envelope is what makes the sine a click rather than a buzz: the swing
+/// comes up over a millisecond and fades over the last two fifths of its
+/// length, where a sine held at one strength for the whole of it is a
+/// vibration the finger reads as a rumble and not as a tap. A waveform the
+/// driver keeps has a shape of its own and takes no envelope from here.
 fn upload(dev: &File, click: &Click, share: f32) -> Result<Loaded> {
+    let length = length_of(share);
+    let millis = length.as_millis() as u16;
     let mut kept: [i16; 2] = [0; 2];
     let (waveform, period, len, data) = match click {
         Click::Kept(id) => {
@@ -325,7 +376,10 @@ fn upload(dev: &File, click: &Click, share: f32) -> Result<Loaded> {
         magnitude: (share.clamp(0.0, 1.0) * f32::from(i16::MAX)).round() as i16,
         offset: 0,
         phase: 0,
-        envelope: libc::ff_envelope { attack_length: 0, attack_level: 0, fade_length: 0, fade_level: 0 },
+        // From nothing up to the strength over the attack, and down to
+        // nothing over the fade: a level at either end other than nothing
+        // would leave the swing turning on and off at its full throw.
+        envelope: libc::ff_envelope { attack_length: ATTACK_MS, attack_level: 0, fade_length: fade_of(millis), fade_level: 0 },
         custom_len: len as u32,
         custom_data: data,
     };
@@ -334,7 +388,7 @@ fn upload(dev: &File, click: &Click, share: f32) -> Result<Loaded> {
         id: -1,
         direction: 0,
         trigger: libc::ff_trigger { button: 0, interval: 0 },
-        replay: libc::ff_replay { length: NOMINAL_CLICK.as_millis() as u16, delay: 0 },
+        replay: libc::ff_replay { length: millis, delay: 0 },
         u: [0; 4],
     };
     // The union holds the periodic effect; it is exactly as large.
@@ -346,7 +400,7 @@ fn upload(dev: &File, click: &Click, share: f32) -> Result<Loaded> {
     if unsafe { libc::ioctl(dev.as_raw_fd(), request as _, &mut effect) } < 0 {
         return Err(io::Error::last_os_error().into());
     }
-    Ok(Loaded { slot: effect.id, length: NOMINAL_CLICK })
+    Ok(Loaded { slot: effect.id, length })
 }
 
 /// Start the loaded effect in slot `id`.
@@ -379,11 +433,38 @@ mod tests {
     }
 
     #[test]
-    fn the_slider_spans_the_strengths_each_step_the_same_factor() {
+    fn the_slider_moves_the_strength_in_equal_steps() {
         let s = Strength { lightest: 0.25, strongest: 1.0 };
         assert_eq!((share(&s, 0.0), share(&s, 1.0)), (0.25, 1.0));
-        assert!((share(&s, 0.5) - 0.5).abs() < 1e-6);
-        assert!((share(&s, 0.25) / share(&s, 0.0) - share(&s, 1.0) / share(&s, 0.75)).abs() < 1e-6, "each step the same factor");
+        assert!((share(&s, 0.5) - 0.625).abs() < 1e-6, "halfway is halfway in between");
+        for step in 0..10 {
+            let (here, next) = (share(&s, step as f32 / 10.0), share(&s, (step + 1) as f32 / 10.0));
+            assert!((next - here - 0.075).abs() < 1e-6, "every tenth of the slider is the same step: {here} to {next}");
+        }
         assert_eq!((share(&s, -1.0), share(&s, 2.0)), (0.25, 1.0), "no further than its ends");
+    }
+
+    #[test]
+    fn a_click_comes_up_and_goes_away_within_the_time_it_plays() {
+        for share in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            let length = length_of(share).as_millis() as u16;
+            assert!(length >= ATTACK_MS + fade_of(length), "the envelope fits in the click at {share}: {length} ms");
+            assert!(length < 30, "a click that long is a buzz: {length} ms at {share}");
+        }
+    }
+
+    #[test]
+    fn a_click_runs_longer_the_further_the_slider_is_pushed() {
+        let light = u128::from(LIGHT_CLICK_MS);
+        let heavy = u128::from(HEAVY_CLICK_MS);
+        assert_eq!((length_of(0.0).as_millis(), length_of(1.0).as_millis()), (light, heavy));
+        assert_eq!((length_of(-1.0).as_millis(), length_of(2.0).as_millis()), (light, heavy), "no further than its ends");
+        let mut last = 0;
+        for step in 0..=10 {
+            let length = length_of(step as f32 / 10.0).as_millis();
+            assert!(length >= last, "the click never gets shorter as the slider goes up: {length} after {last}");
+            last = length;
+        }
+        assert!(heavy > light, "there is a click between the ends of the slider to tell apart");
     }
 }

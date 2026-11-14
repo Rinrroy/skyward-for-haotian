@@ -4,6 +4,14 @@
 
 [English](README.md) | 简体中文
 
+[![version](https://img.shields.io/github/v/release/Rinrroy/skyward-for-haotian?display_name=tag&label=version&color=4c8ddf)](https://github.com/Rinrroy/skyward-for-haotian/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/Rinrroy/skyward-for-haotian/build-haotian.yml?branch=main&label=CI)](https://github.com/Rinrroy/skyward-for-haotian/actions/workflows/build-haotian.yml)
+[![license](https://img.shields.io/github/license/Rinrroy/skyward-for-haotian?label=license&color=4c8ddf)](LICENSE)
+[![status](https://img.shields.io/badge/status-公开测试-8ea9f1)](https://github.com/Rinrroy/skyward-for-haotian/releases)
+[![device](https://img.shields.io/badge/设备-Xiaomi_15_Pro_(haotian)-555555)](#skyward-是使用-rust-编写的-recovery)
+[![stars](https://img.shields.io/github/stars/Rinrroy/skyward-for-haotian?style=flat&label=stars&color=4c8ddf)](https://github.com/Rinrroy/skyward-for-haotian/stargazers)
+[![downloads](https://img.shields.io/github/downloads/Rinrroy/skyward-for-haotian/total?style=flat&label=下载量&color=4c8ddf)](https://github.com/Rinrroy/skyward-for-haotian/releases)
+
 Skyward 是使用 Rust 编写的 recovery，从零开始编写。本分支只为一台手机构建：
 **Xiaomi 15 Pro（`haotian`）**，基于中国版系统 OS4.0.0.19。
 
@@ -36,6 +44,8 @@ eSE 的两个驱动和安全元件的 HAL 都起来之后才能访问它。本�
 ![从三个来源安装四种安装包](slides/zh-CN/out/04-install.png)
 
 刷机包的安装脚本可以使用 `7za` 和 `zstd`，支持刷入 super 镜像使用 zstd 压缩的第三方 ROM；`unzip -p` 边解压边输出镜像。安装脚本还可以使用 `avbctl` 关闭验证启动的校验，使用 `resetprop` 读取和设置属性。
+
+未压缩的 super 镜像本身也可以直接刷入：从文件里选中，或用 `adb sideload` 发送，都会写入整个 super 分区，不需要选择槽位。镜像里的逻辑分区要等下次开机才会重新映射，所以刷完后请重启手机。
 
 ### 在线更新
 

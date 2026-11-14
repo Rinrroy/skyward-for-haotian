@@ -24,22 +24,9 @@ const ZEROED: u64 = 1 << 20;
 pub fn discard(device: &Path) -> Result<()> {
     use std::fs::OpenOptions;
     use std::os::unix::fs::FileExt;
-    use std::os::unix::io::AsRawFd;
-    // _IO(0x12, 125) and _IO(0x12, 119); each takes the start and length.
-    const BLKSECDISCARD: libc::c_int = 0x127d;
-    const BLKDISCARD: libc::c_int = 0x1277;
     let size = crate::size_bytes(device)?;
     let f = OpenOptions::new().write(true).open(device).with_context(|| format!("open {}", device.display()))?;
-    let range = [0u64, size];
-    // The secure kind leaves nothing behind in spare blocks either; not
-    // all storage offers it.
-    if unsafe { libc::ioctl(f.as_raw_fd(), BLKSECDISCARD, range.as_ptr()) } != 0 {
-        let secure = std::io::Error::last_os_error();
-        if unsafe { libc::ioctl(f.as_raw_fd(), BLKDISCARD, range.as_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("discard {}, after a secure discard failed with {secure}", device.display()));
-        }
-    }
+    discard_at(&f, device, 0, size, true)?;
     let zeros = vec![0u8; ZEROED.min(size) as usize];
     f.write_all_at(&zeros, 0).with_context(|| format!("write zeros over the start of {}", device.display()))?;
     f.sync_all().with_context(|| format!("sync {}", device.display()))
@@ -48,6 +35,55 @@ pub fn discard(device: &Path) -> Result<()> {
 #[cfg(not(target_os = "android"))]
 pub fn discard(device: &Path) -> Result<()> {
     bail!("this host has no block device {} to discard", device.display())
+}
+
+/// Discard the `len` bytes of a partition at `at`, leaving them holding
+/// nothing: what a discarded block reads back as is the storage's own
+/// choice, which here is no matter, since every byte of the range is about
+/// to be written over. Nothing is zeroed, unlike [`discard`], and nothing is
+/// synced: the write that follows flushes what it wrote.
+///
+/// This is what a recovery that writes a whole partition does first, so that
+/// the storage need not copy a block away before it writes it. A phone whose
+/// storage or kernel offers no discard is still written: this is a hint.
+///
+/// The plain discard is asked for, not the secure one: the secure discard of
+/// a partition gigabytes wide is an erase the storage does slowly, while what
+/// it adds — spare blocks left holding nothing either — is worth nothing over
+/// a range every byte of which is written over at once.
+#[cfg(target_os = "android")]
+pub fn discard_range(device: &Path, at: u64, len: u64) -> Result<()> {
+    use std::fs::OpenOptions;
+    let f = OpenOptions::new().write(true).open(device).with_context(|| format!("open {}", device.display()))?;
+    discard_at(&f, device, at, len, false)
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn discard_range(device: &Path, at: u64, len: u64) -> Result<()> {
+    bail!("this host has no block device {} to discard {len} bytes at {at} of", device.display())
+}
+
+/// Tell the kernel to discard the `len` bytes of `device` at `at`, on a file
+/// already open for writing: the secure kind first where `secure` is asked
+/// for, which leaves nothing behind in spare blocks either, and the plain one
+/// where the storage offers no secure discard.
+#[cfg(target_os = "android")]
+fn discard_at(f: &std::fs::File, device: &Path, at: u64, len: u64, secure: bool) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // _IO(0x12, 125) and _IO(0x12, 119); each takes the start and length.
+    const BLKSECDISCARD: libc::c_int = 0x127d;
+    const BLKDISCARD: libc::c_int = 0x1277;
+    let range = [at, len];
+    if secure && unsafe { libc::ioctl(f.as_raw_fd(), BLKSECDISCARD, range.as_ptr()) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if unsafe { libc::ioctl(f.as_raw_fd(), BLKDISCARD, range.as_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("discard {len} bytes at {at} of {}, after a secure discard failed with {error}", device.display()));
+        }
+    } else if !secure && unsafe { libc::ioctl(f.as_raw_fd(), BLKDISCARD, range.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("discard {len} bytes at {at} of {}", device.display()));
+    }
+    Ok(())
 }
 
 /// The size of ext4's blocks and of f2fs's where make_f2fs is told no
@@ -214,6 +250,14 @@ mod tests {
     #[test]
     fn a_filesystem_the_recovery_cannot_make_is_refused() {
         assert!(command(Path::new("/dev/x"), "erofs", &[], false, 4096).is_err());
+    }
+
+    #[test]
+    fn a_range_of_a_partition_that_is_not_there_is_not_discarded() {
+        // What a flash of a partition gets on a host, or on a missing device:
+        // an error it is told of and goes on past, never a panic.
+        assert!(discard_range(Path::new("/no/such/device"), 0, 4096).is_err());
+        assert!(discard_range(Path::new("/no/such/device"), 1 << 30, 1 << 20).is_err());
     }
 
     /// A file of `mib` MiB in the temporary folder, as a block device the

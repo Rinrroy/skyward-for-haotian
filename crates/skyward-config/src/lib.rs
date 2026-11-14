@@ -114,6 +114,11 @@ pub struct Wlan {
     /// what tells a platform driver it may start the chip.
     #[serde(default)]
     pub writes: Vec<Write>,
+    /// What is written when the WLAN is put away, each value to its file:
+    /// the switch above set back, so that the driver stops the chip rather
+    /// than leaving it running for whatever the phone boots next.
+    #[serde(default)]
+    pub release: Vec<Write>,
     /// Files the driver asks the kernel's firmware loader for that are not
     /// where the loader looks in a recovery.
     #[serde(default)]
@@ -297,7 +302,8 @@ fn default_aod_node() -> String {
 
 /// How strongly the click plays, each as a share of the most its waveform
 /// drives the motor with. The strength slider goes from the lightest to the
-/// strongest, each step the same factor stronger.
+/// strongest, each step the same share of the throw rather than the same
+/// factor, which is what a finger reads as a heavier click.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct Strength {
     pub lightest: f32,
@@ -799,7 +805,7 @@ mod tests {
         // The CS40L26 says its frequency nowhere, so the click is made at the
         // nominal one rather than played from a waveform kept by the driver.
         assert_eq!((haptics.click, haptics.resonance.as_deref()), (None, Some("/sys/bus/i2c/devices/0-0043/input/input6/calibration/f0_stored")));
-        assert_eq!(haptics.strength, Strength { lightest: 0.25, strongest: 0.75 });
+        assert_eq!(haptics.strength, Strength { lightest: 0.4, strongest: 1.0 });
     }
 
     #[test]
@@ -946,7 +952,7 @@ mod tests {
             (haptics.click, haptics.resonance.as_deref()),
             (None, Some("/sys/bus/i2c/devices/0-0043/input/input6/calibration/f0_stored"))
         );
-        assert_eq!(haptics.strength, Strength { lightest: 0.25, strongest: 0.75 }, "past three quarters the motor rattles");
+        assert_eq!(haptics.strength, Strength { lightest: 0.4, strongest: 1.0 }, "the owner found both ends too weak at three quarters, so the slider reaches the top");
         assert_eq!(haptics.modules, ["cs40l26-core", "cs40l26-i2c"]);
         assert_eq!(cfg.backup.efs, ["modemst1", "modemst2", "fsg", "fsc", "persist"]);
         assert!(cfg.backup.data_skipped.contains(&"vendor/mitee".to_string()));
@@ -1163,6 +1169,11 @@ mod tests {
         assert_eq!(
             wlan.writes,
             [Write { path: "/sys/bus/platform/devices/b0000000.qcom,cnss-peach/fs_ready".into(), value: "1".into() }]
+        );
+        assert_eq!(
+            wlan.release,
+            [Write { path: "/sys/bus/platform/devices/b0000000.qcom,cnss-peach/fs_ready".into(), value: "0".into() }],
+            "the switch is set back when the WLAN is put away"
         );
         assert_eq!(wlan.firmware[0].path, "/vendor/etc/wifi/peach/WCNSS_qcom_cfg.ini");
         assert_eq!(wlan.firmware[1].partition.as_deref(), Some("persist"));

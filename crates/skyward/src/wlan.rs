@@ -64,6 +64,10 @@ const INTERFACE_WAIT: Duration = Duration::from_secs(20);
 /// How long the supplicant may take to open its control socket.
 const SOCKET_WAIT: Duration = Duration::from_secs(10);
 
+/// How long the driver is given to stop the chip once the switch is set back,
+/// before it is asked to leave the kernel.
+const PUT_AWAY_WAIT: Duration = Duration::from_millis(300);
+
 /// How long the supplicant gets to end once asked to.
 const END_WAIT: Duration = Duration::from_secs(3);
 
@@ -268,14 +272,28 @@ impl Worker {
     }
 }
 
-impl Drop for Worker {
-    /// The WLAN goes off with the thread.
-    fn drop(&mut self) {
+impl Worker {
+    /// Put the radio away now, and wait for the thread to have done it: the
+    /// thread is the only one that can stop the chip's firmware and take the
+    /// driver out of the kernel, and a recovery that stops with the chip
+    /// running hands it to the system in a state its own driver cannot start.
+    pub fn stop(mut self) {
+        self.end();
+    }
+
+    fn end(&mut self) {
         if let Some(thread) = self.thread.take() {
             let _ = self.inbox.send(Inbox::End);
             signal(&self.poke);
             thread.join().expect("the WLAN thread does not panic");
         }
+    }
+}
+
+impl Drop for Worker {
+    /// The WLAN goes off with the thread.
+    fn drop(&mut self) {
+        self.end();
     }
 }
 
@@ -303,6 +321,9 @@ struct Running {
     probed: u64,
     /// When to ask for an address again after the network gave none.
     retry_at: Option<Instant>,
+    /// When to look again for a network the supplicant joined by itself,
+    /// which is how the first start after a network was kept comes up.
+    adopt_at: Instant,
     polled_at: Instant,
     /// What had gone over the interface when last counted, while it has an
     /// address.
@@ -393,8 +414,11 @@ impl Station {
     fn next(&self) -> Option<Instant> {
         let r = self.running.as_ref()?;
         let poll = matches!(self.state.joined, Some(Joined { stage: Stage::Connected(_), .. })).then(|| r.polled_at + POLL);
+        // A network the supplicant joined by itself is looked for until one
+        // is taken up, which a phone that keeps none never needs.
+        let adopt = (self.state.joined.is_none() && !self.saved.is_empty()).then_some(r.adopt_at);
         let count = r.lease.as_ref().map(|_| r.counted.map_or_else(Instant::now, |c| c.at + TRAFFIC));
-        [r.lease.as_ref().filter(|_| r.asking.is_none()).map(Held::due), r.retry_at, poll, count].into_iter().flatten().min()
+        [r.lease.as_ref().filter(|_| r.asking.is_none()).map(Held::due), r.retry_at, poll, adopt, count].into_iter().flatten().min()
     }
 
     fn command(&mut self, c: Command) {
@@ -426,10 +450,9 @@ impl Station {
             Command::Leave => {
                 self.unaddress();
                 self.keep = None;
-                if let Some(r) = &self.running {
-                    if let Err(e) = r.control.order("REMOVE_NETWORK all") {
-                        self.lost(e);
-                    }
+                if let Some(r) = &self.running
+                    && let Err(e) = r.control.order("REMOVE_NETWORK all") {
+                    self.lost(e);
                 }
                 self.state.joined = None;
             }
@@ -544,6 +567,7 @@ impl Station {
             asked: 0,
             probed: 0,
             retry_at: None,
+            adopt_at: Instant::now(),
             polled_at: Instant::now(),
             counted: None,
         })
@@ -552,11 +576,17 @@ impl Station {
     fn off(&mut self) {
         self.unaddress();
         self.keep = None;
+        // Whether there is a driver to take out at all: a WLAN that never
+        // came up has nothing to put away, and its switch need not be there.
+        let driving = self.running.is_some() || Path::new("/sys/class/net").join(&self.cfg.interface).exists();
         if let Some(mut r) = self.running.take() {
             end(&mut r.child, Some(&r.control));
         }
         if let Err(e) = iface::set_up(&self.cfg.interface, false) {
             let _ = skyward_sys::kmsg(&format!("{e:#}"));
+        }
+        if driving {
+            put_away(&self.cfg);
         }
         self.state = Wlan::default();
     }
@@ -619,17 +649,14 @@ impl Station {
     }
 
     fn joining(&mut self, told: &Told) {
-        // A network the supplicant joined by itself, out of the ones the
-        // phone keeps, is one no page asked for: without adopting it nothing
-        // would ask it for an address, and the phone would sit on a link
-        // that carries nothing while the page showed no network joined.
         if self.state.joined.is_none() {
-            if let Some(joined) = self.adopt(told) {
-                let _ = skyward_sys::kmsg(&format!("{} is joined from what the phone keeps", joined.name));
-                self.state.joined = Some(joined);
-                self.ask_address();
-                return;
+            // The supplicant joins a network whose password is kept by
+            // itself at the first start, before anything here has said which
+            // network it is about: that is the one thing worth taking up.
+            if matches!(told, Told::Connected) {
+                self.adopt();
             }
+            return;
         }
         let Some(j) = &mut self.state.joined else { return };
         match j.on(told) {
@@ -640,40 +667,53 @@ impl Station {
                 // The network turned the password down: there is nothing
                 // worth keeping.
                 self.keep = None;
-                if let Some(r) = &self.running {
-                    if let Err(e) = r.control.order("REMOVE_NETWORK all") {
-                        self.lost(e);
-                    }
+                if let Some(r) = &self.running
+                    && let Err(e) = r.control.order("REMOVE_NETWORK all") {
+                    self.lost(e);
                 }
             }
         }
     }
 
-    /// The network the supplicant joined by itself, where it did.
+    /// Take up the network the supplicant joined by itself.
     ///
-    /// This is what a phone that remembers networks does at a start: the
-    /// configuration it is given names them all, and the supplicant picks
-    /// one before anything is asked for. The name comes from the supplicant
-    /// rather than from the event, which names an access point and not a
-    /// network; `STATUS-NO_EVENTS` is the answer that says which network is
-    /// up, and the plain `STATUS` would have every other listener told again
-    /// what it already knows.
-    fn adopt(&mut self, told: &Told) -> Option<Joined> {
-        if *told != Told::Connected {
-            return None;
+    /// The configuration it is started with holds the networks whose
+    /// passwords are kept, so at the first start it joins one without being
+    /// told to — often before this thread has attached to its monitor, and
+    /// so without a word heard about it. What it joined is read back here and
+    /// taken up the way a network chosen on the page is, so that an address
+    /// is asked for and the page says what is connected.
+    fn adopt(&mut self) {
+        let Some(r) = &mut self.running else { return };
+        r.adopt_at = Instant::now() + POLL;
+        if self.state.joined.is_some() || self.saved.is_empty() {
+            return;
         }
-        let status = self.running.as_ref()?.control.ask("STATUS-NO_EVENTS").ok()?;
+        // A plain STATUS has Android's supplicant tell every listener again
+        // that the network is connected; this one leaves that out.
+        let status = match r.control.ask("STATUS-NO_EVENTS") {
+            Ok(status) => status,
+            Err(e) => return self.lost(e),
+        };
         let fields = supplicant::fields(&status);
-        let ssid = supplicant::unescape(fields.get("ssid")?).ok()?;
-        if ssid.is_empty() {
-            return None;
+        if fields.get("wpa_state") != Some(&"COMPLETED") {
+            return;
         }
-        // How the network is protected is what the phone kept: one joined
-        // out of the record is one that was kept. A network that is not in
-        // the record was put there by something else, and is taken as a
-        // password network, which is what most of them are.
-        let security = self.saved.iter().find(|k| k.ssid == ssid).map_or(Security::Psk, |k| k.security);
-        Some(Joined { name: String::from_utf8_lossy(&ssid).into_owned(), ssid, security, stage: Stage::Joining })
+        let Some(ssid) = fields.get("ssid").and_then(|name| supplicant::unescape(name).ok()) else { return };
+        let Some(saved) = self.saved.iter().find(|s| s.ssid == ssid) else {
+            // Only a kept network is one the supplicant is configured to
+            // join, so this is a connection made by something else, and no
+            // page should claim it.
+            return;
+        };
+        let (name, security) = (saved.name.clone(), saved.security);
+        let _ = skyward_sys::kmsg(&format!("the supplicant joined {name} by itself"));
+        // Nothing is being kept for it: it is already among what is kept.
+        self.keep = None;
+        self.state.joined = Some(Joined { ssid, name, security, stage: Stage::Joining });
+        // The event the supplicant sent, now that the page knows which
+        // network it was about: the address is asked for from there.
+        self.joining(&Told::Connected);
     }
 
     /// Ask the network for an address, on a thread of its own.
@@ -730,15 +770,14 @@ impl Station {
             }
         };
         let same = r.lease.as_ref().is_some_and(|h| (h.lease.address, h.lease.mask, h.lease.router) == (lease.address, lease.mask, lease.router));
-        if !same {
-            if let Err(e) = iface::configure(&self.cfg.interface, lease.address, lease.mask, lease.router) {
-                let _ = skyward_sys::kmsg(&format!("{e:#}"));
-                r.retry_at = Some(Instant::now() + RETRY);
-                if let Some(j) = &mut self.state.joined {
-                    j.stage = Stage::NoAddress(format!("{e:#}"));
-                }
-                return;
+        if !same
+            && let Err(e) = iface::configure(&self.cfg.interface, lease.address, lease.mask, lease.router) {
+            let _ = skyward_sys::kmsg(&format!("{e:#}"));
+            r.retry_at = Some(Instant::now() + RETRY);
+            if let Some(j) = &mut self.state.joined {
+                j.stage = Stage::NoAddress(format!("{e:#}"));
             }
+            return;
         }
         let _ = skyward_sys::kmsg(&format!(
             "{} has {} ({}) through {:?} for {} s, kept again after {} s",
@@ -830,10 +869,9 @@ impl Station {
         if let Some((_, stop)) = r.asking.take() {
             stop.store(true, Ordering::Relaxed);
         }
-        if r.lease.take().is_some() {
-            if let Err(e) = iface::unconfigure(&self.cfg.interface) {
-                let _ = skyward_sys::kmsg(&format!("{e:#}"));
-            }
+        if r.lease.take().is_some()
+            && let Err(e) = iface::unconfigure(&self.cfg.interface) {
+            let _ = skyward_sys::kmsg(&format!("{e:#}"));
         }
         // Nothing goes over a network left, and counting starts afresh on
         // the next one.
@@ -850,27 +888,27 @@ impl Station {
             r.retry_at = None;
             return self.ask_address();
         }
-        if r.asking.is_none() {
-            if let Some(h) = &r.lease {
-                if now >= h.due() {
-                    if h.phase >= 2 {
-                        // The lease ran out with no server to keep it.
-                        self.unaddress();
-                        if let Some(j) = &mut self.state.joined {
-                            j.stage = Stage::Addressing;
-                        }
-                    }
-                    return self.ask_address();
-                }
-            }
+        if self.state.joined.is_none() && now >= r.adopt_at {
+            return self.adopt();
         }
+        if r.asking.is_none()
+            && let Some(h) = &r.lease
+                && now >= h.due() {
+                if h.phase >= 2 {
+                    // The lease ran out with no server to keep it.
+                    self.unaddress();
+                    if let Some(j) = &mut self.state.joined {
+                        j.stage = Stage::Addressing;
+                    }
+                }
+                return self.ask_address();
+            }
         if now >= r.polled_at + POLL {
             self.poll_link();
         }
-        if let Some(r) = &self.running {
-            if r.lease.is_some() && r.counted.is_none_or(|c| now >= c.at + TRAFFIC) {
-                self.count(now);
-            }
+        if let Some(r) = &self.running
+            && r.lease.is_some() && r.counted.is_none_or(|c| now >= c.at + TRAFFIC) {
+            self.count(now);
         }
     }
 
@@ -916,6 +954,45 @@ impl Station {
         }
         link.speed = fields.get("LINKSPEED").and_then(|v| v.parse().ok());
         link.generation = supplicant::fields(&status).get("wifi_generation").and_then(|v| v.parse().ok());
+    }
+}
+
+/// Put the radio away the way the phone's own init does as it goes down: the
+/// switch the start set set back the other way, which has the driver stop the
+/// chip's firmware, and then the driver itself out of the kernel. A chip left
+/// running is one the system's own driver finds already up when it boots: it
+/// will not start it cold, no interface appears, and the WLAN stays dead
+/// until the phone loses power. Nothing here may fail the WLAN's own ending,
+/// so a switch that will not take its value and a module the kernel will not
+/// let go are said, and no more.
+fn put_away(cfg: &Config) {
+    for w in &cfg.release {
+        if let Err(e) = fs::write(&w.path, &w.value) {
+            let _ = skyward_sys::kmsg(&format!("{} is not given {}: {e}", w.path, w.value));
+        }
+    }
+    if !cfg.release.is_empty() {
+        thread::sleep(PUT_AWAY_WAIT);
+    }
+    let mut why = None;
+    for attempt in 0..3 {
+        match skyward_modules::unload(&cfg.modules) {
+            Ok(gone) => {
+                if !gone.is_empty() {
+                    let _ = skyward_sys::kmsg(&format!("{} left the kernel", gone.join(", ")));
+                }
+                return;
+            }
+            Err(e) => {
+                why = Some(format!("{e:#}"));
+                if attempt < 2 {
+                    thread::sleep(PUT_AWAY_WAIT);
+                }
+            }
+        }
+    }
+    if let Some(why) = why {
+        let _ = skyward_sys::kmsg(&format!("the driver stays in the kernel: {why}"));
     }
 }
 

@@ -7,16 +7,29 @@ use abootimg_oxide::binrw::BinRead;
 use abootimg_oxide::{Header, VendorHeader};
 use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
+use skyward_sys::kmsg;
 use skyward_vab::Slot;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const BOOT_MAGIC: &[u8] = b"ANDROID!";
 const VENDOR_BOOT_MAGIC: &[u8] = b"VNDRBOOT";
 /// A dtbo image starts with this, big-endian.
 const DTBO_MAGIC: &[u8] = &[0xd7, 0xb7, 0xab, 0x1e];
 const VBMETA_MAGIC: &[u8] = b"AVB0";
+
+/// A raw super image, as `lpmake` builds one, keeps a page clear and then
+/// opens its geometry with this, little-endian: skyward_lp's own
+/// `GEOMETRY_MAGIC`, at the offset of its `RESERVED_BYTES`.
+const SUPER_GEOMETRY_MAGIC: [u8; 4] = 0x616c_4467u32.to_le_bytes();
+const SUPER_GEOMETRY_AT: u64 = 4096;
+
+/// A sparse image packs the chunks of a partition instead of holding it, and
+/// is made into one as it is written, so it is no image this tells the kind
+/// of.
+const SPARSE_MAGIC: &[u8] = &[0x3a, 0xff, 0x26, 0xed];
 
 /// How a ramdisk is packed, by its first bytes: LZ4 in the legacy framing
 /// Android uses or the standard one, gzip, or a bare newc archive.
@@ -33,7 +46,25 @@ const RECOVERY_PROGRAMS: [&str; 2] = ["system/bin/recovery", "sbin/recovery"];
 const FOOTER_MAGIC: &[u8] = b"AVBf";
 const FOOTER_LEN: u64 = 64;
 
-const CHUNK: usize = 1 << 20;
+/// How much of an image is moved per call: one buffer, reused, large enough
+/// that the storage has the next write ready before it is done with this one.
+const CHUNK: usize = 4 << 20;
+
+/// The longest image whose whole is read back once it is written. A boot
+/// image, a dtbo, a vbmeta is small, so reading it back costs nothing worth
+/// saving and the whole of it being compared is worth more. A super image is
+/// many gigabytes, and reading all of it back doubles the I/O on storage
+/// whose flash translation layer is still busy with the write, so only
+/// windows of it are compared instead.
+const VERIFY_MOST: u64 = 256 << 20;
+
+/// How wide one such window is: one at the start of the image, one at its
+/// middle, and one at its end are read back and compared.
+const WINDOW: u64 = 1 << 20;
+
+/// How much is written between two lines telling the rate, so that how fast
+/// a super image went can be read off the phone's own log afterwards.
+const RATE_EVERY: u64 = 1 << 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageKind {
@@ -42,6 +73,9 @@ pub enum ImageKind {
     VendorBoot,
     Dtbo,
     Vbmeta,
+    /// A raw super image, holding every partition of both slots: it goes to
+    /// the one partition that holds them all, whole.
+    Super,
 }
 
 /// The ramdisk a boot image carries.
@@ -67,6 +101,7 @@ impl ImageKind {
             ImageKind::VendorBoot => &["vendor_boot"],
             ImageKind::Dtbo => &["dtbo"],
             ImageKind::Vbmeta => &["vbmeta", "vbmeta_system", "vbmeta_vendor"],
+            ImageKind::Super => &["super"],
         }
     }
 }
@@ -97,7 +132,20 @@ pub fn detect<R: Read + Seek>(file: &mut R, head: &[u8]) -> Result<Option<ImageK
     if head.starts_with(VBMETA_MAGIC) {
         return Ok(Some(ImageKind::Vbmeta));
     }
-    Ok(None)
+    if head.starts_with(SPARSE_MAGIC) {
+        return Ok(None);
+    }
+    // A super image's geometry opens past the page it keeps clear, so it is
+    // past what `head` holds and is read where it is.
+    file.seek(SeekFrom::Start(SUPER_GEOMETRY_AT)).context("seek to where a super image's geometry opens")?;
+    let mut geometry = [0u8; 4];
+    match file.read_exact(&mut geometry) {
+        Ok(()) if geometry == SUPER_GEOMETRY_MAGIC => Ok(Some(ImageKind::Super)),
+        Ok(()) => Ok(None),
+        // Shorter than a super image's first page and the geometry after it.
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e).context("read where a super image's geometry opens"),
+    }
 }
 
 /// Whether a packed ramdisk is a recovery's, by the names in its archive.
@@ -178,28 +226,47 @@ pub fn device(dir: &Path, name: &str, slot: Slot) -> PathBuf {
     dir.join(format!("{name}{}", slot.suffix()))
 }
 
-/// The partitions `kind` fits that this phone has in both slots, among the
-/// links in `dir`, the likeliest first.
+/// The one partition a super image goes to among the links in `dir`: super
+/// holds the partitions of both slots inside it, so it has no slot of its own
+/// and no sibling.
+pub fn super_device(dir: &Path) -> PathBuf {
+    dir.join("super")
+}
+
+/// The partitions `kind` fits that this phone has, among the links in `dir`,
+/// the likeliest first: a super image's is the one node that holds both
+/// slots, and the others' are in both slots.
 pub fn partitions(kind: ImageKind, dir: &Path) -> Result<Vec<&'static str>> {
     let mut found = Vec::new();
     for name in kind.partitions() {
-        let mut has = true;
-        for slot in [Slot::A, Slot::B] {
-            let path = device(dir, name, slot);
-            has &= path.try_exists().with_context(|| format!("look for {}", path.display()))?;
-        }
-        if has {
+        if has_partition(kind, dir, name)? {
             found.push(*name);
         }
     }
     Ok(found)
 }
 
-/// Write `len` bytes of `image` to all of `devices` in one pass, then read
-/// each back and compare. A signed image smaller than its partition gets
-/// its footer moved to the partition's end, with zeros between, as
-/// fastboot does. `progress` hears the bytes written and read back so far,
-/// of all.
+/// Whether this phone has the partition `name` an image of `kind` fits, among
+/// the links in `dir`.
+fn has_partition(kind: ImageKind, dir: &Path, name: &str) -> Result<bool> {
+    if kind == ImageKind::Super {
+        let path = super_device(dir);
+        return path.try_exists().with_context(|| format!("look for {}", path.display()));
+    }
+    let mut has = true;
+    for slot in [Slot::A, Slot::B] {
+        let path = device(dir, name, slot);
+        has &= path.try_exists().with_context(|| format!("look for {}", path.display()))?;
+    }
+    Ok(has)
+}
+
+/// Write `len` bytes of `image` to all of `devices` in one pass, discarding
+/// each partition's range first, then read each back and compare: the whole
+/// of a short image, and a window at the start, the middle, and the end of a
+/// long one. A signed image smaller than its partition gets its footer moved
+/// to the partition's end, with zeros between, as fastboot does. `progress`
+/// hears the bytes written and read back so far, of all.
 pub fn flash<R: Read + Seek>(image: &mut R, len: u64, devices: &[PathBuf], progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
     ensure!(!devices.is_empty(), "no partition to write");
     let mut outs = Vec::with_capacity(devices.len());
@@ -222,42 +289,163 @@ pub fn flash<R: Read + Seek>(image: &mut R, len: u64, devices: &[PathBuf], progr
     image.seek(SeekFrom::Start(0)).context("rewind the image")?;
     let (gap, tail): (u64, &[u8]) = if moved { (size - len - FOOTER_LEN, &footer) } else { (0, &[]) };
     let end = len + gap + tail.len() as u64;
-    let total = end * outs.len() as u64 * 2;
+
+    // Every byte of this range is about to be written over, so what the
+    // storage held there is of no use: discarding it first tells the storage
+    // that those blocks need not be copied away before they are written, as
+    // TWRP does before it writes a partition. A phone whose storage or kernel
+    // offers no discard is flashed all the same — this is a hint, and a
+    // diagnostic may never be able to fail the feature it describes — so the
+    // failure is only told, once, of the first partition it failed on.
+    let mut undiscarded: Option<(&Path, anyhow::Error)> = None;
+    let discarding = Instant::now();
+    for (path, ..) in &outs {
+        if let Err(e) = skyward_block::erase::discard_range(path, 0, end) {
+            undiscarded.get_or_insert((path.as_path(), e));
+        }
+    }
+    let discarded = discarding.elapsed();
+    if let Some((path, e)) = undiscarded {
+        let _ = kmsg(&format!("{}: written without a discard first: {e:#}", path.display()));
+    }
+
+    // What is read back once written: the whole of a short image, and three
+    // windows of a long one, each hashed as it is written out.
+    let whole = end <= VERIFY_MOST;
+    let spans = spans(end, whole, WINDOW);
+    let mut parts: Vec<(u64, u64, Sha256)> = spans.iter().map(|&(at, len)| (at, len, Sha256::new())).collect();
+    let read_back = spans.iter().map(|(_, len)| *len).sum::<u64>() * outs.len() as u64;
+    let total = end * outs.len() as u64 + read_back;
+    let name = outs.first().and_then(|(path, ..)| path.file_name()).map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     let mut source = image.take(len).chain(io::repeat(0).take(gap)).chain(tail);
 
     let mut buf = vec![0u8; CHUNK];
-    let mut written = Sha256::new();
     let mut done = 0;
     let mut at = 0;
+    let started = Instant::now();
+    let mut told = 0;
+    // How long of that was spent waiting for the image and how long writing
+    // it: a flash that is slow for reading is a different thing from one that
+    // is slow for writing, and the owner can only say which by the numbers.
+    let mut reading = Duration::ZERO;
+    let mut writing = Duration::ZERO;
     while at < end {
         let n = (end - at).min(CHUNK as u64) as usize;
+        let read = Instant::now();
         source.read_exact(&mut buf[..n]).context("read the image")?;
-        written.update(&buf[..n]);
+        reading += read.elapsed();
+        hash_at(&mut parts, at, &buf[..n]);
+        let write = Instant::now();
         for (path, f, _) in &mut outs {
             f.write_all(&buf[..n]).with_context(|| format!("write {}", path.display()))?;
             done += n as u64;
             progress(done, total);
         }
+        writing += write.elapsed();
         at += n as u64;
+        // How fast the write goes, once per GiB, so that the owner can tell
+        // from the phone's own log how long a super image took and at what
+        // rate, and which of reading and writing it waited on; nothing here
+        // may fail the write.
+        if at / RATE_EVERY > told {
+            told = at / RATE_EVERY;
+            let _ = kmsg(&format!(
+                "{name}: {} of {} MiB, {:.0} MB/s, reading {} MB/s, writing {} MB/s",
+                at >> 20,
+                end >> 20,
+                rate(at, started.elapsed()),
+                rate(at, reading),
+                rate(at, writing)
+            ));
+        }
     }
-    let written = written.finalize();
+    let digests: Vec<(u64, u64, Vec<u8>)> = parts.into_iter().map(|(at, len, hasher)| (at, len, hasher.finalize().to_vec())).collect();
+    let flushing = Instant::now();
     for (path, f, _) in &mut outs {
         f.sync_all().with_context(|| format!("flush {}", path.display()))?;
         drop_cache(f).with_context(|| format!("drop the cached pages of {}", path.display()))?;
     }
+    let flushed = flushing.elapsed();
+    let checking = Instant::now();
     for (path, f, _) in &mut outs {
-        f.seek(SeekFrom::Start(0)).with_context(|| format!("rewind {}", path.display()))?;
+        verify(f, path, &digests, &mut buf, &mut done, total, &mut *progress)?;
+    }
+    // Where the time went, in the phone's own log: what a phone that is still
+    // slow for flashing says instead of the owner having to guess.
+    let _ = kmsg(&format!(
+        "{name}: {} MiB written in {:.1} s, {:.0} MB/s; reading {} MB/s, writing {} MB/s, discarded in {:.0} ms, flushed in {:.0} ms, checked in {:.0} ms",
+        end >> 20,
+        started.elapsed().as_secs_f64(),
+        rate(end, started.elapsed()),
+        rate(end, reading),
+        rate(end, writing),
+        discarded.as_secs_f64() * 1e3,
+        flushed.as_secs_f64() * 1e3,
+        checking.elapsed().as_secs_f64() * 1e3
+    ));
+    Ok(())
+}
+
+/// `bytes` of `spent` as a rate in megabytes a second, or nothing where no
+/// time was spent at all.
+fn rate(bytes: u64, spent: Duration) -> f64 {
+    let secs = spent.as_secs_f64();
+    if secs > 0.0 {
+        bytes as f64 / 1e6 / secs
+    } else {
+        0.0
+    }
+}
+
+/// The parts of an image `end` bytes long that are read back once it is
+/// written: the whole of it where `whole`, and otherwise a `window` at its
+/// start, one at its middle, and one at its end. No window reaches past the
+/// image's end, and an image too short to hold three of them is read whole.
+fn spans(end: u64, whole: bool, window: u64) -> Vec<(u64, u64)> {
+    // Three windows that only just fit tile the image between them, so an
+    // image of exactly three windows is read back as those three and not as
+    // the whole of it: the windows are what is compared either way.
+    if whole || end < window.saturating_mul(3) {
+        return vec![(0, end)];
+    }
+    vec![(0, window), (end / 2 - window / 2, window), (end - window, window)]
+}
+
+/// Feed `bytes`, the image's bytes from `at` on, to the hash of every part
+/// they touch: the parts are hashed as the image is written, so that what a
+/// window is compared against is what went to the storage, without the image
+/// being kept.
+fn hash_at(parts: &mut [(u64, u64, Sha256)], at: u64, bytes: &[u8]) {
+    let end = at + bytes.len() as u64;
+    for (part_at, part_len, hasher) in parts {
+        let (from, to) = ((*part_at).max(at), (*part_at + *part_len).min(end));
+        if from < to
+            && let Some(touched) = bytes.get((from - at) as usize..(to - at) as usize)
+        {
+            hasher.update(touched);
+        }
+    }
+}
+
+/// Read each part of what was written back from `f` and compare it with what
+/// those bytes hashed to as they were written; `what` names the partition in
+/// the errors. `done` and `total` are the progress of the whole flash, and
+/// `buf` is the buffer the write used, reused here.
+fn verify(f: &mut File, what: &Path, parts: &[(u64, u64, Vec<u8>)], buf: &mut [u8], done: &mut u64, total: u64, progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
+    ensure!(!buf.is_empty(), "a buffer to read back into");
+    for (at, len, want) in parts {
+        f.seek(SeekFrom::Start(*at)).with_context(|| format!("seek to {at} of {}", what.display()))?;
         let mut back = Sha256::new();
-        let mut left = end;
+        let mut left = *len;
         while left > 0 {
-            let n = left.min(CHUNK as u64) as usize;
-            f.read_exact(&mut buf[..n]).with_context(|| format!("read back {}", path.display()))?;
+            let n = left.min(buf.len() as u64) as usize;
+            f.read_exact(&mut buf[..n]).with_context(|| format!("read back {}", what.display()))?;
             back.update(&buf[..n]);
             left -= n as u64;
-            done += n as u64;
-            progress(done, total);
+            *done += n as u64;
+            progress(*done, total);
         }
-        ensure!(back.finalize() == written, "{} reads back different from what was written", path.display());
+        ensure!(back.finalize().to_vec() == *want, "{} reads back different from what was written", what.display());
     }
     Ok(())
 }
@@ -287,6 +475,16 @@ pub(crate) mod samples {
         out.resize(4096 + (kernel as usize).div_ceil(4096) * 4096, 0x4b);
         out.extend_from_slice(ramdisk);
         out.resize(out.len().div_ceil(4096) * 4096, 0);
+        out
+    }
+
+    /// A raw super image as `lpmake` builds one: a page kept clear, then the
+    /// geometry the metadata follows, whose size is the next field.
+    pub fn super_image() -> Vec<u8> {
+        let mut out = vec![0u8; SUPER_GEOMETRY_AT as usize];
+        out.extend_from_slice(&SUPER_GEOMETRY_MAGIC);
+        out.extend_from_slice(&0x28u32.to_le_bytes());
+        out.resize(1 << 20, 0);
         out
     }
 
@@ -326,7 +524,7 @@ pub(crate) mod samples {
 
 #[cfg(test)]
 mod tests {
-    use super::samples::{archive, boot_image, lz4_legacy, recovery, skyward_for};
+    use super::samples::{archive, boot_image, lz4_legacy, recovery, skyward_for, super_image};
     use super::*;
     use abootimg_oxide::binrw::BinWrite;
     use abootimg_oxide::VendorHeaderV4;
@@ -409,6 +607,36 @@ mod tests {
     }
 
     #[test]
+    fn a_super_image_is_told_by_the_geometry_past_its_first_page() {
+        let kind = kind_of(&super_image()).unwrap().expect("a super image");
+        assert_eq!(kind, ImageKind::Super);
+        assert_eq!(kind.partitions(), ["super"]);
+        assert_eq!(kind_of(&vec![0u8; 1 << 16]).unwrap(), None, "an erased partition");
+        assert_eq!(kind_of(&vec![0u8; SUPER_GEOMETRY_AT as usize + 2]).unwrap(), None, "too short to hold the geometry");
+        let mut moved = vec![0u8; 1 << 16];
+        moved[..4].copy_from_slice(&SUPER_GEOMETRY_MAGIC);
+        assert_eq!(kind_of(&moved).unwrap(), None, "the geometry where a super image keeps its first page clear");
+        // A sparse image's chunks hold anything at all, the geometry magic
+        // among it, and it is still no super image.
+        let mut sparse = vec![0u8; 1 << 16];
+        sparse[..4].copy_from_slice(SPARSE_MAGIC);
+        let at = SUPER_GEOMETRY_AT as usize;
+        sparse[at..at + 4].copy_from_slice(&SUPER_GEOMETRY_MAGIC);
+        assert_eq!(kind_of(&sparse).unwrap(), None);
+    }
+
+    #[test]
+    fn a_super_image_goes_to_the_one_partition_that_holds_both_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(partitions(ImageKind::Super, dir.path()).unwrap().is_empty(), "a phone with no super");
+        for name in ["super", "super_a", "super_b"] {
+            std::fs::File::create(dir.path().join(name)).unwrap();
+        }
+        assert_eq!(partitions(ImageKind::Super, dir.path()).unwrap(), ["super"]);
+        assert_eq!(super_device(dir.path()), dir.path().join("super"));
+    }
+
+    #[test]
     fn only_partitions_the_phone_has_in_both_slots_are_offered() {
         let dir = tempfile::tempdir().unwrap();
         for name in ["boot_a", "boot_b", "recovery_a", "recovery_b", "init_boot_a", "init_boot_b", "vbmeta_a", "vbmeta_b", "vbmeta_system_a"] {
@@ -484,5 +712,63 @@ mod tests {
         let err = flash_all(&[1u8; 4097], &slots).unwrap_err();
         assert!(err.to_string().contains("4097"), "{err}");
         assert!(std::fs::read(&slots[0]).unwrap().iter().all(|&b| b == 0xaa));
+    }
+
+    /// What `bytes` hash to, as a part of a written image is compared.
+    fn digest_of(bytes: &[u8]) -> Vec<u8> {
+        Sha256::digest(bytes).to_vec()
+    }
+
+    #[test]
+    fn a_long_image_is_read_back_as_three_windows_and_a_short_one_whole() {
+        assert_eq!(spans(3 << 20, false, WINDOW), [(0, WINDOW), ((3 << 20) / 2 - WINDOW / 2, WINDOW), ((3 << 20) - WINDOW, WINDOW)], "a window at each end and the middle");
+        assert_eq!(spans(9 << 30, true, WINDOW), [(0, 9 << 30)], "a whole read-back is one part");
+        assert_eq!(spans(20, false, 8), [(0, 20)], "too short to hold three windows");
+        assert_eq!(spans(0, false, 8), [(0, 0)], "an empty image");
+    }
+
+    #[test]
+    fn the_windows_of_an_image_are_hashed_as_it_is_written() {
+        let data: Vec<u8> = (0..100u32).map(|i| (i * 7) as u8).collect();
+        let spans = spans(data.len() as u64, false, 8);
+        let mut parts: Vec<(u64, u64, Sha256)> = spans.iter().map(|&(at, len)| (at, len, Sha256::new())).collect();
+        let mut at = 0;
+        for chunk in data.chunks(7) {
+            hash_at(&mut parts, at, chunk);
+            at += chunk.len() as u64;
+        }
+        assert_eq!(at as usize, data.len(), "the whole image was fed in");
+        for ((at, len, hasher), (want_at, want_len)) in parts.into_iter().zip(spans) {
+            assert_eq!((at, len), (want_at, want_len));
+            let want = digest_of(data.get(at as usize..(at + len) as usize).unwrap_or_default());
+            assert_eq!(hasher.finalize().to_vec(), want, "the window at {at}");
+        }
+    }
+
+    #[test]
+    fn a_read_back_that_differs_from_what_was_written_fails_the_flash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("super");
+        let data: Vec<u8> = (0..64u32).map(|i| (i * 5) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let parts = |data: &[u8]| -> Vec<(u64, u64, Vec<u8>)> {
+            spans(data.len() as u64, false, 8).into_iter().map(|(at, len)| (at, len, digest_of(&data[at as usize..(at + len) as usize]))).collect()
+        };
+        let total = parts(&data).iter().map(|(_, len, _)| *len).sum::<u64>();
+        let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut buf = vec![0u8; 16];
+        let mut done = 0;
+        verify(&mut f, &path, &parts(&data), &mut buf, &mut done, total, &mut |_, _| {}).unwrap();
+        assert_eq!(done, total, "only the windows were read");
+
+        // A byte under no window is never read back, so what changed there is
+        // not noticed; a byte under a window is compared and fails the write.
+        f.seek(SeekFrom::Start(20)).unwrap();
+        f.write_all(&[0xff]).unwrap();
+        verify(&mut f, &path, &parts(&data), &mut buf, &mut 0u64, total, &mut |_, _| {}).unwrap();
+        f.seek(SeekFrom::Start(30)).unwrap();
+        f.write_all(&[0xee]).unwrap();
+        let err = verify(&mut f, &path, &parts(&data), &mut buf, &mut 0u64, total, &mut |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("different from what was written"), "{err}");
     }
 }

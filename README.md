@@ -4,6 +4,14 @@
 
 English | [简体中文](README.zh-CN.md)
 
+[![version](https://img.shields.io/github/v/release/Rinrroy/skyward-for-haotian?display_name=tag&label=version&color=4c8ddf)](https://github.com/Rinrroy/skyward-for-haotian/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/Rinrroy/skyward-for-haotian/build-haotian.yml?branch=main&label=CI)](https://github.com/Rinrroy/skyward-for-haotian/actions/workflows/build-haotian.yml)
+[![license](https://img.shields.io/github/license/Rinrroy/skyward-for-haotian?label=license&color=4c8ddf)](LICENSE)
+[![status](https://img.shields.io/badge/status-public_beta-8ea9f1)](https://github.com/Rinrroy/skyward-for-haotian/releases)
+[![device](https://img.shields.io/badge/device-Xiaomi_15_Pro_(haotian)-555555)](#skyward-for-the-xiaomi-15-pro)
+[![stars](https://img.shields.io/github/stars/Rinrroy/skyward-for-haotian?style=flat&label=stars&color=4c8ddf)](https://github.com/Rinrroy/skyward-for-haotian/stargazers)
+[![downloads](https://img.shields.io/github/downloads/Rinrroy/skyward-for-haotian/total?style=flat&label=downloads&color=4c8ddf)](https://github.com/Rinrroy/skyward-for-haotian/releases)
+
 Skyward is a recovery written in Rust, from scratch. This fork is built for one
 phone: **Xiaomi 15 Pro (`haotian`)**, on the Chinese system's OS4.0.0.19.
 
@@ -41,6 +49,11 @@ Install scripts get `7za` and `zstd`, which ROMs with a super image compressed b
 zstd use to flash it, and an `unzip` whose `-p` streams the image as it reads it.
 They also get `avbctl` and `resetprop`, to turn off verified boot's checks and to
 read and set properties.
+
+A raw super image is a package of its own: picked as a file or sent with
+`adb sideload`, it is written over the whole super partition, with no slot to
+pick. The logical partitions inside it are mapped anew at the next start, so the
+phone is restarted after one is flashed.
 
 ### Online updates
 

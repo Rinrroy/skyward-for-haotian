@@ -10,6 +10,7 @@ anyhow = { workspace = true }
 base64 = "0.22.1"
 cbc = { version = "0.1.2", features = ["alloc", "block-padding"] }
 dhcproto = "0.15.0"
+hex = { workspace = true }
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 httparse = "1.10.1"
 libc = { workspace = true }

@@ -19,12 +19,12 @@ use crate::theme::Theme;
 use crate::tr;
 use crate::icons::{self, Icon};
 use crate::widgets::{self, Caption, Detail, Fact, Outline, Row, Spec, SystemCard, SystemMark, Tone, Trail};
-use skyward_info::{DeviceInfo, VERSION};
+use skyward_info::{BUILDER, DeviceInfo, VERSION};
 use skyward_install::{Outcome, Reflash, Refusal, Stage};
 use skyward_net::download::Progress;
 use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Bands, Network, Power, Stage as Joining};
-use skyward_systems::Who;
+use skyward_systems::{Held, Who};
 use skyward_vab::{Slot, Standing};
 use std::path::Path;
 
@@ -754,10 +754,16 @@ pub fn specs(cx: &Ctx) -> Frame {
     if let Some(r) = &i.android {
         y = widgets::info_card(&mut c, t, f, y + gap, &[(l.pick(ANDROID_VERSION), fmt::android(l, r, i.security_patch.as_ref()))]);
     }
-    y = widgets::info_card(&mut c, t, f, y + gap, &[
+    let mut versions = vec![
         (l.pick(["Recovery 版本", "Recovery 版本", "Recovery version"]), format!("Skyward {VERSION}")),
         (l.pick(["内核版本", "核心版本", "Kernel version"]), i.kernel.clone()),
-    ]);
+    ];
+    // Only a build that named someone has this row; the const is absent when
+    // the variable was not set at build time.
+    if let Some(builder) = BUILDER {
+        versions.push((l.pick(["构建者", "建置者", "Built by"]), builder.to_string()));
+    }
+    y = widgets::info_card(&mut c, t, f, y + gap, &versions);
 
     let mut boot = Vec::new();
     if let Some(s) = i.slot {
@@ -1101,14 +1107,14 @@ pub fn install(cx: &Ctx) -> Frame {
     // A phone that can hold a second system installs one from here too.
     let what = l.pick(match cx.state.dual_boot {
         true => [
-            "支持安装 A/B 完整更新包、带安装脚本的刷机包和第二系统的安装包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分区镜像。系统更新将安装到另一个槽位，重启后从该槽位启动；第二系统安装在 data 分区中，可在「双系统」中切换。选择文件时仅列出文件夹以及 .zip、.img 文件。",
-            "支援安裝 A/B 完整更新檔、帶有安裝指令碼的刷機包和第二系統的安裝檔，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分割區映像檔。系統更新將安裝到另一個槽位，重新啟動後從該槽位啟動；第二系統安裝在 data 分割區中，可在「雙系統」中切換。選擇檔案時僅列出資料夾以及 .zip、.img 檔案。",
-            "Installs A/B full OTA packages, flashable zips with an install script and second systems' packages, and flashes boot, init_boot, vendor_boot, recovery, dtbo and vbmeta partition images. A system update installs to the other slot, which starts after a reboot; a second system installs into the data partition, and Dual boot switches to it. Choosing a file lists only folders and .zip and .img files.",
+            "支持安装 A/B 完整更新包、带安装脚本的刷机包和第二系统的安装包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta、super 分区镜像。刷入 super 会写整个分区，其中的逻辑分区要重启手机后才会重新映射。系统更新将安装到另一个槽位，重启后从该槽位启动；第二系统安装在 data 分区中，可在「双系统」中切换。选择文件时仅列出文件夹以及 .zip、.img 文件。",
+            "支援安裝 A/B 完整更新檔、帶有安裝指令碼的刷機包和第二系統的安裝檔，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta、super 分割區映像檔。刷入 super 會寫入整個分割區，其中的邏輯分割區要重新啟動手機後才會重新映射。系統更新將安裝到另一個槽位，重新啟動後從該槽位啟動；第二系統安裝在 data 分割區中，可在「雙系統」中切換。選擇檔案時僅列出資料夾以及 .zip、.img 檔案。",
+            "Installs A/B full OTA packages, flashable zips with an install script and second systems' packages, and flashes boot, init_boot, vendor_boot, recovery, dtbo, vbmeta and super partition images. A super image is written to the whole partition, and the logical partitions inside it are mapped anew only when the phone next starts. A system update installs to the other slot, which starts after a reboot; a second system installs into the data partition, and Dual boot switches to it. Choosing a file lists only folders and .zip and .img files.",
         ],
         false => [
-            "支持安装 A/B 完整更新包和带安装脚本的刷机包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分区镜像。系统更新将安装到另一个槽位，重启后从该槽位启动。选择文件时仅列出文件夹以及 .zip、.img 文件。",
-            "支援安裝 A/B 完整更新檔和帶有安裝指令碼的刷機包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分割區映像檔。系統更新將安裝到另一個槽位，重新啟動後從該槽位啟動。選擇檔案時僅列出資料夾以及 .zip、.img 檔案。",
-            "Installs A/B full OTA packages and flashable zips with an install script, and flashes boot, init_boot, vendor_boot, recovery, dtbo and vbmeta partition images. A system update installs to the other slot, which starts after a reboot. Choosing a file lists only folders and .zip and .img files.",
+            "支持安装 A/B 完整更新包和带安装脚本的刷机包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta、super 分区镜像。刷入 super 会写整个分区，其中的逻辑分区要重启手机后才会重新映射。系统更新将安装到另一个槽位，重启后从该槽位启动。选择文件时仅列出文件夹以及 .zip、.img 文件。",
+            "支援安裝 A/B 完整更新檔和帶有安裝指令碼的刷機包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta、super 分割區映像檔。刷入 super 會寫入整個分割區，其中的邏輯分割區要重新啟動手機後才會重新映射。系統更新將安裝到另一個槽位，重新啟動後從該槽位啟動。選擇檔案時僅列出資料夾以及 .zip、.img 檔案。",
+            "Installs A/B full OTA packages and flashable zips with an install script, and flashes boot, init_boot, vendor_boot, recovery, dtbo, vbmeta and super partition images. A super image is written to the whole partition, and the logical partitions inside it are mapped anew only when the phone next starts. A system update installs to the other slot, which starts after a reboot. Choosing a file lists only folders and .zip and .img files.",
         ],
     });
     let y = widgets::footnote(&mut c, t, f, methods.bottom, what);
@@ -1293,6 +1299,13 @@ fn pick_title(l: Lang, pick: Pick, current: Option<Slot>) -> String {
     }
 }
 
+/// A raw super image: the one partition `super`, and no slots of its own. The
+/// installer writes the whole partition and ignores the slot picked, so the
+/// page does not offer one.
+fn super_image(partitions: &[&'static str]) -> bool {
+    matches!(partitions, ["super"])
+}
+
 /// Words the installing page says of more than one of its steps.
 const SWITCHING_USB: Text = ["正在切换 USB 模式", "正在切換 USB 模式", "Switching USB mode"];
 const READING_FILE: Text = ["正在读取文件", "正在讀取檔案", "Reading the file"];
@@ -1302,6 +1315,14 @@ const RUN_ON_COMPUTER: Text = ["在电脑上运行", "在電腦上執行", "Run 
 const KEEP_CABLE: Text = ["读取完成前，请不要断开数据线。", "讀取完成前，請不要拔除傳輸線。", "Keep the cable in until it's read."];
 const KEEP_DRIVE: Text = ["读取完成前，请不要拔出 U 盘。", "讀取完成前，請不要拔出 USB 隨身碟。", "Keep the USB drive in until it's read."];
 const GETTING_READY: Text = ["正在准备", "正在準備", "Getting ready"];
+/// What flashing a raw super image does, which is not like the other
+/// partitions: the whole of it is written, and what is inside it is mapped
+/// only at the next start.
+const SUPER_NOTE: Text = [
+    "将写入整个 super 分区，其中的逻辑分区要重启手机后才会重新映射。刷入完成后请重启手机。",
+    "將寫入整個 super 分割區，其中的邏輯分割區要重新啟動手機後才會重新對應。刷入完成後請重新啟動手機。",
+    "The whole super partition is written, and the logical partitions inside it are mapped anew only when the phone next starts. Restart the phone once it's flashed.",
+];
 
 /// Installing a package step by step: receiving what the computer sends
 /// with `adb sideload`, or reading the file chosen, then installing it.
@@ -1430,15 +1451,29 @@ pub fn installing(cx: &Ctx) -> Frame {
             let parts = widgets::list(&mut c, t, f, y, &rows);
             let choose: Vec<Action> = (0..choice.partitions.len()).map(Action::FlashPartition).collect();
             out.extend(hits(&parts.rows, &choose));
-            let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(["槽位", "槽位", "Slot"]));
-            let titles = Pick::ALL.map(|p| pick_title(l, p, i.slot));
-            let rows: Vec<Row> =
-                Pick::ALL.iter().zip(&titles).map(|(p, title)| Row::new(title).trail(Trail::Check(*p == choice.pick))).collect();
-            let picks = widgets::list(&mut c, t, f, y, &rows);
-            out.extend(hits(&picks.rows, &Pick::ALL.map(Action::FlashSlots)));
+            // A raw super image has no slots of its own: the installer writes
+            // the whole partition and ignores the slot picked, so the page
+            // does not ask for one, and says what that means below the swipe.
+            let super_only = super_image(&choice.partitions);
+            let bottom = if super_only {
+                parts.bottom
+            } else {
+                let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(["槽位", "槽位", "Slot"]));
+                let titles = Pick::ALL.map(|p| pick_title(l, p, i.slot));
+                let rows: Vec<Row> =
+                    Pick::ALL.iter().zip(&titles).map(|(p, title)| Row::new(title).trail(Trail::Check(*p == choice.pick))).collect();
+                let picks = widgets::list(&mut c, t, f, y, &rows);
+                out.extend(hits(&picks.rows, &Pick::ALL.map(Action::FlashSlots)));
+                picks.bottom
+            };
             let (label, danger) = confirm_label(Confirm::Flash, cx.state);
-            let track = widgets::confirm(&mut c, t, f, picks.bottom + t.m.dp(28.0), label, danger, s.confirm);
+            let track = widgets::confirm(&mut c, t, f, bottom + t.m.dp(28.0), label, danger, s.confirm);
             out.push(Hit { rect: track, action: Action::Confirm(Confirm::Flash) });
+            let y = if super_only {
+                widgets::footnote(&mut c, t, f, track.y + track.h, l.pick(SUPER_NOTE))
+            } else {
+                track.y + track.h
+            };
             let note = l.pick(match s.source {
                 Source::Computer => [
                     "刷入将覆盖分区中的原有内容。返回将取消刷入，并结束电脑上的 adb sideload。",
@@ -1456,7 +1491,7 @@ pub fn installing(cx: &Ctx) -> Frame {
                     "Flashing writes over what the partition holds. Going back cancels it.",
                 ],
             });
-            widgets::footnote(&mut c, t, f, track.y + track.h, note)
+            widgets::footnote(&mut c, t, f, y, note)
         }
         Install::Confirming { version, wipe } => {
             let (title, color, icon, detail, which) = if *wipe {
@@ -1667,6 +1702,17 @@ fn capitalized(l: Lang, phrase: &str) -> String {
     }
 }
 
+/// What a flash that ended says. A raw super image is written whole and has no
+/// slots, which the installer reports as none: said without one, rather than
+/// with a slot list that is not there.
+fn flashed_detail(l: Lang, partition: &str, slots: &[Slot]) -> String {
+    if slots.is_empty() {
+        return tr!(l, "{partition} 已刷入。", "{partition} 已刷入。", "Flashed to {partition}.");
+    }
+    let slots = fmt::slots(l, slots);
+    tr!(l, "{partition} 已刷入{slots}。", "{partition} 已刷入{slots}。", "Flashed to {partition} in {slots}.")
+}
+
 /// How an install ended, and where to go from there: another package from
 /// the computer, or back to choose another file.
 fn finished(
@@ -1706,8 +1752,7 @@ fn finished(
             afterwards_of(c, cx, y, true)
         }
         Outcome::Flashed { partition, slots } => {
-            let slots = fmt::slots(l, slots);
-            let detail = tr!(l, "{partition} 已刷入{slots}。", "{partition} 已刷入{slots}。", "Flashed to {partition} in {slots}.");
+            let detail = flashed_detail(l, partition, slots);
             let y = widgets::list(c, t, f, top, &[standing(l.pick(["刷入成功", "刷入成功", "Flashed"]), GREEN, Icon::Install, &detail)]).bottom;
             let mut rows = vec![restart];
             let mut acts = vec![Action::RebootTo(Target::System)];
@@ -2169,16 +2214,17 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
                 }
                 // The boot partitions' vbmeta checks the system's: one of
                 // another version without the other may not start.
-                if let (Some(was), Some(now)) = (&held.system, &i.os_version) {
-                    if was != now && chosen[0] != chosen[1] {
-                        let warn = tr!(
-                            l,
-                            "该备份来自 {was}，本机当前为 {now}。仅恢复启动分区或系统分区中的一项，可能导致无法开机。",
-                            "這份備份來自 {was}，本機目前為 {now}。僅還原啟動分割區或系統分割區中的一項，可能導致無法開機。",
-                            "This backup is from {was}, and this phone runs {now}. Restoring only one of the boot and system partitions may keep the phone from starting."
-                        );
-                        y = widgets::footnote(&mut c, t, f, y, &warn);
-                    }
+                if let (Some(was), Some(now)) = (&held.system, &i.os_version)
+                    && was != now
+                    && chosen[0] != chosen[1]
+                {
+                    let warn = tr!(
+                        l,
+                        "该备份来自 {was}，本机当前为 {now}。仅恢复启动分区或系统分区中的一项，可能导致无法开机。",
+                        "這份備份來自 {was}，本機目前為 {now}。僅還原啟動分割區或系統分割區中的一項，可能導致無法開機。",
+                        "This backup is from {was}, and this phone runs {now}. Restoring only one of the boot and system partitions may keep the phone from starting."
+                    );
+                    y = widgets::footnote(&mut c, t, f, y, &warn);
                 }
                 let (label, danger) = confirm_label(Confirm::Restore, cx.state);
                 let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
@@ -3335,10 +3381,10 @@ pub fn wlan(cx: &Ctx) -> Frame {
                 out.extend(hits(&joined.rows, &[Action::OpenJoined]));
                 out.push(Hit { rect: widgets::round_button(t, joined.rows[0]), action: Action::OpenJoined });
                 y = joined.bottom;
-                if let Joining::Connected(link) = &j.stage {
-                    if let Some(note) = link.reach.as_ref().and_then(|r| fmt::reach(l, r)) {
-                        y = widgets::footnote(&mut c, t, f, y, &note);
-                    }
+                if let Joining::Connected(link) = &j.stage
+                    && let Some(note) = link.reach.as_ref().and_then(|r| fmt::reach(l, r))
+                {
+                    y = widgets::footnote(&mut c, t, f, y, &note);
                 }
             }
             let others: Vec<(usize, &Network)> =
@@ -4270,11 +4316,13 @@ pub fn systems(cx: &Ctx) -> Frame {
     let starts = starting(systems);
     let chosen = s.system_pick.unwrap_or(starts);
     let second_role = l.pick(SECOND_SYSTEM);
+    // Boot partitions that hold a second system's image nothing is kept of
+    // start neither system the page knows.
     let main = SystemCard {
         role: l.pick(MAIN_SYSTEM),
         name: &systems.installed.name,
         detail: systems.installed.version.as_deref().unwrap_or_default(),
-        mark: SystemMark::Check(chosen == Who::Installed),
+        mark: SystemMark::Check(chosen == Who::Installed && systems.held != Held::Unrecorded),
     };
     let second = match &systems.other {
         Some(other) => SystemCard { role: second_role, name: &other.name, detail: &other.version, mark: SystemMark::Check(chosen == Who::Other) },
@@ -4313,6 +4361,25 @@ pub fn systems(cx: &Ctx) -> Frame {
         "Tap a card to pick a system. Switching rewrites only the boot and init_boot partitions of the slot that starts next, and leaves the main system's other partitions as they are. The second system's files are kept in the data partition.",
     ]);
     y = widgets::footnote(&mut c, t, f, y, what);
+    match systems.held {
+        Held::Recorded => {}
+        Held::Rewritten => {
+            let note = l.pick([
+                "Skyward 写入第二系统的启动镜像之后，启动分区被改写过。选择主系统并滑动确认，会用保存的主系统启动镜像覆盖现在的内容；在此之前，安装、清除和备份都不会进行。",
+                "Skyward 寫入第二系統的啟動映像檔之後，啟動分割區被改寫過。選擇主系統並滑動確認，會用儲存的主系統啟動映像檔覆蓋現在的內容；在此之前，安裝、清除和備份都不會進行。",
+                "Something else has written the boot partitions since Skyward put the second system's boot images there. Picking the main system and sliding to confirm writes the main system's saved boot images over what is there now; until then, nothing is installed, wiped or backed up.",
+            ]);
+            y = widgets::footnote(&mut c, t, f, y, note);
+        }
+        Held::Unrecorded => {
+            let note = l.pick([
+                "启动分区里是第二系统的启动镜像，Skyward 保存的记录已经不存在，无法写回主系统的启动镜像。请重新刷入主系统的 boot 和 init_boot 镜像。",
+                "啟動分割區裡是第二系統的啟動映像檔，Skyward 儲存的記錄已經不存在，無法寫回主系統的啟動映像檔。請重新刷入主系統的 boot 和 init_boot 映像檔。",
+                "The boot partitions hold a second system's boot images, and what Skyward kept of them is gone, so it can't put the main system's back. Flash the main system's boot and init_boot images again.",
+            ]);
+            y = widgets::footnote(&mut c, t, f, y, note);
+        }
+    }
     if systems.other.is_some() && systems.changed {
         let note = l.pick([
             "安装第二系统后，主系统的 vendor_boot 或 dtbo 分区已改变，第二系统可能无法正常启动。",
@@ -5065,5 +5132,25 @@ mod tests {
     fn a_phrase_that_opens_a_line_starts_with_a_capital_in_english() {
         assert_eq!(capitalized(Lang::En, "empties the data partition"), "Empties the data partition");
         assert_eq!(capitalized(Lang::Hans, "清空 data 分区"), "清空 data 分区");
+    }
+
+    #[test]
+    fn only_a_super_image_on_its_own_has_no_slots_to_pick() {
+        assert!(super_image(&["super"]), "the whole of the dynamic partitions, in one partition");
+        assert!(!super_image(&["super", "boot"]), "an image that also names another partition is not that");
+        assert!(!super_image(&["boot"]));
+        assert!(!super_image(&[]), "an image with nowhere to go asks for nothing, rather than for a slot");
+    }
+
+    #[test]
+    fn a_flash_with_no_slot_is_said_without_one() {
+        assert_eq!(flashed_detail(Lang::Hans, "super", &[]), "super 已刷入。");
+        assert_eq!(flashed_detail(Lang::Hant, "super", &[]), "super 已刷入。");
+        assert_eq!(flashed_detail(Lang::En, "super", &[]), "Flashed to super.");
+        // An image that does go to slots reads as it did.
+        assert_eq!(flashed_detail(Lang::Hans, "boot", &[Slot::A, Slot::B]), "boot 已刷入槽位 A 和 B。");
+        assert_eq!(flashed_detail(Lang::Hant, "recovery", &[Slot::B]), "recovery 已刷入槽位 B。");
+        assert_eq!(flashed_detail(Lang::En, "boot", &[Slot::A]), "Flashed to boot in slot A.");
+        assert_eq!(flashed_detail(Lang::En, "boot", &[Slot::A, Slot::B]), "Flashed to boot in slots A and B.");
     }
 }

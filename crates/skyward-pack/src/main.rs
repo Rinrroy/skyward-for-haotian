@@ -111,7 +111,7 @@ enum Cmd {
         out: Option<PathBuf>,
         /// Another partition to take from the same package, such as odm.
         /// It is written beside --out, named <partition>.img.
-        #[arg(long)]
+        #[arg(long, requires = "out")]
         partition: Option<String>,
     },
 
@@ -215,10 +215,26 @@ fn main() -> Result<()> {
 /// The partition a recovery is made on, as a full update package names it.
 const RECOVERY: &str = "recovery";
 
+/// Refuse a name that is not a partition of its own.
+///
+/// The name becomes a path beside `--out`, so nothing in it may lead
+/// anywhere else, and the recovery partition is taken out already: asking for
+/// it twice would write it over itself.
+fn separate_partition(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty() && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-') && name != RECOVERY,
+        "{name} is not a separate partition name: give one such as odm, which is written beside --out"
+    );
+    Ok(())
+}
+
 /// Take the recovery partition out of the stock build's full update package
 /// on its server, reading only what that partition takes of it, and write it
 /// to `out` once its SHA-256 is the one the configuration names.
 fn take_stock_recovery(stock: &skyward_config::Stock, out: &Path, other: Option<&str>) -> Result<()> {
+    if let Some(name) = other {
+        separate_partition(name)?;
+    }
     let parent = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| format!("make {}", parent.display()))?;
     // Taken out beside where it goes, so it is moved there whole.
@@ -455,5 +471,15 @@ ro.vendor.build.security_patch=2026-10-01\nro.vendor.build.security_patch_level=
         assert_eq!(out, b"a=1\n");
         let kept = without(b"a=1\nb=2", &BUILD_VERSION);
         assert_eq!(kept, b"a=1\nb=2");
+    }
+
+    #[test]
+    fn a_second_partition_is_named_where_it_can_only_be_one() {
+        for good in ["odm", "vendor_boot", "system-a", "vbmeta_system"] {
+            assert!(separate_partition(good).is_ok(), "{good} is a partition name");
+        }
+        for bad in ["", "recovery", "../recovery", "odm/../../../etc/passwd", "odm.img", "odm ", "ODM\n", "分区"] {
+            assert!(separate_partition(bad).is_err(), "{bad:?} is not a partition name");
+        }
     }
 }

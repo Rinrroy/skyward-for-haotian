@@ -21,7 +21,27 @@ pub enum Job {
 /// How a job ended: what it opened, or why it did not.
 pub enum Ended {
     Opened(Result<Opening, String>),
-    Unlocked(Result<Vec<Closed>, String>),
+    Unlocked(Result<Vec<Closed>, UnlockError>),
+}
+
+#[derive(Debug)]
+pub struct UnlockError {
+    pub rejection: Option<skyward_crypto::credential::Rejection>,
+    pub details: String,
+}
+
+impl UnlockError {
+    fn of(error: anyhow::Error) -> Self {
+        Self { rejection: skyward_crypto::credential::rejection(&error), details: format!("{error:#}") }
+    }
+}
+
+/// The whole chain, as the log has always written it. The page shows a
+/// sentence of its own instead, so this is only what the log says.
+impl std::fmt::Display for UnlockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.details)
+    }
 }
 
 pub struct Decryptor {
@@ -45,7 +65,7 @@ impl Decryptor {
                 let ended_as = match job {
                     Job::Open => Ended::Opened(with_key_service(data::open_without_credential)),
                     Job::Unlock { closed, user, credential } => {
-                        Ended::Unlocked(with_key_service(|service| data::unlock(service, &closed, user, &credential)))
+                        Ended::Unlocked(work_with_key_service(|service| data::unlock(service, &closed, user, &credential)).map_err(UnlockError::of))
                     }
                 };
                 // The screen only stops listening once it has let the
@@ -81,10 +101,11 @@ impl Drop for Decryptor {
 /// Do `work` with the phone's key service, reached afresh for it, and say
 /// why it failed in words for the page.
 pub fn with_key_service<T>(work: impl FnOnce(&KeyMint) -> Result<T>) -> Result<T, String> {
-    let done = (|| {
-        let binder = Binder::open()?;
-        let service = KeyMint::open(&binder)?;
-        work(&service)
-    })();
-    done.map_err(|e| format!("{e:#}"))
+    work_with_key_service(work).map_err(|e| format!("{e:#}"))
+}
+
+fn work_with_key_service<T>(work: impl FnOnce(&KeyMint) -> Result<T>) -> Result<T> {
+    let binder = Binder::open()?;
+    let service = KeyMint::open(&binder)?;
+    work(&service)
 }

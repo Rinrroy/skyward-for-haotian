@@ -206,6 +206,43 @@ pub fn insmod(path: impl AsRef<Path>, params: &str) -> Result<()> {
     }
 }
 
+/// Take `names` out of the kernel again, the last loaded first: a module does
+/// not go while another is built on it. A module the kernel does not have is
+/// not an error, as two starts of the recovery service share one kernel and
+/// the driver is only taken out once. Returns the modules that came out.
+pub fn unload(names: &[String]) -> Result<Vec<String>> {
+    let mut gone = Vec::new();
+    for name in names.iter().rev() {
+        if removed(name)? {
+            gone.push(name.clone());
+        }
+    }
+    Ok(gone)
+}
+
+/// Have the kernel drop the module `name`.
+#[cfg(target_os = "android")]
+fn removed(name: &str) -> Result<bool> {
+    let cname = std::ffi::CString::new(name).map_err(|e| anyhow!("{name} is no module's name: {e}"))?;
+    // Not waited on: a module still in use then answers at once instead of
+    // holding the caller until its user lets go, which is a recovery that
+    // never restarts.
+    let rc = unsafe { libc::syscall(libc::SYS_delete_module, cname.as_ptr(), libc::O_NONBLOCK as libc::c_int) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::ENOENT) {
+        return Ok(false);
+    }
+    Err(anyhow!("{name} is still in the kernel: {e}"))
+}
+
+#[cfg(not(target_os = "android"))]
+fn removed(_name: &str) -> Result<bool> {
+    bail!("modules are loaded only on the phone")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

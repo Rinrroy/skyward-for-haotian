@@ -24,11 +24,17 @@ pub enum Status {
     /// Step 1 writes the partitions; step 2 runs the package's last steps,
     /// after the written partitions are read back.
     Step(u32),
+    /// How far the step it is in has gone, in thousandths.
+    Progress(u16),
     /// It failed with this error code.
     Error(i32),
 }
 
 pub fn status(line: &str) -> Option<Status> {
+    if let Some(share) = line.strip_prefix("set_progress ") {
+        let share: f64 = share.trim().parse().ok()?;
+        return (share.is_finite() && (0.0..=1.0).contains(&share)).then(|| Status::Progress((share * 1000.0).round() as u16));
+    }
     let text = line.strip_prefix("ui_print ")?;
     if let Some(step) = text.strip_prefix("Step ") {
         return step.split_once('/')?.0.parse().ok().map(Status::Step);
@@ -40,6 +46,11 @@ pub fn status(line: &str) -> Option<Status> {
 /// What its log on stderr tells beyond the status lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Log {
+    /// How far the payload as a whole has gone, in thousandths. The package
+    /// is read through a FUSE mount, and how far into it something has read
+    /// says nothing about how much of it has been applied: the zip's own
+    /// directory sits at its end and is read before any work starts.
+    Progress(u16),
     /// A partition the payload writes, listed once before writing starts.
     Partition(String),
     /// Super has no room for snapshots, so it writes over the partitions
@@ -50,6 +61,10 @@ pub enum Log {
 }
 
 pub fn log(line: &str) -> Option<Log> {
+    if let Some(rest) = after(line, "overall progress ") {
+        let percent: u16 = rest.split_once('%')?.0.parse().ok()?;
+        return (percent <= 100).then_some(Log::Progress(percent * 10));
+    }
     if let Some(rest) = after(line, "PartitionInfo new ") {
         let (name, _) = rest.split_once(' ')?;
         return Some(Log::Partition(name.to_string()));
@@ -141,7 +156,21 @@ mod tests {
             Some(Status::Error(51))
         );
         assert_eq!(status("progress 0.5 0"), None);
-        assert_eq!(status("set_progress 1"), None);
+        assert_eq!(status("set_progress 1"), Some(Status::Progress(1000)));
+        assert_eq!(status("set_progress 0.125"), Some(Status::Progress(125)));
+        for line in ["set_progress NaN", "set_progress inf", "set_progress -1", "set_progress 1.01"] {
+            assert_eq!(status(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn how_far_the_payload_has_gone_is_the_engines_own_number() {
+        assert_eq!(
+            log("[INFO:delta_performer.cc(108)] Completed 10/400 operations (2%), 1024/4096 bytes downloaded (25%), overall progress 13%"),
+            Some(Log::Progress(130))
+        );
+        assert_eq!(log("overall progress 101%"), None);
+        assert_eq!(log("overall progress invalid%"), None);
     }
 
     #[test]
