@@ -24,6 +24,10 @@ edition = "2018"
 [features]
 default = ["plain"]
 plain = []
+# The build script writes a `split` field for the cut between a syllable's
+# initial and its final when this is on; it reads `cfg(feature = "compat")`,
+# which a compiler that checks its `cfg`s wants declared even off.
+compat = []
 with_tone = []
 with_tone_num = []
 with_tone_num_end = []
