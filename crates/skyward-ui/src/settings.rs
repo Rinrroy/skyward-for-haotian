@@ -21,7 +21,7 @@ const STORAGE: &str = "storage";
 const USB_DRIVE: &str = "usb_drive";
 /// The logs exported, and where they go, by name, in the order of the page
 /// that exports them.
-const LOGS: [&str; 2] = ["recovery", "kernel"];
+const LOGS: [&str; 4] = ["recovery", "kernel", "browser", "full"];
 const LOG_PLACES: [&str; 2] = ["temporary", "storage"];
 
 /// The settings as they are kept. A value missing is the one a recovery
@@ -355,7 +355,7 @@ mod tests {
             backup_to: Place::UsbDrive,
             compress: true,
             verify: false,
-            logs: [false, true],
+            logs: [false, true, false, false],
             logs_to: 1,
             ..State::default()
         };
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!((state.screen_off, state.time_zone, state.backup_to, state.logs_to), (start.screen_off, start.time_zone, start.backup_to, start.logs_to));
         assert!(!state.language_chosen);
         assert_eq!(state.backup, [true, false, false, false, false], "a part this version has not is left out");
-        assert_eq!(state.logs, [false, true]);
+        assert_eq!(state.logs, [false, true, false, false]);
     }
 
     #[test]

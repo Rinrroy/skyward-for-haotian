@@ -391,7 +391,7 @@ fn in_place(place: Place, path: &str) -> PathBuf {
 /// what update_engine wrote while it last installed an update and what the
 /// last install script wrote, and the kernel's. Each file is owned as a
 /// copy into the folder would be. Gives the folder.
-fn export_logs(recovery: bool, kernel: bool, into: &Path, zone: usize) -> Result<PathBuf> {
+fn export_logs(recovery: bool, kernel: bool, browser: bool, full: bool, into: &Path, zone: usize) -> Result<PathBuf> {
     let there = into.ancestors().find(|p| p.exists()).context("the root is always there")?;
     let ownership = ownership(there)?;
     let folder = into.join(skyward_ui::fmt::stamp(unix_now()?, zone));
@@ -414,6 +414,26 @@ fn export_logs(recovery: bool, kernel: bool, into: &Path, zone: usize) -> Result
     }
     if kernel {
         save("kernel.log", skyward_sys::kernel_log()?.as_bytes())?;
+    }
+    if browser {
+        let path = Path::new(skyward_sys::RUN).join("browser.log");
+        match fs::read(&path) {
+            Ok(log) => save("browser-basic.log", &log)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                save("browser-basic.log", b"No basic browser activity in this recovery session.\n")?
+            }
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        }
+    }
+    if full {
+        let path = Path::new("/data/media/0/Skyward/plugins/chromium/tmp/chromium.log");
+        match fs::read(path) {
+            Ok(log) => save("browser-full.log", &log)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                save("browser-full.log", b"No full-mode Chromium log is present.\n")?
+            }
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        }
     }
     Ok(folder)
 }
@@ -2338,6 +2358,10 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         app.browser_plugin_shot(shot);
                         read = true;
                     }
+                    browser::Event::Focus(focus) => {
+                        app.browser_plugin_focus(focus);
+                        read = true;
+                    }
                 }
             }
         }
@@ -2354,7 +2378,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         saved = true;
                     }
                     browser::Event::Opened(_) => unreachable!("saving a file reads no page"),
-                    browser::Event::Installed(_) | browser::Event::Shot(_) => unreachable!("saving a file runs no plugin"),
+                    browser::Event::Installed(_) | browser::Event::Shot(_) | browser::Event::Focus(_) => unreachable!("saving a file runs no plugin"),
                 }
             }
         }
@@ -2756,9 +2780,68 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     Effect::ReadMagisk => {
                         if !app.state.data.storage_open() {
                             app.set_magisk(skyward_ui::app::MagiskRoot::Locked, Ok(Vec::new()));
+                            app.set_magisk_version(None);
                         } else {
                             let (root, modules) = magisk::read();
                             app.set_magisk(root, modules.map_err(|e| format!("{e:#}")));
+                            app.set_magisk_version(magisk::version());
+                        }
+                    }
+                    Effect::CheckMagiskUpdate => {
+                        let agent = ureq::Agent::new_with_defaults();
+                        let asked = agent
+                            .get("https://api.github.com/repos/topjohnwu/Magisk/releases/latest")
+                            .header("User-Agent", "Skyward")
+                            .call();
+                        match asked.and_then(|mut r| r.body_mut().read_to_string().map_err(Into::into)) {
+                            Ok(body) => {
+                                let tag = body
+                                    .split("\"tag_name\":\"")
+                                    .nth(1)
+                                    .and_then(|rest| rest.split('"').next())
+                                    .map(|tag| tag.trim_start_matches('v').to_string());
+                                app.set_magisk_latest(tag.clone());
+                                app.report(
+                                    &match tag {
+                                        Some(tag) => format!("Magisk 最新版本：{tag}"),
+                                        None => "无法读取 Magisk 最新版本".into(),
+                                    },
+                                    now,
+                                );
+                            }
+                            Err(e) => app.report(&format!("检查 Magisk 更新失败：{e}"), now),
+                        }
+                    }
+                    Effect::DownloadMagisk => {
+                        let agent = ureq::Agent::new_with_defaults();
+                        let result = (|| -> std::result::Result<_, String> {
+                            let mut latest = agent
+                                .get("https://api.github.com/repos/topjohnwu/Magisk/releases/latest")
+                                .header("User-Agent", "Skyward")
+                                .call()
+                                .map_err(|e| format!("{e}"))?;
+                            let body = latest.body_mut().read_to_string().map_err(|e| format!("{e}"))?;
+                            let url = body
+                                .split("\"browser_download_url\":\"")
+                                .map(|rest| rest.split('"').next().unwrap_or(""))
+                                .find(|url| url.ends_with(".apk"))
+                                .ok_or_else(|| "latest release holds no APK".to_string())?;
+                            let mut package = agent.get(url).header("User-Agent", "Skyward").call().map_err(|e| format!("{e}"))?;
+                            let bytes = package.body_mut().read_to_vec().map_err(|e| format!("{e}"))?;
+                            std::fs::write("/tmp/magisk-update.zip", &bytes).map_err(|e| format!("write /tmp/magisk-update.zip: {e}"))?;
+                            Ok(bytes.len() as u64)
+                        })();
+                        match result {
+                            Ok(size) => {
+                                app.install_downloaded("/tmp/magisk-update.zip".into(), size, now);
+                                installer = Some(Installer::open(
+                                    PathBuf::from("/tmp/magisk-update.zip"),
+                                    detach(cfg.services.clone()),
+                                    install_options(&app),
+                                )?);
+                                app.report("Magisk 已下载，开始安装", now);
+                            }
+                            Err(e) => app.report(&format!("下载 Magisk 失败：{e}"), now),
                         }
                     }
                     Effect::ToggleMagisk { id, path, enabled } => {
@@ -3077,8 +3160,45 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         if let Some(worker) = reader.take() {
                             worker.stop();
                         }
-                        let task = browser::Task::Full { dir: PathBuf::from(dir), url, out: PathBuf::from(out) };
+                        let task = browser::Task::FullStart { dir: PathBuf::from(dir), url };
+                        let _ = out;
                         match browser::Worker::start(task, servers.clone()) {
+                            Ok(worker) => reader = Some(worker),
+                            Err(e) => app.browser_plugin_shot(Err(format!("{e:#}"))),
+                        }
+                    }
+                    Effect::BrowserPluginTap { x, y } => {
+                        if let Some(worker) = reader.take() {
+                            worker.stop();
+                        }
+                        match browser::Worker::start(browser::Task::FullTap { x, y }, servers.clone()) {
+                            Ok(worker) => reader = Some(worker),
+                            Err(e) => app.browser_plugin_shot(Err(format!("{e:#}"))),
+                        }
+                    }
+                    Effect::BrowserPluginPinch { scale } => {
+                        if let Some(worker) = reader.take() {
+                            worker.stop();
+                        }
+                        match browser::Worker::start(browser::Task::FullPinch { scale }, servers.clone()) {
+                            Ok(worker) => reader = Some(worker),
+                            Err(e) => app.browser_plugin_shot(Err(format!("{e:#}"))),
+                        }
+                    }
+                    Effect::BrowserPluginText(text) => {
+                        if let Some(worker) = reader.take() {
+                            worker.stop();
+                        }
+                        match browser::Worker::start(browser::Task::FullText { text }, servers.clone()) {
+                            Ok(worker) => reader = Some(worker),
+                            Err(e) => app.browser_plugin_shot(Err(format!("{e:#}"))),
+                        }
+                    }
+                    Effect::BrowserPluginReload => {
+                        if let Some(worker) = reader.take() {
+                            worker.stop();
+                        }
+                        match browser::Worker::start(browser::Task::FullReload, servers.clone()) {
                             Ok(worker) => reader = Some(worker),
                             Err(e) => app.browser_plugin_shot(Err(format!("{e:#}"))),
                         }
@@ -3087,18 +3207,20 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         if let Some(worker) = &reader {
                             worker.stop();
                         }
+                        let _ = browser::Worker::start(browser::Task::FullStop, servers.clone())
+                            .map(|w| w.stop());
                     }
                     Effect::BrowserPluginRemove { dir } => {
                         let _ = std::fs::remove_dir_all(dir);
                     }
                     // Logs that cannot be saved are the page's to report;
                     // the recovery carries on.
-                    Effect::ExportLogs { recovery, kernel, storage } => {
+                    Effect::ExportLogs { recovery, kernel, browser, full, storage } => {
                         let into = match storage {
                             true => Path::new(skyward_crypto::data::SDCARD).join(STORAGE_LOGS),
                             false => PathBuf::from(TMP_LOGS),
                         };
-                        match export_logs(recovery, kernel, &into, app.state.time_zone) {
+                        match export_logs(recovery, kernel, browser, full, &into, app.state.time_zone) {
                             Ok(folder) => app.report(&skyward_ui::fmt::exported(app.state.lang, &folder.display().to_string()), now),
                             Err(e) => app.report(&skyward_ui::fmt::export_failed(app.state.lang, &format!("{e:#}")), now),
                         }

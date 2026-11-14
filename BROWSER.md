@@ -31,15 +31,30 @@
 
 完整模式使用外置的 Linux Chromium，不进入 100 MiB recovery 镜像：
 
+完整模式现在是**常驻 Chromium 会话**（CDP），不是每次点击重新启动截图：
+- 点击、缩放、输入都在同一个页面完成；
+- 点输入框会自动弹出恢复键盘，文字通过 CDP 写入焦点元素；
+- 缩放按钮发送 Chromium 的真实 pinch gesture；
+- 顶部只有返回基本模式按钮和常驻地址栏，没有「浏览器」大标题。
+
 1. 把插件包下载到 `/sdcard/Skyward/plugins/chromium.zip`
    （或 `.tar.gz`，以及 `/sdcard/Download/Skyward/` 下的同名文件）。
 2. 浏览器 →「完整模式」→「安装或更新」。Skyward 用 `unzip` 或 `tar -xzf` 解到
    `/data/media/0/Skyward/plugins/chromium`。
-3. 先在内置浏览器打开一个地址，再点「启动完整模式」。启动时会显示进度条，
-   插件渲染完成后显示截图。
-4. 截图上的点按会以 6×12 的粗粒度网格转成点击，通过插件自带的
+3. 先在内置浏览器打开一个地址并连接 WLAN；完整模式现在会先检查网络，未连接时不会启动 Chromium。
+   - 启动前会把 recovery 的网关 DNS 写进插件，并用 `--disable-features=AsyncDns` 让 Chromium 走系统解析器，避免它自己连 8.8.8.8:53 被网络阻断；
+   - 基本模式的 Bing RSS 地址会自动去掉 `format=rss`，完整模式 Chromium 加载普通 HTML 页面，不会把 RSS/XML 当成空白页；
+   - 插件带有 CA 证书，HTTPS 页面不会因缺根证书而空白；
+   - 页面加载上限 30 秒；外层用独立 session 的 60 秒硬超时，超时会显示失败，不会无限卡住，也不会连带结束 recovery。
+4. 启动后不再停留在「完整模式」设置页，而是回到**普通浏览器界面**：
+   - 顶部不显示「浏览器」大标题，只有左侧返回基本模式按钮和常驻地址栏；
+   - 点页面在同一个完整模式界面里更新，不再重新打开一个页面；
+   - 底部完整模式栏：后退、前进、刷新、键盘、缩小、放大、退出；
+   - 点网页文本框后按「键盘」，用恢复键盘输入文字，再回车写入页面；
+   - 基本模式底栏新增完整模式按钮，主页按它直接以完整模式打开 Bing。
+5. 截图上的点按会以 6×12 的粗粒度网格转成点击，通过插件自带的
    `skyward-tap` 扩展注入 Chromium；这是实验性触控，复杂页面/滚动仍可能不准。
-5. 插件根目录的 `run.sh` 被这样调用：
+6. 插件根目录的 `run.sh` 被这样调用：
 
    ```sh
    chroot /data/media/0/Skyward/plugins/chromium /bin/sh /run.sh <url>
@@ -51,6 +66,13 @@
 
 当前完整模式是**一次性截图**，还没有把触摸/滚动/键盘通过 CDP 转发给 Chromium；
 下一步才是交互式 CDP 桥。安装前请自行校验插件包的 SHA-256，并只使用可信来源。
+
+## 日志
+
+- 基本模式写到 `/skyward/run/browser.log`：打开的地址、表单提交、下载和错误。
+- 完整模式写到插件的 `/data/media/0/Skyward/plugins/chromium/tmp/chromium.log`。
+- 「高级」→「日志」里新增两项「浏览器日志（基本模式）」「浏览器日志（完整模式）」，
+  勾选后导出为 `browser-basic.log` 和 `browser-full.log`。
 
 ## 构建
 

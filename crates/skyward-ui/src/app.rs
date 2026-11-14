@@ -185,6 +185,9 @@ pub enum BrowserView {
     Loading(String),
     Page(WebPage),
     File(FileOffer),
+    /// A page drawn by the external Chromium plugin, shown under the normal
+    /// browser bar and dock.
+    Full,
     /// The address asked for, and why nothing came back.
     Failed { url: String, why: String },
 }
@@ -242,6 +245,7 @@ impl BrowserTab {
             BrowserView::Loading(url) => url.clone(),
             BrowserView::Page(page) => page.title.clone(),
             BrowserView::File(file) => file.name.clone(),
+            BrowserView::Full => self.url.clone(),
             BrowserView::Failed { url, .. } => url.clone(),
         }
     }
@@ -281,6 +285,14 @@ pub struct Browser {
     pub full: BrowserFull,
     /// The last page the plugin rendered, as PNG.
     pub full_shot: Option<Vec<u8>>,
+    /// Whether the page shown is the plugin's, and new addresses go to it.
+    pub full_active: bool,
+    /// The plugin page's CSS zoom, changed by the full-mode zoom buttons.
+    pub full_zoom: f32,
+    /// The keyboard is typing into the plugin page's focused field.
+    pub full_text: bool,
+    /// The last place tapped on the plugin page, in per-mille.
+    pub full_touch: (u16, u16),
     /// The plugin's progress, from 0 to 1.
     pub full_progress: Option<f32>,
     /// The open pages, and which one shows.
@@ -332,6 +344,10 @@ impl Default for Browser {
             cookies: Vec::new(),
             full: BrowserFull::Unknown,
             full_shot: None,
+            full_active: false,
+            full_zoom: 1.0,
+            full_text: false,
+            full_touch: (500, 500),
             full_progress: None,
             tabs: vec![BrowserTab::home()],
             active: 0,
@@ -467,11 +483,15 @@ pub struct Magisk {
     pub root: MagiskRoot,
     /// The modules found, or why they could not be read.
     pub modules: Option<Result<Vec<MagiskModule>, String>>,
+    /// The installed Magisk version, when Magisk is the root solution.
+    pub version: Option<String>,
+    /// The newest Magisk release found, if it has been checked.
+    pub latest: Option<String>,
 }
 
 impl Default for Magisk {
     fn default() -> Self {
-        Magisk { root: MagiskRoot::Unknown, modules: None }
+        Magisk { root: MagiskRoot::Unknown, modules: None, version: None, latest: None }
     }
 }
 
@@ -1704,6 +1724,12 @@ pub enum Action {
     MagiskRepo,
     /// Install a module zip from Skyward's download folder.
     InstallMagiskModule,
+    /// Open the file manager to choose a module zip.
+    MagiskPickZip,
+    /// Ask GitHub for the newest Magisk release.
+    CheckMagiskUpdate,
+    /// Download the newest Magisk package and begin installing it.
+    MagiskDownload,
     /// Open the entry at this place in a place's folder: a folder to look
     /// in, or the file to install.
     ChooseEntry(usize),
@@ -1788,6 +1814,15 @@ pub enum Action {
     BrowserHome,
     /// Show the files the browser has saved.
     BrowserDownloads,
+    /// Change the full-mode page's zoom.
+    BrowserZoomOut,
+    BrowserZoomIn,
+    /// Leave the plugin page and read the same address with the basic reader.
+    BrowserBasic,
+    /// Type into the page's focused field with the recovery keyboard.
+    BrowserKeyboard,
+    /// Load the current address, or the full-mode home, in full mode.
+    BrowserFullLoad,
     /// Open, or install, the file the browser saved at this place.
     BrowserOpenDownload(usize),
     /// Empty the browser's address field.
@@ -2266,8 +2301,8 @@ pub struct State {
     pub restore: Option<(BackupEntry, [bool; 5])>,
     /// Backing up or restoring under way, or how it last ended.
     pub backup_job: Option<BackupJob>,
-    /// Which logs to export: the recovery's, the kernel's.
-    pub logs: [bool; 2],
+    /// Which logs to export: recovery, kernel, basic browser and full mode.
+    pub logs: [bool; 4],
     /// Where the logs go: 0 for the temporary folder, 1 for internal
     /// storage.
     pub logs_to: usize,
@@ -2332,6 +2367,8 @@ pub struct State {
     pub drive: Folder,
     /// Magisk, KernelSU or APatch and its modules.
     pub magisk: Magisk,
+    /// The file manager is choosing a module zip for the Magisk page.
+    pub magisk_pick: bool,
     /// The entry the file page describes.
     pub file: Option<FileRow>,
     pub fastboot: Fastboot,
@@ -2447,7 +2484,7 @@ impl Default for State {
             backups: Vec::new(),
             restore: None,
             backup_job: None,
-            logs: [true, true],
+            logs: [true, true, true, true],
             logs_to: 0,
             boot_slots: None,
             avb: None,
@@ -2472,6 +2509,7 @@ impl Default for State {
             usb_drive: None,
             drive: Folder::new(""),
             magisk: Magisk::default(),
+            magisk_pick: false,
             file: None,
             fastboot: Fastboot { running: false, link: UsbLink::Unplugged },
             erase: Erase::default(),
@@ -2695,6 +2733,10 @@ pub enum Effect {
     RemoveMagisk { id: String, path: String },
     /// Install the module zip at this path.
     InstallMagiskModule(String),
+    /// Ask GitHub for the newest Magisk release.
+    CheckMagiskUpdate,
+    /// Download the newest Magisk package.
+    DownloadMagisk,
     /// List the folder at this path from the top of a place, to choose a
     /// file to install in, telling what it holds with [`App::set_place`].
     ReadPlace(Place, String),
@@ -2769,10 +2811,10 @@ pub enum Effect {
     /// making the data partition afresh as another filesystem is a factory
     /// reset, which tells as erasing tells.
     Filesystem { name: String, action: FsAction },
-    /// Save the logs chosen, the recovery's own and the kernel's, into a
-    /// folder of their own in internal storage or the temporary folder,
-    /// saying where with [`App::report`].
-    ExportLogs { recovery: bool, kernel: bool, storage: bool },
+    /// Save the logs chosen, the recovery's own, the kernel's, the browser's
+    /// basic log and the full mode's, into a folder of their own in internal
+    /// storage or the temporary folder, saying where with [`App::report`].
+    ExportLogs { recovery: bool, kernel: bool, browser: bool, full: bool, storage: bool },
     /// Read the page at this address in the browser, sending the cookies
     /// kept for it.
     BrowserOpen { url: String, cookie: Option<String> },
@@ -2788,6 +2830,14 @@ pub enum Effect {
     BrowserPluginInstall { archive: String, dir: String },
     /// Start the full browser plugin, which writes the page to `out`.
     BrowserPluginStart { dir: String, url: String, out: String },
+    /// Tap the persistent full-mode page.
+    BrowserPluginTap { x: u16, y: u16 },
+    /// Pinch the persistent full-mode page.
+    BrowserPluginPinch { scale: f64 },
+    /// Type into the focused field of the persistent full-mode page.
+    BrowserPluginText(String),
+    /// Reload the persistent full-mode page.
+    BrowserPluginReload,
     /// Stop the full browser plugin.
     BrowserPluginStop,
     /// Take the full browser plugin away.
@@ -4887,10 +4937,31 @@ impl App {
     /// page.
     /// The root solution and modules the runtime read.
     pub fn set_magisk(&mut self, root: MagiskRoot, modules: Result<Vec<MagiskModule>, String>) {
-        self.state.magisk = Magisk { root, modules: Some(modules) };
+        let version = self.state.magisk.version.clone();
+        let latest = self.state.magisk.latest.clone();
+        self.state.magisk = Magisk { root, modules: Some(modules), version, latest };
         if self.screen() == Screen::Magisk {
             self.refresh();
         }
+    }
+
+    pub fn set_magisk_version(&mut self, version: Option<String>) {
+        self.state.magisk.version = version;
+        if self.screen() == Screen::Magisk {
+            self.refresh();
+        }
+    }
+
+    pub fn set_magisk_latest(&mut self, latest: Option<String>) {
+        self.state.magisk.latest = latest;
+        if self.screen() == Screen::Magisk {
+            self.refresh();
+        }
+    }
+
+    /// Begin installing a package the runtime downloaded for the Magisk page.
+    pub fn install_downloaded(&mut self, path: String, size: u64, now: u64) -> Vec<Effect> {
+        self.install_opened(path, size, now)
     }
 
     /// The root solution and its modules.
@@ -5864,6 +5935,17 @@ impl App {
     /// opens to join one.
     fn browser_go(&mut self, input: &str, now: u64) -> Vec<Effect> {
         let l = self.state.lang;
+        if self.state.browser.full_text {
+            let text = input.trim().to_string();
+            self.state.browser.full_text = false;
+            self.state.browser.address.clear();
+            if text.is_empty() {
+                return Vec::new();
+            }
+            self.state.browser.full_progress = Some(0.2);
+            self.refresh();
+            return vec![Effect::BrowserPluginText(text)];
+        }
         let url = skyward_net::web::address(input);
         if url.is_empty() {
             self.say(l.pick(["请输入网址或搜索词", "請輸入網址或搜尋詞", "Enter an address or search for something"]), now);
@@ -5879,26 +5961,50 @@ impl App {
 
     /// Put `url` in the browser's history and read it.
     fn browser_read(&mut self, url: String) -> Vec<Effect> {
-        let b = &mut self.state.browser;
-        if b.history.is_empty() {
-            b.history.push(url.clone());
-            b.at = 0;
-        } else {
-            b.history.truncate(b.at + 1);
-            if b.history.last() != Some(&url) {
+        let url = if self.state.browser.full_active { chromium_url(&url) } else { url };
+        let full = {
+            let b = &mut self.state.browser;
+            if b.history.is_empty() {
                 b.history.push(url.clone());
-                b.at = b.history.len() - 1;
+                b.at = 0;
+            } else {
+                b.history.truncate(b.at + 1);
+                if b.history.last() != Some(&url) {
+                    b.history.push(url.clone());
+                    b.at = b.history.len() - 1;
+                }
             }
-        }
-        b.url = url.clone();
-        b.address = url.clone();
-        b.view = BrowserView::Loading(url.clone());
-        b.form.clear();
-        b.field = None;
+            b.url = url.clone();
+            b.address = url.clone();
+            b.view = BrowserView::Loading(url.clone());
+            b.form.clear();
+            b.field = None;
+            if b.full_active {
+                let dir = match &b.full {
+                    BrowserFull::Ready(dir) => Some(dir.clone()),
+                    BrowserFull::Running(_) => Some("/data/media/0/Skyward/plugins/chromium".into()),
+                    _ => None,
+                };
+                if let Some(dir) = dir {
+                    b.full_shot = None;
+                    b.full_progress = Some(0.12);
+                    let out = format!("{dir}/tmp/skyward-chromium.png");
+                    Some((dir, url.clone(), out))
+                } else {
+                    b.full_active = false;
+                    None
+                }
+            } else {
+                None
+            }
+        };
         if self.screen() == Screen::Browser {
             self.top_mut().1 = 0.0;
         }
         self.refresh();
+        if let Some((dir, url, out)) = full {
+            return vec![Effect::BrowserPluginStart { dir, url, out }];
+        }
         let cookie = self.browser_cookie(&url);
         vec![Effect::BrowserOpen { url, cookie }]
     }
@@ -5906,22 +6012,45 @@ impl App {
     /// Read the page at `at` in the browser's history.
     fn browser_step(&mut self, at: usize, now: u64) -> Vec<Effect> {
         let l = self.state.lang;
-        let b = &mut self.state.browser;
-        if b.history.is_empty() || at >= b.history.len() {
+        if self.state.browser.history.is_empty() || at >= self.state.browser.history.len() {
             self.say(l.pick(["没有更多页面了", "沒有更多頁面了", "There's no page that way"]), now);
             return Vec::new();
         }
-        let url = b.history[at].clone();
-        b.at = at;
-        b.url = url.clone();
-        b.address = url.clone();
-        b.view = BrowserView::Loading(url.clone());
-        b.form.clear();
-        b.field = None;
+        let url = if self.state.browser.full_active { chromium_url(&self.state.browser.history[at]) } else { self.state.browser.history[at].clone() };
+        let full = {
+            let b = &mut self.state.browser;
+            b.at = at;
+            b.url = url.clone();
+            b.address = url.clone();
+            b.view = BrowserView::Loading(url.clone());
+            b.form.clear();
+            b.field = None;
+            if b.full_active {
+                let dir = match &b.full {
+                    BrowserFull::Ready(dir) => Some(dir.clone()),
+                    BrowserFull::Running(_) => Some("/data/media/0/Skyward/plugins/chromium".into()),
+                    _ => None,
+                };
+                if let Some(dir) = dir {
+                    b.full_shot = None;
+                    b.full_progress = Some(0.12);
+                    let out = format!("{dir}/tmp/skyward-chromium.png");
+                    Some((dir, url.clone(), out))
+                } else {
+                    b.full_active = false;
+                    None
+                }
+            } else {
+                None
+            }
+        };
         if self.screen() == Screen::Browser {
             self.top_mut().1 = 0.0;
         }
         self.refresh();
+        if let Some((dir, url, out)) = full {
+            return vec![Effect::BrowserPluginStart { dir, url, out }];
+        }
         let cookie = self.browser_cookie(&url);
         vec![Effect::BrowserOpen { url, cookie }]
     }
@@ -6168,8 +6297,16 @@ impl App {
     }
 
     fn browser_plugin_start(&mut self, now: u64) -> Vec<Effect> {
+        let l = self.state.lang;
+        if !self.state.online() {
+            self.say(l.pick(["需先连接 WLAN", "需先連接 Wi-Fi", "Connect to Wi-Fi first"]), now);
+            self.open(Screen::Wlan);
+            return self.arrive_at(Screen::Wlan);
+        }
         let url = if self.state.browser.url.is_empty() {
-            "https://example.com".to_string()
+            self.say(l.pick(["请先打开一个网页", "請先開啟一個網頁", "Open a page first"]), now);
+            self.open(Screen::BrowserAddress);
+            return self.arrive_at(Screen::BrowserAddress);
         } else {
             self.state.browser.url.clone()
         };
@@ -6180,21 +6317,42 @@ impl App {
         if self.state.browser.url.is_empty() || self.state.browser.full_shot.is_none() {
             return Vec::new();
         }
-        let base = self.state.browser.url.split('#').next().unwrap_or(&self.state.browser.url).to_string();
-        let url = format!("{base}#skywardtap={x},{y}");
-        self.browser_plugin_start_at(url, now)
+        self.state.browser.full_touch = (x, y);
+        self.state.browser.full_progress = Some(0.2);
+        self.refresh();
+        vec![Effect::BrowserPluginTap { x, y }]
     }
 
     fn browser_plugin_start_at(&mut self, url: String, now: u64) -> Vec<Effect> {
         let l = self.state.lang;
-        let BrowserFull::Ready(dir) = self.state.browser.full.clone() else {
-            self.say(l.pick(["插件尚未安装", "外掛尚未安裝", "The plugin isn't installed"]), now);
-            return Vec::new();
+        if !self.state.online() {
+            self.say(l.pick(["需先连接 WLAN", "需先連接 Wi-Fi", "Connect to Wi-Fi first"]), now);
+            self.open(Screen::Wlan);
+            return self.arrive_at(Screen::Wlan);
+        }
+        let url = chromium_url(&url);
+        let dir = match &self.state.browser.full {
+            BrowserFull::Ready(dir) => dir.clone(),
+            BrowserFull::Running(_) => "/data/media/0/Skyward/plugins/chromium".into(),
+            _ => {
+                self.say(l.pick(["插件尚未安装", "外掛尚未安裝", "The plugin isn't installed"]), now);
+                return Vec::new();
+            }
         };
         self.state.browser.full = BrowserFull::Running("127.0.0.1:9222".into());
-        self.state.browser.full_shot = None;
+        let keep = self.state.browser.full_active && self.state.browser.full_shot.is_some();
+        self.state.browser.full_active = true;
+        if !keep {
+            self.state.browser.full_shot = None;
+            self.state.browser.view = BrowserView::Loading(url.clone());
+        }
         self.state.browser.full_progress = Some(0.12);
+        self.state.browser.url = url.clone();
+        self.state.browser.address = url.clone();
         let out = format!("{dir}/tmp/skyward-chromium.png");
+        if self.screen() != Screen::Browser {
+            self.open(Screen::Browser);
+        }
         self.refresh();
         vec![Effect::BrowserPluginStart { dir, url, out }]
     }
@@ -6203,6 +6361,7 @@ impl App {
         if let BrowserFull::Running(_) = self.state.browser.full {
             self.state.browser.full = BrowserFull::Absent("已停止".into());
             self.state.browser.full_progress = None;
+            self.state.browser.full_active = false;
             self.refresh();
         }
         vec![Effect::BrowserPluginStop]
@@ -6229,17 +6388,41 @@ impl App {
     }
 
     /// The plugin drew a page, or why it did not.
-    pub fn browser_plugin_shot(&mut self, shot: Result<Vec<u8>, String>) {
-        match shot {
+    /// A text field on the full-mode page took focus: bring up the recovery
+    /// keyboard, so typing goes to the page rather than nowhere.
+    pub fn browser_plugin_focus(&mut self, focus: bool) {
+        if focus
+            && self.state.browser.full_active
+            && !self.state.browser.full_text
+            && self.screen() == Screen::Browser
+            && !matches!(self.state.browser.view, BrowserView::Home)
+        {
+            self.state.browser.full_text = true;
+            self.state.browser.address.clear();
+            self.state.layer = Layer::Letters;
+            self.open(Screen::BrowserAddress);
+        }
+    }
+
+    pub fn browser_plugin_shot(&mut self, shot: Result<Vec<u8>, String>) {        match shot {
             Ok(png) => {
                 self.state.browser.full_shot = Some(png);
                 self.state.browser.full_progress = Some(1.0);
+                if self.state.browser.full_active {
+                    self.state.browser.view = BrowserView::Full;
+                    if self.screen() == Screen::BrowserAddress {
+                        self.open(Screen::Browser);
+                    }
+                }
                 if let BrowserFull::Running(at) = &self.state.browser.full {
                     self.state.browser.full = BrowserFull::Running(at.clone());
                 }
             }
             Err(why) => {
                 self.state.browser.full_progress = None;
+                self.state.browser.full_active = false;
+                let url = self.state.browser.url.clone();
+                self.state.browser.view = BrowserView::Failed { url, why: why.clone() };
                 self.state.browser.full = BrowserFull::Failed(why);
             }
         }
@@ -6769,10 +6952,50 @@ impl App {
                 }
                 self.say(l.pick(["已到最新的一页", "已到最新的一頁", "This is the last page"]), now);
             }
+            Action::BrowserZoomIn | Action::BrowserZoomOut => {
+                if self.state.browser.full_active {
+                    let up = matches!(action, Action::BrowserZoomIn);
+                    let zoom = (self.state.browser.full_zoom * if up { 1.25 } else { 0.8 }).clamp(0.5, 3.0);
+                    self.state.browser.full_zoom = zoom;
+                    self.state.browser.full_progress = Some(0.2);
+                    self.refresh();
+                    return vec![Effect::BrowserPluginPinch { scale: if up { 1.25 } else { 0.8 } }];
+                }
+            }
+            Action::BrowserBasic => {
+                self.state.browser.full_active = false;
+                self.state.browser.full_text = false;
+                let url = self.state.browser.url.clone();
+                if !url.is_empty() {
+                    return self.browser_read(url);
+                }
+                self.state.browser.view = BrowserView::Home;
+                self.refresh();
+            }
+            Action::BrowserKeyboard => {
+                if self.state.browser.full_active {
+                    self.state.browser.full_text = true;
+                    self.state.browser.address.clear();
+                    self.state.layer = Layer::Letters;
+                    self.open(Screen::BrowserAddress);
+                }
+            }
+            Action::BrowserFullLoad => {
+                let url = if self.state.browser.url.is_empty() { "https://www.bing.com/".to_string() } else { self.state.browser.url.clone() };
+                if matches!(self.state.browser.full, BrowserFull::Ready(_) | BrowserFull::Running(_)) {
+                    return self.browser_plugin_start_at(url, now);
+                }
+                self.open(Screen::BrowserFull);
+            }
             Action::BrowserReload => {
                 if matches!(self.state.browser.view, BrowserView::Home) {
                     self.refresh();
                     return Vec::new();
+                }
+                if self.state.browser.full_active {
+                    self.state.browser.full_progress = Some(0.2);
+                    self.refresh();
+                    return vec![Effect::BrowserPluginReload];
                 }
                 let url = self.state.browser.url.clone();
                 if url.is_empty() {
@@ -6786,6 +7009,7 @@ impl App {
                 }
             }
             Action::BrowserHome => {
+                self.state.browser.full_active = false;
                 self.state.browser.view = BrowserView::Home;
                 self.state.browser.address.clear();
                 self.refresh();
@@ -7153,13 +7377,14 @@ impl App {
                 self.refresh();
             }
             Action::ExportLogs => {
-                let ([recovery, kernel], storage) = (self.state.logs, self.state.logs_to == 1);
-                if !recovery && !kernel {
+                let [recovery, kernel, browser, full] = self.state.logs;
+                let storage = self.state.logs_to == 1;
+                if !recovery && !kernel && !browser && !full {
                     self.say(l.pick(["请选择要导出的日志", "請選擇要匯出的記錄", "Choose the logs to export"]), now);
                 } else if storage && !self.state.data.storage_open() {
                     self.say(l.pick(DECRYPT_FIRST), now);
                 } else {
-                    return vec![Effect::ExportLogs { recovery, kernel, storage }];
+                    return vec![Effect::ExportLogs { recovery, kernel, browser, full, storage }];
                 }
             }
             Action::PickSlot(slot) => {
@@ -7268,7 +7493,27 @@ impl App {
             }
             Action::MagiskRepo => {
                 if self.screen() == Screen::Magisk {
+                    self.open(Screen::Browser);
                     return self.browser_go("https://github.com/topics/magisk-module", now);
+                }
+            }
+            Action::MagiskPickZip => {
+                if !self.state.data.storage_open() {
+                    self.say(l.pick(["请先解密 data 分区", "請先解密 data 分割區", "Decrypt the data partition first"]), now);
+                } else {
+                    self.state.magisk_pick = true;
+                    self.open(Screen::Choose(Place::Storage));
+                    return vec![Effect::ReadPlace(Place::Storage, "/sdcard".into())];
+                }
+            }
+            Action::CheckMagiskUpdate => {
+                if matches!(self.state.magisk.root, MagiskRoot::Present(ref name) if name == "Magisk") {
+                    return vec![Effect::CheckMagiskUpdate];
+                }
+            }
+            Action::MagiskDownload => {
+                if self.state.magisk.latest.is_some() {
+                    return vec![Effect::DownloadMagisk];
                 }
             }
             Action::InstallMagiskModule => {
@@ -7295,6 +7540,10 @@ impl App {
                 let folder = self.state.folder(screen);
                 let entry = folder.entry(i).clone();
                 let path = folder.inside(&entry.name);
+                if self.state.magisk_pick && entry.name.to_lowercase().ends_with(".zip") {
+                    self.state.magisk_pick = false;
+                    return vec![Effect::InstallMagiskModule(path)];
+                }
                 match entry.kind {
                     FileKind::Folder { .. } | FileKind::Link { folder: true, .. } => {
                         let scroll = self.top().1;
@@ -9064,11 +9313,48 @@ impl App {
     }
 }
 
+fn escape_text(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// The address the plugin should load. The basic reader asks Bing for RSS;
+/// Chromium should get the same search without `format=rss`, or it renders
+/// an XML feed instead of the page.
+fn chromium_url(url: &str) -> String {
+    let mut url = url
+        .replace("?format=rss&", "?")
+        .replace("&format=rss&", "&")
+        .replace("?format=rss", "?")
+        .replace("&format=rss", "");
+    if url.ends_with('?') {
+        url.pop();
+    }
+    url
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::color::over;
     use crate::fmt;
+
+    #[test]
+    fn the_plugin_gets_a_page_not_bings_rss_feed() {
+        assert_eq!(
+            chromium_url("https://cn.bing.com/search?format=rss&setlang=zh-Hans&q=test"),
+            "https://cn.bing.com/search?setlang=zh-Hans&q=test"
+        );
+        assert_eq!(chromium_url("https://cn.bing.com/search?q=test&format=rss"), "https://cn.bing.com/search?q=test");
+        assert_eq!(chromium_url("https://example.com/?format=rss"), "https://example.com/");
+    }
     use skyward_info::{Boot, Charge, Cpu, Storage};
     use skyward_install::{Failure, Refusal};
     use skyward_net::reach::Reach;
@@ -11443,16 +11729,21 @@ mod tests {
     fn logs_are_exported_as_ticked_where_they_can_go() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Logs, W, H, PPD);
-        let both = Effect::ExportLogs { recovery: true, kernel: true, storage: false };
-        assert_eq!(tap(&mut app, &f, &i, Action::ExportLogs), vec![both], "both, to the temporary folder, at first");
+        let all = Effect::ExportLogs { recovery: true, kernel: true, browser: true, full: true, storage: false };
+        assert_eq!(tap(&mut app, &f, &i, Action::ExportLogs), vec![all], "all four, to the temporary folder, at first");
         tap(&mut app, &f, &i, Action::LogPart(0));
         tap(&mut app, &f, &i, Action::LogsTo(1));
         assert!(tap(&mut app, &f, &i, Action::ExportLogs).is_empty(), "internal storage waits for the data partition");
         app.tick(1000);
         assert_eq!(app.deadline(1000), Some(TOAST_MS), "and says so");
         app.data_waiting(None);
-        assert_eq!(tap(&mut app, &f, &i, Action::ExportLogs), vec![Effect::ExportLogs { recovery: false, kernel: true, storage: true }]);
+        assert_eq!(
+            tap(&mut app, &f, &i, Action::ExportLogs),
+            vec![Effect::ExportLogs { recovery: false, kernel: true, browser: true, full: true, storage: true }]
+        );
         tap(&mut app, &f, &i, Action::LogPart(1));
+        tap(&mut app, &f, &i, Action::LogPart(2));
+        tap(&mut app, &f, &i, Action::LogPart(3));
         assert!(tap(&mut app, &f, &i, Action::ExportLogs).is_empty(), "nothing ticked, nothing saved");
     }
 

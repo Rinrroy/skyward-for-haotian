@@ -83,6 +83,33 @@ pub fn screen(cx: &Ctx) -> Frame {
             list.bottom
         }
     };
+    if matches!(&s.magisk.root, MagiskRoot::Present(name) if name == "Magisk") {
+        let version = s.magisk.version.clone().unwrap_or_else(|| "未知版本".into());
+        let latest = s.magisk.latest.clone();
+        let sub = match latest {
+            Some(latest) if latest != version => format!("已安装 {version} · 最新 {latest}"),
+            Some(_) => format!("已安装 {version} · 已是最新"),
+            None => format!("已安装 {version} · 检查 GitHub Releases"),
+        };
+        let row = Row::new(l.pick(["Magisk 版本", "Magisk 版本", "Magisk version"]))
+            .subtitle(&sub)
+            .icon(crate::color::Rgba::rgb(0x34, 0x82, 0xff), Icon::Shield)
+            .trail(Trail::None);
+        let list = widgets::list(&mut c, t, f, y, &[row]);
+        y = list.bottom;
+        out.extend(hits(&list.rows, &[Action::CheckMagiskUpdate]));
+        if let Some(latest) = &s.magisk.latest {
+            if Some(latest) != s.magisk.version.as_ref() {
+                let row = Row::new(l.pick(["下载并安装更新", "下載並安裝更新", "Download and install"]))
+                    .subtitle(latest)
+                    .icon(crate::color::Rgba::rgb(0x1d, 0xcd, 0x3a), Icon::Install)
+                    .trail(Trail::None);
+                let list = widgets::list(&mut c, t, f, y, &[row]);
+                y = list.bottom;
+                out.extend(hits(&list.rows, &[Action::MagiskDownload]));
+            }
+        }
+    }
     y = widgets::section(&mut c, t, f, y, l.pick(["模块", "模組", "Modules"]));
     match &s.magisk.modules {
         None => {
@@ -124,7 +151,7 @@ pub fn screen(cx: &Ctx) -> Frame {
             .trail(Trail::None),
     ];
     let list = widgets::list(&mut c, t, f, y, &rows);
-    out.extend(hits(&list.rows, &[Action::MagiskRepo, Action::InstallMagiskModule]));
+    out.extend(hits(&list.rows, &[Action::MagiskRepo, Action::MagiskPickZip]));
     y = widgets::footnote(
         &mut c,
         t,

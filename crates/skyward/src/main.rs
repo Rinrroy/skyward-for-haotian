@@ -11,6 +11,8 @@ mod backup;
 #[cfg(target_os = "android")]
 mod browser;
 #[cfg(target_os = "android")]
+mod cdp;
+#[cfg(target_os = "android")]
 mod magisk;
 #[cfg(target_os = "android")]
 mod decrypt;

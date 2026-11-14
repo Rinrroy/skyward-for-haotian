@@ -83,6 +83,19 @@ fn module_at(path: &Path) -> Option<MagiskModule> {
     })
 }
 
+pub fn version() -> Option<String> {
+    let binary = Path::new("/data/adb/magisk/magisk");
+    if !binary.exists() {
+        return None;
+    }
+    let output = Command::new(binary).arg("-v").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
 pub fn toggle(path: &str, enabled: bool) -> Result<()> {
     let path = Path::new(path);
     let disable = path.join("disable");

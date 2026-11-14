@@ -24,6 +24,10 @@
 
 - 点模块行切换 `disable` 文件，停用/启用。
 - 点「移除」写入 `remove` 标记，由 Magisk 在重启后删除。
+- 「模块仓库」会直接打开基本浏览器并加载 GitHub 主题；返回键回到 Magisk 管理器。
+- 使用官方 Magisk 时显示已安装版本，可点「检查 GitHub Releases」查看最新版本；
+  有新版本时显示「下载并安装更新」，从官方 Releases 下载 APK 并交给安装器。
+- 「从本地 zip 安装」会打开文件管理器选择 zip，不再要求固定放到某个地址。
 - 需要先解密 data；未解密时页面会直接显示「需先解密 data 分区」，而不是「未安装」。
 - 没有安装 root 方案时，页面提供 Magisk、KernelSU、APatch 官方 Releases 链接，
   可在内置浏览器下载安装包；安装包下载后可在「安装」中选择（Magisk APK 通常

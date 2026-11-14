@@ -4194,8 +4194,14 @@ pub fn logs(cx: &Ctx) -> Frame {
         Row::new(l.pick(["内核日志", "核心記錄", "Kernel log"]))
             .subtitle(l.pick(["本次开机以来的内核消息", "本次開機以來的核心訊息", "The kernel's messages since this start"]))
             .trail(Trail::Check(s.logs[1])),
+        Row::new(l.pick(["浏览器日志（基本模式）", "瀏覽器記錄（基本模式）", "Browser log (basic)"]))
+            .subtitle(l.pick(["打开网页、表单和下载的记录", "開啟網頁、表單和下載的記錄", "Pages opened, forms sent and downloads"]))
+            .trail(Trail::Check(s.logs[2])),
+        Row::new(l.pick(["浏览器日志（完整模式）", "瀏覽器記錄（完整模式）", "Browser log (full mode)"]))
+            .subtitle(l.pick(["外置 Chromium 插件的输出", "外置 Chromium 外掛的輸出", "The external Chromium plugin's output"]))
+            .trail(Trail::Check(s.logs[3])),
     ]);
-    out.extend(hits(&parts.rows, &[Action::LogPart(0), Action::LogPart(1)]));
+    out.extend(hits(&parts.rows, &[Action::LogPart(0), Action::LogPart(1), Action::LogPart(2), Action::LogPart(3)]));
     let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(["保存到", "儲存到", "Save to"]));
     let storage = l.pick(match cx.state.data.storage_open() {
         true => ["Skyward/logs 文件夹", "Skyward/logs 資料夾", "The Skyward/logs folder"],

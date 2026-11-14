@@ -65,6 +65,7 @@ pub fn screen(cx: &Ctx) -> Frame {
     match &cx.state.browser.view {
         BrowserView::Home => home(cx),
         BrowserView::Loading(url) => loading(cx, url),
+        BrowserView::Full => full_page(cx),
         BrowserView::Failed { url, why } => failed(cx, url, why),
         BrowserView::Page(article) => read(cx, article),
         BrowserView::File(file) => {
@@ -253,8 +254,73 @@ fn home(cx: &Ctx) -> Frame {
     frame
 }
 
-fn loading(cx: &Ctx, url: &str) -> Frame {
-    let (t, f, l) = (cx.t, cx.f, cx.state.lang);
+/// A page the external Chromium drew, under the normal address bar and
+/// dock: the plugin is the webview, the recovery still owns the controls.
+fn full_page(cx: &Ctx) -> Frame {
+    let (t, l) = (cx.t, cx.state.lang);
+    let m = &t.m;
+    let mut c = long_page(cx);
+    let top = widgets::bar_bottom(t) + m.dp(8.0);
+    let mut out = Vec::new();
+    let back = Rect::new(m.margin, top, m.dp(44.0), m.dp(44.0));
+    c.fill_round_rect(back.x, back.y, back.w, back.h, back.h / 2.0, t.pal.search);
+    let (cx0, cy0) = back.centre();
+    c.line(cx0 + m.dp(5.0), cy0 - m.dp(8.0), cx0 - m.dp(4.0), cy0, m.dp(2.6), t.pal.text);
+    c.line(cx0 - m.dp(4.0), cy0, cx0 + m.dp(5.0), cy0 + m.dp(8.0), m.dp(2.6), t.pal.text);
+    out.push(Hit { rect: back, action: Action::BrowserBasic });
+    let bar = Rect::new(back.x + back.w + m.dp(10.0), top, m.w as f32 - back.x - back.w - m.margin - m.dp(10.0), m.dp(44.0));
+    widgets::search_capsule(&mut c, t, cx.f, bar, &cx.state.browser.url);
+    out.push(Hit { rect: bar, action: Action::BrowserAddress });
+    let mut y = top + back.h + m.dp(8.0);
+    let max_w = (m.w as f32 - m.margin * 2.0).max(m.dp(80.0)) as u32;
+    if let Some(shot) = &cx.state.browser.full_shot {
+        if let Some((w, h, rgba)) = decode_picture(shot, max_w) {
+            let x = (m.w as f32 - w as f32) / 2.0;
+            let picture = Canvas::from_rgba(w, h, rgba);
+            c.lay(&picture, x.round() as i32, y.round() as i32, 1.0);
+            let (cols, rows) = (12, 24);
+            for gy in 0..rows {
+                for gx in 0..cols {
+                    let rect = Rect::new(
+                        x + gx as f32 * w as f32 / cols as f32,
+                        y + gy as f32 * h as f32 / rows as f32,
+                        w as f32 / cols as f32,
+                        h as f32 / rows as f32,
+                    );
+                    let px = ((gx * 1000 + 500) / cols as i32) as u16;
+                    let py = ((gy * 1000 + 500) / rows as i32) as u16;
+                    out.push(Hit { rect, action: Action::BrowserPluginTap(px, py) });
+                }
+            }
+            if let Some(progress) = cx.state.browser.full_progress.filter(|p| *p < 1.0) {
+                let progress = progress.clamp(0.0, 1.0);
+                c.fill_round_rect(m.margin, y - m.dp(4.0), (m.w as f32 - m.margin * 2.0) * progress, m.dp(3.0), m.dp(1.5), t.pal.accent);
+            }
+            y += h as f32;
+        } else {
+            y = widgets::footnote(&mut c, t, cx.f, y, l.pick(["完整模式返回的图片无法解码", "完整模式回傳的圖片無法解碼", "Full mode returned a picture that can't be decoded"]));
+        }
+    } else {
+        let progress = cx.state.browser.full_progress.unwrap_or(0.0);
+        y = widgets::progress_card(
+            &mut c,
+            t,
+            cx.f,
+            y,
+            l.pick(["正在渲染页面", "正在繪製頁面", "Drawing the page"]),
+            &cx.state.browser.url,
+            Some(progress),
+        );
+        out.push(Hit { rect: Rect::new(m.margin, top, m.w as f32 - m.margin * 2.0, m.dp(56.0)), action: Action::BrowserAddress });
+    }
+    let mut frame = Frame::new(t, fit(c, t, y), out, l.pick(BROWSER), top);
+    frame.header = false;
+    frame.back = false;
+    frame.dock = Some(full_dock(cx));
+    frame
+}
+
+fn loading(cx: &Ctx, url: &str) -> Frame {    let (t, f, l) = (cx.t, cx.f, cx.state.lang);
     let m = &t.m;
     let mut c = page(cx);
     let mut out = Vec::new();
@@ -308,19 +374,19 @@ fn saving_line(l: Lang, name: &str, done: u64, total: Option<u64>) -> (&'static 
 }
 
 fn dock(cx: &Ctx) -> Dock {
+    dock_with(cx, &[Action::BrowserBack, Action::BrowserForward, Action::BrowserReload, Action::BrowserHome, Action::BrowserTabs, Action::BrowserDownloads, Action::BrowserFullLoad])
+}
+
+fn full_dock(cx: &Ctx) -> Dock {
+    dock_with(cx, &[Action::BrowserBack, Action::BrowserForward, Action::BrowserReload, Action::BrowserKeyboard, Action::BrowserZoomOut, Action::BrowserZoomIn, Action::BrowserHome])
+}
+
+fn dock_with(cx: &Ctx, actions: &[Action]) -> Dock {
     let (t, l) = (cx.t, cx.state.lang);
     let m = &t.m;
     let (h, pad, gap) = (m.dp(48.0), m.dp(12.0), m.dp(8.0));
     let mut c = Canvas::new(m.w, (pad + h + m.dp(26.0)).ceil() as u32);
     c.clear(t.pal.bg);
-    let actions = [
-        Action::BrowserBack,
-        Action::BrowserForward,
-        Action::BrowserReload,
-        Action::BrowserHome,
-        Action::BrowserTabs,
-        Action::BrowserDownloads,
-    ];
     let n = actions.len() as f32;
     let w = (m.w as f32 - m.margin * 2.0 - gap * (n - 1.0)) / n;
     let mut rects = Vec::new();
@@ -351,6 +417,26 @@ fn dock(cx: &Ctx) -> Dock {
                 c.stroke_round_rect(cx0 - m.dp(8.0), cy0 - m.dp(6.0), m.dp(12.0), m.dp(12.0), m.dp(2.0), m.dp(2.0), ink);
                 c.stroke_round_rect(cx0 - m.dp(1.0), cy0 - m.dp(9.0), m.dp(10.0), m.dp(10.0), m.dp(2.0), m.dp(2.0), ink);
             }
+            Action::BrowserKeyboard => {
+                c.stroke_round_rect(cx0 - m.dp(9.0), cy0 - m.dp(6.0), m.dp(18.0), m.dp(12.0), m.dp(2.0), m.dp(1.8), ink);
+                for k in 0..3 {
+                    let x = cx0 - m.dp(5.0) + k as f32 * m.dp(5.0);
+                    c.line(x, cy0 - m.dp(2.0), x, cy0 + m.dp(1.0), m.dp(1.3), ink);
+                }
+                c.line(cx0 - m.dp(5.0), cy0 + m.dp(4.0), cx0 + m.dp(5.0), cy0 + m.dp(4.0), m.dp(1.5), ink);
+            }
+            Action::BrowserZoomIn | Action::BrowserZoomOut => {
+                c.stroke_round_rect(cx0 - m.dp(9.0), cy0 - m.dp(9.0), m.dp(18.0), m.dp(18.0), m.dp(9.0), m.dp(2.0), ink);
+                c.line(cx0 - m.dp(5.0), cy0, cx0 + m.dp(5.0), cy0, m.dp(2.0), ink);
+                if action == &Action::BrowserZoomIn {
+                    c.line(cx0, cy0 - m.dp(5.0), cx0, cy0 + m.dp(5.0), m.dp(2.0), ink);
+                }
+            }
+            Action::BrowserFullLoad => {
+                c.stroke_round_rect(cx0 - m.dp(8.0), cy0 - m.dp(8.0), m.dp(16.0), m.dp(16.0), m.dp(8.0), m.dp(1.8), ink);
+                c.line(cx0 - m.dp(8.0), cy0, cx0 + m.dp(8.0), cy0, m.dp(1.5), ink);
+                c.stroke_arc(cx0, cy0, m.dp(5.0), 0.0, 6.28, m.dp(1.4), ink);
+            }
             _ => {
                 c.line(cx0, cy0 - m.dp(9.0), cx0, cy0 + m.dp(3.0), m.dp(2.4), ink);
                 c.line(cx0 - m.dp(4.0), cy0 - m.dp(1.0), cx0, cy0 + m.dp(3.0), m.dp(2.4), ink);
@@ -361,7 +447,7 @@ fn dock(cx: &Ctx) -> Dock {
         rects.push(Rect::new(x, pad, w, h));
     }
     let _ = l;
-    Dock { canvas: c, hits: hits(&rects, &actions) }
+    Dock { canvas: c, hits: hits(&rects, actions) }
 }
 
 /// A page read as text and links: its title and address in a card, then a
