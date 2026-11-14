@@ -13,10 +13,11 @@ use std::time::{Duration, Instant};
 const PORT: u16 = 9222;
 const VIEW_W: u32 = 412;
 const VIEW_H: u32 = 915;
-/// Render at a sharp phone density; the UI maps this to its own width.
-const DEVICE_SCALE: f64 = 3.5;
+/// Render at a phone density; a whole-page frame is kept small enough to
+/// decode comfortably in recovery memory.
+const DEVICE_SCALE: f64 = 2.0;
 /// A full-page capture is capped so one frame cannot exhaust recovery memory.
-const MAX_PAGE_CSS: f64 = 3000.0;
+const MAX_PAGE_CSS: f64 = 2500.0;
 
 pub struct Cdp {
     stream: TcpStream,
@@ -230,44 +231,51 @@ fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<()> {
 }
 
 fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>> {
-    let mut two = [0u8; 2];
-    stream.read_exact(&mut two)?;
-    let opcode = two[0] & 0x0f;
-    let masked = two[1] & 0x80 != 0;
-    let mut len = (two[1] & 0x7f) as u64;
-    if len == 126 {
-        let mut bytes = [0u8; 2];
-        stream.read_exact(&mut bytes)?;
-        len = u16::from_be_bytes(bytes) as u64;
-    } else if len == 127 {
-        let mut bytes = [0u8; 8];
-        stream.read_exact(&mut bytes)?;
-        len = u64::from_be_bytes(bytes);
-    }
-    if len > 48 * 1024 * 1024 {
-        bail!("Chromium sent an oversized frame");
-    }
-    let mask = if masked {
-        let mut mask = [0u8; 4];
-        stream.read_exact(&mut mask)?;
-        Some(mask)
-    } else {
-        None
-    };
-    let mut payload = vec![0u8; len as usize];
-    stream.read_exact(&mut payload)?;
-    if let Some(mask) = mask {
-        for (i, byte) in payload.iter_mut().enumerate() {
-            *byte ^= mask[i % 4];
+    let mut whole = Vec::new();
+    loop {
+        let mut two = [0u8; 2];
+        stream.read_exact(&mut two)?;
+        let fin = two[0] & 0x80 != 0;
+        let opcode = two[0] & 0x0f;
+        let masked = two[1] & 0x80 != 0;
+        let mut len = (two[1] & 0x7f) as u64;
+        if len == 126 {
+            let mut bytes = [0u8; 2];
+            stream.read_exact(&mut bytes)?;
+            len = u16::from_be_bytes(bytes) as u64;
+        } else if len == 127 {
+            let mut bytes = [0u8; 8];
+            stream.read_exact(&mut bytes)?;
+            len = u64::from_be_bytes(bytes);
+        }
+        if len > 48 * 1024 * 1024 {
+            bail!("Chromium sent an oversized frame");
+        }
+        let mask = if masked {
+            let mut mask = [0u8; 4];
+            stream.read_exact(&mut mask)?;
+            Some(mask)
+        } else {
+            None
+        };
+        let mut payload = vec![0u8; len as usize];
+        stream.read_exact(&mut payload)?;
+        if let Some(mask) = mask {
+            for (i, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[i % 4];
+            }
+        }
+        if opcode == 0x8 {
+            return Err(anyhow!("Chromium closed the debugging socket"));
+        }
+        if opcode == 0x9 || opcode == 0xA {
+            continue;
+        }
+        whole.extend_from_slice(&payload);
+        if fin {
+            return Ok(whole);
         }
     }
-    if opcode == 0x8 {
-        return Err(anyhow!("Chromium closed the debugging socket"));
-    }
-    if opcode == 0x9 {
-        return read_frame(stream);
-    }
-    Ok(payload)
 }
 
 pub const WIDTH: u32 = VIEW_W;
