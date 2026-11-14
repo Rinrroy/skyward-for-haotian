@@ -114,6 +114,11 @@ pub struct Wlan {
     /// what tells a platform driver it may start the chip.
     #[serde(default)]
     pub writes: Vec<Write>,
+    /// What is written when the WLAN is put away, each value to its file:
+    /// the switch above set back, so that the driver stops the chip rather
+    /// than leaving it running for whatever the phone boots next.
+    #[serde(default)]
+    pub release: Vec<Write>,
     /// Files the driver asks the kernel's firmware loader for that are not
     /// where the loader looks in a recovery.
     #[serde(default)]
@@ -1164,6 +1169,11 @@ mod tests {
         assert_eq!(
             wlan.writes,
             [Write { path: "/sys/bus/platform/devices/b0000000.qcom,cnss-peach/fs_ready".into(), value: "1".into() }]
+        );
+        assert_eq!(
+            wlan.release,
+            [Write { path: "/sys/bus/platform/devices/b0000000.qcom,cnss-peach/fs_ready".into(), value: "0".into() }],
+            "the switch is set back when the WLAN is put away"
         );
         assert_eq!(wlan.firmware[0].path, "/vendor/etc/wifi/peach/WCNSS_qcom_cfg.ini");
         assert_eq!(wlan.firmware[1].partition.as_deref(), Some("persist"));

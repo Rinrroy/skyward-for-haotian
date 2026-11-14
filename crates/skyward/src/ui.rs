@@ -217,6 +217,23 @@ fn power(target: Target) -> Result<()> {
     })
 }
 
+/// Put the radio away before the recovery stops.
+///
+/// The WLAN's thread is told to end, and it ends by setting the switch the
+/// start set back, letting the chip go of its firmware, and taking the driver
+/// out of the kernel. A chip left running is one the system's own driver finds
+/// already up as it boots and will not start cold: no interface appears, the
+/// WLAN stays dead until the phone loses its power, and only flashing the phone
+/// again brings it back.
+///
+/// Init is asked to stop the services on the way out, but nothing in that queue
+/// cuts the chip's power: it keeps its firmware across the restart.
+fn put_radio_away(wlan: &mut Option<wlan::Worker>) {
+    if let Some(worker) = wlan.take() {
+        worker.stop();
+    }
+}
+
 /// File transfer: the service offering internal storage to a computer over
 /// USB, whether it offers the storage now, and the zone, by its place in
 /// the settings, it tells the times of files in.
@@ -1542,7 +1559,7 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
     // what shows the pages, so a phone whose WLAN cannot be brought up still
     // works, and why it could not goes to the kernel log — as a radio that
     // fails once tried says why on its own page.
-    let wlan = match &cfg.wlan {
+    let mut wlan = match &cfg.wlan {
         Some(w) => {
             let started = (|| -> Result<wlan::Worker> {
                 let modules = cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
@@ -2001,6 +2018,7 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                         if again {
                             bcb::write(&misc, &bcb::Bcb { command: "boot-rescue".into(), args: Vec::new() })?;
                         }
+                        put_radio_away(&mut wlan);
                         power(target)?;
                     }
                 }
@@ -2218,6 +2236,7 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                         }
                         switch_asked = false;
                         switched = true;
+                        put_radio_away(&mut wlan);
                         power(Target::System)?;
                     }
                     systems::Event::Failed(why) => {
@@ -2529,6 +2548,10 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                             bcb::clear(&misc)?;
                             kept = false;
                         }
+                        // The radio goes away before the phone does: a chip
+                        // left running is one the system's own driver finds
+                        // already up as it boots and will not start cold.
+                        put_radio_away(&mut wlan);
                         power(target)?
                     }
                     Effect::Dismiss => {
