@@ -1,0 +1,302 @@
+[device]
+codename = "haotian"
+brand = "Xiaomi"
+model = "Xiaomi 15 Pro"
+ab = true
+soc = { hans = "骁龙®8至尊版移动平台", hant = "Snapdragon® 8 Elite 行動平台", en = "Snapdragon® 8 Elite Mobile Platform" }
+os_version_prop = "ro.mi.os.version.incremental"
+
+[display]
+# The panel's own mode, persist.sys.miui_default_resolution in the odm
+# partition's build.prop and the o2 panel's mode in the device tree:
+# 1440 by 3200. persist.sys.miui_resolution gives the lower mode the system
+# starts in, 1080 by 2400 at 450; the density is that one's, at the panel's
+# own width, as the 13 Ultra's is.
+width = 1440
+height = 3200
+density = 600
+diagonal = 6.73
+# The radius a page's corners are rounded to as it slides in. Measured
+# against the glass: 168 and 384 were both too round, 96 too square, and 140
+# is what the stock settings round theirs to on this phone.
+corner_radius = 140
+
+# The panel's own doze, as the system's always-on display uses it.
+#
+# The way in is command set 44 (mi,mdss-dsi-doze-hbm-command) rather than 45
+# (mi,mdss-dsi-doze-lbm-command): the panel's device tree drives the low one
+# at DBV 35 and the high one at DBV 412, and at 35 the face on the glass can
+# be seen only in the dark. Both keep the frame up with the backlight written
+# to 0, and set 18 (qcom,mdss-dsi-nolp-command) brings the panel back, the
+# backlight being written again after it.
+#
+# 1 goes to the driver's doze-brightness feature before the panel dozes: it
+# has two levels, and the driver calls 1 `doze_brightness_high`.
+[aod]
+enter = [{ id = 3, value = "1" }]
+enter_cmds = [44]
+leave_cmds = [18]
+
+[modules]
+sources = ["vendor_boot", "vendor_dlkm", "vendor", "system_dlkm"]
+# The touchscreen: Synaptics TouchComm over SPI behind Xiaomi's touch
+# layer, the one touch driver the phone's own modules.load lists.
+#
+# The secure element: the Thales weaver reads and writes the slots that
+# guard a lock-screen secret through the eSE, and the eSE's driver is the
+# /dev/st54spi_gpio node from stm_st54se_gpio, with the NFC controller's
+# I2C driver beside it. YARP loads them in recovery for the same reason;
+# without them the eSE HAL answers "eseGetVendorId: Unknown eSE HW" and
+# the weaver's transport has no element to reach.
+load = ["synaptics_tcm2", "stm_st54se_gpio", "stm_nfc_i2c"]
+
+# As on the 17 Ultra, no init script of the phone's starts touch_report:
+# the touch feature service turns the controller's raw frames into
+# touches with /odm/lib64/libtouchreport.so, and a recovery runs none of
+# it. Told through Xiaomi's touch layer, the driver has the controller
+# report positions itself; that is known of the 17 Ultra's Synaptics
+# controller and not yet tried on this phone's.
+[touch]
+writes = [{ path = "/sys/class/touch/touch_dev/enable_touch_raw", value = "0" }]
+
+# The node the phone's own init opens to every program as it boots, which a
+# recovery leaves the owner's alone. The touch layer writes positions through
+# it: made root's alone, the controller reports nothing and the panel stays
+# still though its driver is loaded.
+[[owners]]
+user = "root"
+group = "root"
+mode = 438
+paths = ["/dev/xiaomi-touch"]
+
+# What the phone's own init runs once the system has finished starting, as
+# kernel-post-boot in /vendor/etc/init/hw/init.qti.kernel.rc. The kernel
+# starts the CPU clusters on the performance governor, which holds them at
+# their highest clock; the script hands them to WALT, lets idle CPUs power
+# down and sets how the memory bus scales. Without it the CPUs stay at
+# their highest clock and voltage even while idle, and the phone slowly
+# heats up.
+[[service]]
+path = "/vendor/bin/sh"
+args = ["/vendor/bin/init.kernel.post_boot.sh"]
+libraries = ["/system/lib64", "/vendor/lib64"]
+oneshot = true
+user = "root"
+groups = ["root", "system", "wakelock", "graphics"]
+
+# 1. TEE 通信守护进程
+[[service]]
+path = "/vendor/bin/qseecomd"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_property = "vendor.sys.listeners.registered"
+sockets = ["notify-topology"]
+user = "root"
+groups = ["root", "drmrpc"]
+
+# 2. TEE 的 mink 通道
+# The TEE's own IPC: a trustlet that waits for a mink service has its session
+# refused until one is listening, and the secure element's trusted app is one
+# of them. The phone's own init starts ssgtzd for that at early-boot and gives
+# it the two listeners; without it the eSE HAL's TEEC_OpenSession comes back
+# 0xFFFF0000, so the element never opens, se_omapi finds no card, and every
+# call to the weaver answers with its own error 1 - which is what this phone
+# did. Nothing registers with the service directory: what listens is a socket,
+# and the programs after it are the ones that use it.
+[[service]]
+path = "/vendor/bin/ssgtzd"
+libraries = ["/system/lib64", "/vendor/lib64"]
+sockets = ["ssgtzd", "ssgtzd_opener"]
+user = "system"
+groups = ["system", "oem_2912", "wakelock"]
+capabilities = ["WAKE_ALARM", "BLOCK_SUSPEND"]
+
+# 3. TEE 应用加载器
+# This daemon asks for ANDROID_SOCKET_hlos_mink_opener, the listener its init
+# service creates. Without that descriptor it exits at once, leaving every
+# service that talks to the TEE unable to start.
+[[service]]
+path = "/vendor/bin/hlosminkdaemon"
+libraries = ["/system/lib64", "/vendor/lib64"]
+sockets = ["hlos_mink_opener"]
+user = "system"
+groups = ["system"]
+capabilities = ["WAKE_ALARM", "BLOCK_SUSPEND"]
+
+# 4. KeyMint 密钥服务
+# The binary is the one this build carries: the phone has no
+# android.hardware.security.onekeymint-service-qti, which other Xiaomi builds
+# of the same chip do. Its init script runs it as system in system and
+# drmrpc.
+[[service]]
+path = "/vendor/bin/hw/android.hardware.security.keymint-service-qti"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_service = "android.hardware.security.keymint.IKeyMintDevice/default"
+registers = [
+    "android.hardware.security.keymint.IRemotelyProvisionedComponent/default",
+    "android.hardware.security.secureclock.ISecureClock/default",
+    "android.hardware.security.sharedsecret.ISharedSecret/default",
+]
+user = "system"
+groups = ["system", "drmrpc"]
+
+# 5. Gatekeeper 凭证验证服务
+# Not the Rust one: this build ships the C one, run as root as the phone's own
+# recovery runs it. libqtigatekeeper is in the vendor partition's hw folder,
+# where the phone keeps the half of a HAL that its own init script adds to the
+# search path.
+#
+# Root, where the stock rc says system: that rc is only reached once init has
+# turned the service on with a property, and this recovery starts the program
+# itself instead. The trustlet behind libqtigatekeeper is reached through
+# QSEECom, and a program that cannot open it answers every call as though the
+# secure world had taken the credential and written no note for the key
+# service -- which is what this phone did while it ran as system.
+[[service]]
+path = "/vendor/bin/hw/android.hardware.gatekeeper-service-qti"
+libraries = ["/system/lib64", "/vendor/lib64", "/vendor/lib64/hw"]
+ready_service = "android.hardware.gatekeeper.IGatekeeper/default"
+user = "root"
+groups = ["system"]
+
+# 6. 安全元件服务
+# The phone's secure element is Qualcomm's, and it registers one service for
+# each of SIM1, SIM2 and eSE1. There is no Goodix one on this build, and no
+# description file of the name the earlier configuration named. libEseUtils
+# is in the hw folder, as gatekeeper's is.
+#
+# Root, where the stock rc says system: the HAL asks the element for its
+# vendor id before it can open the TA, and that answer comes back through
+# the ADSP the recovery boots once its modules are in. YARP runs it as root
+# on this phone, and the service the Thales weaver reaches its element
+# through is this one.
+[[service]]
+path = "/vendor/bin/hw/android.hardware.secure_element-service.qti"
+libraries = ["/system/lib64", "/vendor/lib64", "/vendor/lib64/hw"]
+ready_service = "android.hardware.secure_element.ISecureElement/eSE1"
+registers = [
+    "android.hardware.secure_element.ISecureElement/SIM1",
+    "android.hardware.secure_element.ISecureElement/SIM2",
+]
+user = "root"
+groups = ["root", "nfc"]
+
+# 7. OMAPI
+# The Thales weaver reaches the secure element through
+# android.se.omapi.ISecureElementService/default, which system_server serves
+# on Android. se_omapi, packed into the ramdisk with its description, serves
+# it here. It loads its two interface libraries from the vendor partition and
+# the rest from the recovery's own, and asks for eSE1, so it starts after the
+# secure element and before the weaver. Run as root, as YARP runs it.
+[[service]]
+path = "/system/bin/se_omapi"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_service = "android.se.omapi.ISecureElementService/default"
+user = "root"
+groups = ["root", "system"]
+
+# 8. Weaver 服务
+# Thales' weaver, run as vendor_thales_weaver in that group, system and
+# drmrpc, as its init script on the odm partition has it.
+#
+# The names below are the ones the service directory reads before it takes a
+# registration; the phone's own manifest describes this HAL in the SoC's file
+# rather than in a fragment of its own, so the text is given here.
+[[service]]
+path = "/odm/bin/hw/android.hardware.weaver-service.thales"
+libraries = ["/system/lib64", "/vendor/lib64", "/odm/lib64"]
+ready_service = "android.hardware.weaver.IWeaver/default"
+description_text = '<manifest version="1.0" type="device"><hal format="aidl"><name>android.hardware.weaver</name><version>2</version><fqname>IWeaver/default</fqname></hal><hal format="aidl"><name>android.hardware.secure_element</name><version>1</version><fqname>ISecureElement/SIM1</fqname><fqname>ISecureElement/SIM2</fqname><fqname>ISecureElement/eSE1</fqname></hal><hal format="aidl"><name>android.se.omapi</name><version>1</version><fqname>ISecureElementService/default</fqname></hal></manifest>'
+user = "vendor_thales_weaver"
+groups = ["vendor_thales_weaver", "system", "drmrpc"]
+
+# The boot control, which says which slot the bootloader starts next and
+# switches it, writing where the bootloader reads it. It comes last: the
+# phone is usable without it.
+[[service]]
+path = "/vendor/bin/hw/android.hardware.boot-service.qti"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_service = "android.hardware.boot.IBootControl/default"
+user = "root"
+groups = ["root"]
+
+# WLAN: the peach node in the device tree, driven by qca_cld3_peach_v2, the
+# one of the two Peach drivers this build loads. The driver asks the cnss
+# platform device for its firmware, and waits there until that device is told
+# the file system is ready. The node that says so is the one the driver was
+# given, under the platform device itself, not a path of its own.
+# Their cfg80211 asks for rfkill, one of the kernel's own modules in
+# system_dlkm, as the 17 Ultra's does. Its recovery covers the vendor
+# partition's firmware folder with the modem's, as the 13 Ultra's does, so
+# the settings and the MAC address are given to the loader again, under
+# the names each driver asks for: the settings from the vendor partition,
+# the address from where the vendor's links point in persist.
+# wpa_supplicant runs on the recovery's own libraries before the vendor
+# partition's, as on the 17 Ultra.
+[wlan]
+modules = ["rfkill", "qca_cld3_peach_v2"]
+writes = [{ path = "/sys/bus/platform/devices/b0000000.qcom,cnss-peach/fs_ready", value = "1" }]
+firmware = [
+    { name = "wlan/qca_cld/peach/WCNSS_qcom_cfg.ini", path = "/vendor/etc/wifi/peach/WCNSS_qcom_cfg.ini" },
+    { name = "wlan/qca_cld/peach/wlan_mac.bin", partition = "persist", path = "wlan/wlan_mac.bin" },
+    { name = "wlan/qca_cld/peach_v2/WCNSS_qcom_cfg.ini", path = "/vendor/etc/wifi/peach_v2/WCNSS_qcom_cfg.ini" },
+    { name = "wlan/qca_cld/peach_v2/wlan_mac.bin", partition = "persist", path = "wlan/wlan_mac.bin" },
+]
+interface = "wlan0"
+supplicant = "/vendor/bin/hw/wpa_supplicant"
+libraries = ["/system/lib64", "/vendor/lib64"]
+service = "android.hardware.wifi.supplicant.ISupplicant/default"
+probe = "http://connect.rom.miui.com/generate_204"
+
+# The secure world keeps its own files (the applets the key service and the
+# credential service ask for) in the modem partition, which qseecomd's
+# listener mounts at /vendor/firmware_mnt and loads them from as they are
+# first asked for; without the mount they are not there.
+[firmware]
+partition = "modem"
+
+[partitions]
+mounted = ["persist"]
+
+# The update server the stock updater of the Chinese system asks.
+[update]
+server = "https://update.miui.com/updates/miotaV3.php"
+
+# The stock build the recovery is made on: the Chinese system's
+# OS4.0.0.19, whose full update package on the phone maker's own download
+# server holds the recovery partition the recovery is built on top of.
+[stock]
+version = "OS4.0.0.19.XOBCNXM"
+package = "https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS4.0.0.19.XOBCNXM/haotian-ota_full-OS4.0.0.19.XOBCNXM-user-17.0-2f40c16d06.zip"
+recovery = "657f3bed0afa0be2a9dbc07ed3d511c6acda4f82c2c5c99983b9c86d7d9358b7"
+
+# The recovery's own logd loads libsysutils and libcap, which the stock
+# recovery leaves out, so it ends as soon as init starts it...
+[logd]
+libraries = ["/mnt/system/system/lib64/libsysutils.so", "/mnt/system/system/lib64/libcap.so"]
+
+# The partitions a backup of the baseband and EFS takes...
+[backup]
+efs = ["modemst1", "modemst2", "fsg", "fsc", "persist"]
+data_skipped = [
+    "vendor/tzstorage",
+    "vendor/qtee",
+    "vendor/mitee",
+    "vendor/goodix",
+    "vendor/fingerprint",
+    "vendor/fpdata",
+    "vendor/misc/mi_fp",
+]
+
+# Where the phone's own programs keep logs in the data partition...
+[wipe]
+logs = [
+    "/data/miuilog",
+    "/data/vendor/diag",
+    "/data/vendor/bsplog",
+    "/data/vendor/log",
+    "/data/vendor/ramdump",
+    "/data/vendor/ramdump_ssr",
+    "/data/vendor/ssrdump",
+    "/data/vendor/tombstones",
+    "/data/vendor/wlan_logs",
+]

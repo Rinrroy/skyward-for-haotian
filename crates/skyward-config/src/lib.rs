@@ -919,6 +919,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_haotian() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/haotian.toml")).unwrap();
+        assert_eq!(cfg.device.codename, "haotian");
+        assert_eq!(cfg.services.len(), 10, "the programs the data partition opens with");
+        assert_eq!(cfg.services.iter().filter(|s| s.oneshot).count(), 1);
+        let qsee = cfg.services.iter().find(|s| s.path.ends_with("qseecomd")).expect("the TEE's daemon");
+        assert_eq!(qsee.sockets, ["notify-topology"]);
+        assert_eq!(qsee.ready_property.as_deref(), Some("vendor.sys.listeners.registered"));
+        let weaver = cfg.services.iter().find(|s| s.path.contains("weaver")).expect("the weaver");
+        assert!(weaver.description_text.is_some(), "the weaver's names are given to the directory in a text");
+        assert_eq!(cfg.owners[0].mode, 0o666);
+        assert_eq!(cfg.owners[0].paths, ["/dev/xiaomi-touch"]);
+        let aod = cfg.aod.as_ref().expect("the panel's own doze");
+        assert_eq!(aod.enter_cmds, [44]);
+        assert_eq!(aod.leave_cmds, [18]);
+        assert_eq!(aod.enter[0].id, 3);
+        let wlan = cfg.wlan.as_ref().expect("the WLAN driver");
+        assert_eq!(wlan.modules, ["rfkill", "qca_cld3_peach_v2"]);
+        assert_eq!(wlan.firmware.len(), 4);
+        assert_eq!(wlan.firmware[1].partition.as_deref(), Some("persist"));
+        assert_eq!(cfg.modules.load, ["synaptics_tcm2", "stm_st54se_gpio", "stm_nfc_i2c"]);
+        assert_eq!(cfg.display.corner_radius, 140);
+        assert_eq!(cfg.display.diagonal, Some(6.73));
+        assert_eq!(cfg.logd.as_ref().expect("logd's libraries").libraries.len(), 2);
+        assert_eq!(cfg.stock.as_ref().expect("the stock build").version, "OS4.0.0.19.XOBCNXM");
+    }
+
+    #[test]
     fn each_phone_names_the_stock_build_its_recovery_is_made_on() {
         for (text, version) in [
             (include_str!("../../../devices/disabled/nezha.toml"), "OS4.0.4.0.XPACNXM"),
@@ -935,7 +963,7 @@ mod tests {
             (include_str!("../../../devices/disabled/shennong.toml"), "OS3.0.309.0.WNBCNXM"),
             (include_str!("../../../devices/aurora.toml"), "OS3.0.308.0.WNACNXM"),
             (include_str!("../../../devices/disabled/dada.toml"), "OS3.0.307.0.WOCCNXM"),
-            (include_str!("../../../devices/disabled/haotian.toml"), "OS3.0.309.0.WOBCNXM"),
+            (include_str!("../../../devices/haotian.toml"), "OS4.0.0.19.XOBCNXM"),
             (include_str!("../../../devices/disabled/xuanyuan.toml"), "OS3.0.314.0.WOACNXM"),
             (include_str!("../../../devices/disabled/byron.toml"), "OS3.0.310.0.WAFCNXM"),
             (include_str!("../../../devices/disabled/zorn.toml"), "OS3.0.309.0.WOKCNXM"),
