@@ -99,8 +99,8 @@ pub fn newest(answer: &str, codename: &str, running: &str) -> Result<Newest> {
     let release: Release = serde_json::from_str(answer).context("read GitHub's answer")?;
     let tag = release.tag_name;
     let version = tag.strip_prefix('v').with_context(|| format!("the newest release is tagged {tag}, which is not v and a version"))?;
-    let newest = semver::Version::parse(version).with_context(|| format!("the newest release is tagged {tag}"))?;
-    let this = semver::Version::parse(running).with_context(|| format!("this build's version is {running}"))?;
+    let newest = Version::parse(version).with_context(|| format!("the newest release is tagged {tag}"))?;
+    let this = Version::parse(running).with_context(|| format!("this build's version is {running}"))?;
     // The image is named skyward-, the tag, the phone's codename, and the
     // stock build it is made on, and is put on the release as it is - not
     // zipped, so the phone downloads what it writes.
@@ -113,7 +113,46 @@ pub fn newest(answer: &str, codename: &str, running: &str) -> Result<Newest> {
             Some(Build { sha256: sha256.to_lowercase(), name: a.name, url: a.url, link: a.browser_download_url, size: a.size })
         }
     };
-    Ok(Newest { version: version.to_string(), newer: newest > this, build, via: None })
+    Ok(Newest { version: version.to_string(), newer: newest.newer_than(this), build, via: None })
+}
+
+/// A version as the fork names its releases: the three numbers Cargo takes,
+/// and the fork's own patch level after them, as `0.3.1.2`. A release named
+/// the way upstream names them has the three numbers and no patch level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Version {
+    numbers: (u64, u64, u64),
+    patch: Option<u64>,
+}
+
+impl Version {
+    fn parse(text: &str) -> Result<Version> {
+        let parts: Vec<&str> = text.split('.').collect();
+        let count = match parts.len() {
+            3 => 3,
+            4 => 4,
+            _ => bail!("{text:?} is not a version, which is three numbers or three and the fork's patch level after them"),
+        };
+        let mut numbers = [0u64; 4];
+        for (at, part) in parts.iter().enumerate() {
+            numbers[at] = part.parse().with_context(|| format!("{text:?} is not a version, which is numbers and full stops"))?;
+        }
+        Ok(Version { numbers: (numbers[0], numbers[1], numbers[2]), patch: (count == 4).then_some(numbers[3]) })
+    }
+
+    /// Whether `self`, a release, is newer than `other`, the build that asks.
+    /// Two names of the same kind are compared number by number; the two
+    /// kinds are not compared at all, since the fork's patch level does not
+    /// order against the three numbers upstream names its releases with — a
+    /// build with a patch level is only looked at against releases that have
+    /// one, and one without it against releases without it.
+    fn newer_than(self, other: Version) -> bool {
+        match (self.patch, other.patch) {
+            (Some(mine), Some(theirs)) => (self.numbers, mine) > (other.numbers, theirs),
+            (None, None) => self.numbers > other.numbers,
+            _ => false,
+        }
+    }
 }
 
 /// Ask GitHub for Skyward's newest release, and its build for the phone
@@ -367,8 +406,22 @@ mod tests {
     fn a_release_is_newer_only_than_an_older_build() {
         assert!(!newest(ANSWERED_013, "ishtar", "0.1.3").unwrap().newer, "the same version");
         assert!(!newest(ANSWERED_013, "ishtar", "0.2.0").unwrap().newer, "a build ahead of every release");
-        assert!(newest(ANSWERED_013, "ishtar", "0.1.3-rc.1").unwrap().newer, "a build before the release it led to");
+        assert!(newest(ANSWERED_013, "ishtar", "0.1.3-rc.1").is_err(), "a version of numbers and full stops only");
         assert!(newest(ANSWERED_013, "ishtar", "0.1").is_err(), "a version this build cannot have");
+    }
+
+    #[test]
+    fn a_release_with_the_fork_patch_level_is_only_compared_with_builds_that_have_one() {
+        let tagged = |tag: &str| ANSWERED_013.replace("\"tag_name\":\"v0.1.3\"", &format!("\"tag_name\":\"v{tag}\""));
+        let newer = |tag: &str, running: &str| newest(&tagged(tag), "ishtar", running).unwrap().newer;
+        assert!(newer("0.3.1.3", "0.3.1.2"), "the patch level after the build's");
+        assert!(!newer("0.3.1.2", "0.3.1.2"), "the same version");
+        assert!(!newer("0.3.1.1", "0.3.1.2"), "a patch level before the build's");
+        assert!(newer("0.3.2.0", "0.3.1.9"), "the three numbers come first");
+        assert!(newer("0.3.3", "0.3.2"), "two releases without a patch level");
+        assert!(!newer("0.3.2", "0.3.1.2"), "a release named as upstream names them says nothing of the fork's own builds");
+        assert!(!newer("0.3.1.2", "0.3.2"), "and the other way round");
+        assert!(newest(&tagged("0.3.1.2.3"), "ishtar", "0.3.1.2").is_err(), "more numbers than the fork names");
     }
 
     #[test]

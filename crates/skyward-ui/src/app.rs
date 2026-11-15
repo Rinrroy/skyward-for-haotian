@@ -1,3 +1,4 @@
+use crate::aod::AodStyle;
 use crate::canvas::{Canvas, Run};
 use crate::charge;
 use crate::color::Rgba;
@@ -141,8 +142,6 @@ pub enum Screen {
     /// A network added by hand: its name, how it is protected and its
     /// password, typed on the screen's keyboard.
     WlanAdd,
-    /// Turning the phone off, and what that means: the swipe that does it.
-    PowerOff,
     /// The vbmeta image of the slot the phone runs from: the copies kept of
     /// it, making one, and putting one back.
     Vbmeta,
@@ -961,8 +960,6 @@ pub enum Confirm {
     ForgetNetwork,
     /// Delete the full package downloaded from internal storage.
     DeleteDownload,
-    /// Turn the phone off.
-    PowerOff,
 }
 
 /// What the wipe page erases: everything a factory reset erases, or any of
@@ -1319,6 +1316,9 @@ pub enum Action {
     Back,
     Theme { dark: bool },
     Toggle(Switch),
+    /// Put the next face on the dark panel: the digits, the hour and the
+    /// minute set askew, or a clock face, going round the three.
+    AodStyle,
     RebootTarget(usize),
     /// Choose or leave out what the wipe page erases.
     WipeItem(Wipe),
@@ -1759,6 +1759,11 @@ pub struct State {
     /// here puts a dark panel out the way the recovery always did, since a
     /// face left glowing all night is a thing to ask for rather than to find.
     pub always_on: bool,
+    /// The face the panel wears while it dozes, by the style the settings
+    /// page goes round: digits, the hour and minute set askew, or a clock
+    /// face. It is the setting's alone, so it starts as the face the recovery
+    /// has always drawn.
+    pub aod_style: AodStyle,
     /// This phone's panel has the two-tap wake at all, which the settings page
     /// then offers a switch for: a panel whose touch controller stops
     /// reporting fingers with the panel off has nothing for the gesture to
@@ -2040,6 +2045,9 @@ impl Default for State {
             // Off, so a freshly flashed phone is put out as it always was and
             // the face is turned on from the settings page.
             always_on: false,
+            // The face the recovery has always drawn, until the setting says
+            // otherwise.
+            aod_style: AodStyle::Digits,
             panel_taps: false,
             // Off, so a phone flashed and never visited here puts its panel
             // out and suspends, which is the least it can draw.
@@ -6034,6 +6042,13 @@ impl App {
                 self.refresh();
                 return vec![Effect::Wlan(on)];
             }
+            // The next face, kept for the next start: the panel is redrawn
+            // with it, so the setting shows at once rather than at the next
+            // minute.
+            Action::AodStyle => {
+                self.state.aod_style = self.state.aod_style.next();
+                self.refresh();
+            }
             Action::Toggle(switch) => {
                 let on = match switch {
                     Switch::Vibrate => &mut self.state.vibrate,
@@ -7813,7 +7828,6 @@ impl App {
                 }
                 _ => self.say(l.pick(["没有可删除的安装包", "沒有可刪除的安裝檔", "There is no package to delete"]), now),
             },
-            Confirm::PowerOff => fx.push(Effect::Reboot(Target::PowerOff)),
         }
         fx
     }
@@ -9512,6 +9526,29 @@ mod tests {
     }
 
     #[test]
+    fn the_clock_style_shows_only_on_a_panel_that_dozes_and_goes_round_the_faces() {
+        let (f, i) = (fonts(), info());
+        let offered = |app: &mut App| app.frame(&f, &i).hits.iter().any(|h| h.action == Action::AodStyle);
+        let mut app = App::new(Screen::Settings, W, H, PPD);
+        assert!(!offered(&mut app), "a panel with no doze of its own has no face to choose");
+        // A phone whose panel does doze offers the row, and a start that has
+        // not been to the page yet wears the face the recovery always drew.
+        app.state.panel_dozes = true;
+        app.refresh();
+        assert!(offered(&mut app), "the row is among the page's controls");
+        assert_eq!(app.state.aod_style, AodStyle::Digits, "the digits until the setting goes round them");
+        // The row is worked the way any other on the page is, and the face it
+        // names is the one the settings carry into the next start.
+        app.act(Action::AodStyle, 1000);
+        assert_eq!(app.state.aod_style, AodStyle::Offset, "the row goes round to the next face");
+        assert_eq!(app.settings().aod_style, "offset", "and the settings keep the one chosen");
+        app.act(Action::AodStyle, 2000);
+        assert_eq!(app.state.aod_style, AodStyle::Dial);
+        app.act(Action::AodStyle, 3000);
+        assert_eq!(app.state.aod_style, AodStyle::Digits, "and round again to the face it started on");
+    }
+
+    #[test]
     fn the_avb_page_reads_before_it_shows_and_only_writes_after_the_swipe() {
         use skyward_install::commands::avbctl;
         let (f, i) = (fonts(), info());
@@ -10253,16 +10290,16 @@ mod tests {
         let snug = snug(&f, &info());
         let i = DeviceInfo { snapshot: SnapshotState::Snapshotted, ..info() };
         let mut app = App::new(Screen::Home, W, snug, PPD);
-        let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::PowerOff));
+        let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::Reboot));
         assert!(y > snug as f32, "below the screen to start with");
-        light_on(&mut app, &f, &i, Stop::Hit(Action::Open(Screen::PowerOff)));
+        light_on(&mut app, &f, &i, Stop::Hit(Action::Open(Screen::Reboot)));
         for ms in (0..3000).step_by(8) {
             app.tick(ms);
         }
-        let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::PowerOff));
+        let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::Reboot));
         assert!(y < snug as f32, "the page scrolled the lit row into view");
         press(&mut app, Key::Power, 3000);
-        assert_eq!(app.screen(), Screen::PowerOff);
+        assert_eq!(app.screen(), Screen::Reboot);
     }
 
     #[test]
@@ -10329,7 +10366,7 @@ mod tests {
         assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::About))));
         press(&mut app, Key::VolumeUp, 0);
         press(&mut app, Key::VolumeUp, 0);
-        assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::PowerOff))), "up from the first goes round to the last");
+        assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::Open(Screen::Reboot))), "up from the first goes round to the last");
         app.tick(5000);
         let reboot = app.lit().expect("lit");
         assert!(app.shows(&reboot, app.top().1), "scrolled into view");

@@ -19,6 +19,7 @@
 use crate::canvas::Canvas;
 use crate::color::Rgba;
 use crate::font::Fonts;
+use crate::Lang;
 
 /// The black the rest of the face is: on an OLED, the pixels that are not
 /// lit, which is all but a few hundred of them.
@@ -51,6 +52,88 @@ const FACTS_DROP_DP: f32 = 84.0;
 /// middle its baseline sits.
 const DATE_DP: f32 = 17.0;
 const DATE_RISE_DP: f32 = 78.0;
+
+/// The offset face: the hour and the minute, each as large as the screen has
+/// room for. Their size in dp, where the hour's middle sits down the screen
+/// as a share of its height, how far either side of the middle the pair
+/// stands, how far the minute sits below the hour, and where the date above
+/// the hour and the readings below the minute go.
+const OFFSET_DP: f32 = 150.0;
+const OFFSET_AT: f32 = 0.28;
+const OFFSET_SKEW_DP: f32 = 90.0;
+const OFFSET_DROP_DP: f32 = 150.0;
+const OFFSET_DATE_RISE_DP: f32 = 110.0;
+const OFFSET_FACTS_DROP_DP: f32 = 120.0;
+
+/// The dial: where its middle sits down the screen as a share of its height,
+/// how far the ring reaches in dp, and how thick its rim is.
+const DIAL_AT: f32 = 0.40;
+const DIAL_RADIUS_DP: f32 = 104.0;
+const DIAL_RING_DP: f32 = 3.0;
+/// Its twelve marks: how far in from the rim one reaches, the quarters'
+/// deeper than the rest, how far short of the rim both stop, and how wide
+/// each is, halves in dp.
+const DIAL_MARK_IN_DP: f32 = 10.0;
+const DIAL_QUARTER_IN_DP: f32 = 14.0;
+const DIAL_MARK_OUT_DP: f32 = 6.0;
+const DIAL_MARK_HALF_DP: f32 = 1.25;
+const DIAL_QUARTER_HALF_DP: f32 = 2.5;
+/// The numerals the quarters are named with: their size in dp, and how deep
+/// inside the rim they sit as a share of the ring's radius.
+const DIAL_NUMERAL_DP: f32 = 26.0;
+const DIAL_NUMERAL_AT: f32 = 0.72;
+/// The hands: how far out each reaches as a share of the ring's radius, and
+/// how wide each is at its pin and at its tip, in dp.
+const DIAL_HOUR_LEN: f32 = 0.48;
+const DIAL_MINUTE_LEN: f32 = 0.76;
+const DIAL_HOUR_BASE_DP: f32 = 5.0;
+const DIAL_HOUR_TIP_DP: f32 = 1.5;
+const DIAL_MINUTE_BASE_DP: f32 = 3.5;
+const DIAL_MINUTE_TIP_DP: f32 = 1.0;
+/// The pin the hands turn on, and the black it is bored with.
+const DIAL_PIN_DP: f32 = 6.0;
+const DIAL_PIN_CORE_DP: f32 = 2.0;
+/// The date above the ring, how far above its top it sits in dp, and where
+/// the readings line goes down the screen as a share of its height.
+const DIAL_DATE_RISE_DP: f32 = 46.0;
+const DIAL_FACTS_AT: f32 = 0.72;
+
+/// The faces the always-on display can wear, in the order the setting goes
+/// round them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AodStyle {
+    /// `HH:MM` large, centred: the face the recovery has always drawn.
+    #[default]
+    Digits,
+    /// The hour and the minute set askew, each as large as the screen allows.
+    Offset,
+    /// A clock face: a ring, twelve marks, the quarters named, and the hands.
+    Dial,
+}
+
+/// Every style, in the order the setting goes round them.
+pub const STYLES: [AodStyle; 3] = [AodStyle::Digits, AodStyle::Offset, AodStyle::Dial];
+
+impl AodStyle {
+    /// The name the style is known by, as the setting shows it.
+    pub fn name(self, l: Lang) -> &'static str {
+        let names: [&'static str; 3] = match self {
+            AodStyle::Digits => ["数字", "數字", "Digits"],
+            AodStyle::Offset => ["错位", "錯位", "Offset"],
+            AodStyle::Dial => ["表盘", "錶盤", "Dial"],
+        };
+        l.pick(names)
+    }
+
+    /// The style after this one, as the setting is tapped.
+    pub fn next(self) -> Self {
+        match self {
+            AodStyle::Digits => AodStyle::Offset,
+            AodStyle::Offset => AodStyle::Dial,
+            AodStyle::Dial => AodStyle::Digits,
+        }
+    }
+}
 
 /// What the face says beside the time: the readings a person glancing at the
 /// phone wants, and nothing that has to be read closely.
@@ -290,18 +373,31 @@ impl Doze {
     }
 }
 
-/// Draw the face the panel keeps on the glass while it dozes: the date, the
-/// time, the readings a glance wants, and a small mark under them, on black.
+/// Draw the face the panel keeps on the glass while it dozes, in the style
+/// the setting is on: the date, the time, and the readings a glance wants, on
+/// black.
 ///
 /// The frame is what glows, so everything but what is drawn here is black: a
 /// page's worth of light would burn the panel and drain the battery with the
 /// backlight never coming on. The face stands a little to one side or the
 /// other of the middle, a different place each minute, so that the same
-/// subpixels are not lit for hours on end.
-pub fn face(out: &mut Canvas, f: &Fonts, clock: &str, facts: &Facts, px_per_dp: f32) {
+/// subpixels are not lit for hours on end, and whatever the style draws, it
+/// is in the inks that phone shows as they were drawn (see [`INK`]).
+pub fn face(out: &mut Canvas, f: &Fonts, clock: &str, facts: &Facts, style: AodStyle, px_per_dp: f32) {
     out.clear(BLACK);
     let (w, h) = (out.w as f32, out.h as f32);
-    let (cx, cy) = (w / 2.0 + drift(clock, px_per_dp), h * CLOCK_AT);
+    let cx = w / 2.0 + drift(clock, px_per_dp);
+    match style {
+        AodStyle::Digits => digits(out, f, clock, facts, cx, h, px_per_dp),
+        AodStyle::Offset => offset(out, f, clock, facts, cx, h, px_per_dp),
+        AodStyle::Dial => dial(out, f, clock, facts, cx, h, px_per_dp),
+    }
+}
+
+/// The face the recovery has always drawn: the date above, the clock large in
+/// the middle, a small mark under it, and the readings under that.
+fn digits(out: &mut Canvas, f: &Fonts, clock: &str, facts: &Facts, cx: f32, h: f32, px_per_dp: f32) {
+    let cy = h * CLOCK_AT;
     if !facts.date.is_empty() {
         out.text_center(&f.body, &facts.date, cx, cy - DATE_RISE_DP * px_per_dp, DATE_DP * px_per_dp, MARK);
     }
@@ -312,6 +408,105 @@ pub fn face(out: &mut Canvas, f: &Fonts, clock: &str, facts: &Facts, px_per_dp: 
     if !line.is_empty() {
         out.text_center(&f.body, &line, cx, cy + FACTS_DROP_DP * px_per_dp, FACTS_DP * px_per_dp, MARK);
     }
+}
+
+/// The hour and the minute set askew, each as large as the screen has room
+/// for: the hour up and to one side, the minute down and to the other, the
+/// date above the hour and the readings below the minute. The parts of a
+/// clock that is no `HH:MM` are drawn as they come, and a face with no clock
+/// at all draws only the date and the readings.
+fn offset(out: &mut Canvas, f: &Fonts, clock: &str, facts: &Facts, cx: f32, h: f32, px_per_dp: f32) {
+    let (hour, minute) = clock.split_once(':').unwrap_or((clock, ""));
+    let (hour_x, hour_y) = (cx - OFFSET_SKEW_DP * px_per_dp, h * OFFSET_AT);
+    let (minute_x, minute_y) = (cx + OFFSET_SKEW_DP * px_per_dp, hour_y + OFFSET_DROP_DP * px_per_dp);
+    if !facts.date.is_empty() {
+        out.text_center(&f.body, &facts.date, hour_x, hour_y - OFFSET_DATE_RISE_DP * px_per_dp, DATE_DP * px_per_dp, MARK);
+    }
+    out.text_center(&f.title, hour, hour_x, hour_y, OFFSET_DP * px_per_dp, INK);
+    out.text_center(&f.title, minute, minute_x, minute_y, OFFSET_DP * px_per_dp, INK);
+    let line = facts.line();
+    if !line.is_empty() {
+        out.text_center(&f.body, &line, minute_x, minute_y + OFFSET_FACTS_DROP_DP * px_per_dp, FACTS_DP * px_per_dp, MARK);
+    }
+}
+
+/// A clock face: a ring with twelve marks about it, the quarters named, and
+/// the hands where the time says, the date above the ring and the readings
+/// below it. A clock that reads as no time draws no ring and no hands — the
+/// date and the readings the phone gives are still drawn.
+fn dial(out: &mut Canvas, f: &Fonts, clock: &str, facts: &Facts, cx: f32, h: f32, px_per_dp: f32) {
+    let (cy, r) = (h * DIAL_AT, DIAL_RADIUS_DP * px_per_dp);
+    if let Some((hour, minute)) = hands(clock) {
+        // The rim is a disc of ink with the black taken back out of it, so
+        // that only the ring is left lit.
+        out.fill_circle(cx, cy, r, MARK);
+        out.fill_circle(cx, cy, (r - DIAL_RING_DP * px_per_dp).max(0.0), BLACK);
+        for i in 0..12u32 {
+            let a = i as f32 * std::f32::consts::FRAC_PI_6;
+            let (sx, sy) = (a.sin(), -a.cos());
+            let (qx, qy) = (-sy, sx);
+            let quarter = i % 3 == 0;
+            let (reach, half) = if quarter { (DIAL_QUARTER_IN_DP, DIAL_QUARTER_HALF_DP) } else { (DIAL_MARK_IN_DP, DIAL_MARK_HALF_DP) };
+            let (r0, r1, half) = (r - reach * px_per_dp, r - DIAL_MARK_OUT_DP * px_per_dp, half * px_per_dp);
+            out.fill_convex(
+                &[
+                    (cx + sx * r0 + qx * half, cy + sy * r0 + qy * half),
+                    (cx + sx * r1 + qx * half, cy + sy * r1 + qy * half),
+                    (cx + sx * r1 - qx * half, cy + sy * r1 - qy * half),
+                    (cx + sx * r0 - qx * half, cy + sy * r0 - qy * half),
+                ],
+                INK,
+            );
+            if quarter {
+                let numeral = match i {
+                    0 => "12",
+                    3 => "3",
+                    6 => "6",
+                    _ => "9",
+                };
+                out.text_center(&f.heading, numeral, cx + sx * r * DIAL_NUMERAL_AT, cy + sy * r * DIAL_NUMERAL_AT, DIAL_NUMERAL_DP * px_per_dp, INK);
+            }
+        }
+        let tau = std::f32::consts::TAU;
+        let mut hand = |angle: f32, len: f32, base: f32, tip: f32| {
+            let (sx, sy) = (angle.sin(), -angle.cos());
+            let (qx, qy) = (-sy, sx);
+            out.fill_convex(
+                &[
+                    (cx - qx * base, cy - qy * base),
+                    (cx + sx * len + qx * tip, cy + sy * len + qy * tip),
+                    (cx + sx * len - qx * tip, cy + sy * len - qy * tip),
+                    (cx + qx * base, cy + qy * base),
+                ],
+                INK,
+            );
+        };
+        hand(hour.rem_euclid(12.0) / 12.0 * tau + minute / 60.0 * (tau / 12.0), r * DIAL_HOUR_LEN, DIAL_HOUR_BASE_DP * px_per_dp, DIAL_HOUR_TIP_DP * px_per_dp);
+        hand(minute / 60.0 * tau, r * DIAL_MINUTE_LEN, DIAL_MINUTE_BASE_DP * px_per_dp, DIAL_MINUTE_TIP_DP * px_per_dp);
+        out.fill_circle(cx, cy, DIAL_PIN_DP * px_per_dp, INK);
+        out.fill_circle(cx, cy, DIAL_PIN_CORE_DP * px_per_dp, BLACK);
+    }
+    if !facts.date.is_empty() {
+        out.text_center(&f.body, &facts.date, cx, cy - r - DIAL_DATE_RISE_DP * px_per_dp, DATE_DP * px_per_dp, MARK);
+    }
+    let line = facts.line();
+    if !line.is_empty() {
+        out.text_center(&f.body, &line, cx, h * DIAL_FACTS_AT, FACTS_DP * px_per_dp, MARK);
+    }
+}
+
+/// The hour and the minute `clock` reads as, where it reads as `HH:MM`: what
+/// the dial's hands point at. A clock that is no time — the empty one a phone
+/// whose RTC never set gives, or words — has no hands, and the dial draws
+/// neither them nor its ring.
+fn hands(clock: &str) -> Option<(f32, f32)> {
+    let (hour, minute) = clock.split_once(':')?;
+    // A field that is no number at all, or no number of an hour or a minute,
+    // has no hand to point with; `99:99` is read, and the hands go where its
+    // arithmetic puts them rather than failing.
+    let hour: f32 = hour.trim().parse().ok()?;
+    let minute: f32 = minute.trim().parse().ok()?;
+    (hour.is_finite() && minute.is_finite()).then_some((hour, minute))
 }
 
 /// How far, in pixels, the face stands from the middle of the screen for the
@@ -446,15 +641,21 @@ mod tests {
         Facts { date: "2026年11月7日".into(), battery: Some((48, true)), slot: Some("A".into()), data: "未解密".into() }
     }
 
+    /// How many pixels of `out` are lit at all, as a face with the backlight
+    /// out is the only light on the glass.
+    fn lit(out: &Canvas) -> usize {
+        out.data.as_chunks::<4>().0.iter().filter(|p| p[0] > 0).count()
+    }
+
     #[test]
     fn the_face_lights_a_clock_and_its_readings_on_black_and_nothing_else() {
         let (mut out, f) = screen();
-        face(&mut out, &f, "03:27", &facts(), 3.75);
-        let lit = out.data.as_chunks::<4>().0.iter().filter(|p| p[0] > 0).count();
-        assert!(lit > 0, "the clock is on the glass");
+        face(&mut out, &f, "03:27", &facts(), AodStyle::Digits, 3.75);
+        let on = lit(&out);
+        assert!(on > 0, "the clock is on the glass");
         // A page's worth of light would burn the panel: a few thousand
         // pixels out of four and a half million is all the face lights.
-        assert!(lit < 90_000, "{lit} pixels lit of {}", out.data.len() / 4);
+        assert!(on < 90_000, "{on} pixels lit of {}", out.data.len() / 4);
         // Everything that is not the face is black; its edges are
         // anti-aliased, so a little more than its ink is not.
         let black = out.data.as_chunks::<4>().0.iter().filter(|p| p[..3] == [0, 0, 0]).count();
@@ -471,9 +672,11 @@ mod tests {
         // is still the clock over its mark.
         let bare = Facts::default();
         assert_eq!(bare.line(), "");
-        let (mut out, f) = screen();
-        face(&mut out, &f, "03:27", &bare, 3.75);
-        assert!(out.data.as_chunks::<4>().0.iter().any(|p| p[0] > 0), "the clock is still on the glass");
+        for style in STYLES {
+            let (mut out, f) = screen();
+            face(&mut out, &f, "03:27", &bare, style, 3.75);
+            assert!(lit(&out) > 0, "{style:?} still has the clock on the glass");
+        }
     }
 
     #[test]
@@ -481,31 +684,129 @@ mod tests {
         // `haotian`'s glass shows the buffer's blue byte as both red and blue
         // (see AGENT.md), so a face whose lit pixels all have red equal to
         // blue is a face that phone shows as it was drawn. Everything on it is
-        // grey or white for that reason.
-        let (mut out, f) = screen();
-        face(&mut out, &f, "03:27", &facts(), 3.75);
-        let wrong: Vec<[u8; 4]> = out.data.as_chunks::<4>().0.iter().copied().filter(|p| p[0] != p[2]).collect();
-        assert!(wrong.is_empty(), "{} pixels depend on a channel the glass mangles: {:?}", wrong.len(), wrong.first());
+        // grey or white for that reason, whichever face the setting is on.
+        let f = crate::font::bundled();
+        for style in STYLES {
+            let mut out = Canvas::filled(1440, 3200, Rgba::rgb(9, 9, 9));
+            face(&mut out, &f, "03:27", &facts(), style, 3.75);
+            let wrong: Vec<[u8; 4]> = out.data.as_chunks::<4>().0.iter().copied().filter(|p| p[0] != p[2]).collect();
+            assert!(wrong.is_empty(), "{style:?}: {} pixels depend on a channel the glass mangles: {:?}", wrong.len(), wrong.first());
+        }
     }
 
     #[test]
     fn the_face_moves_with_the_minute_so_no_pixel_is_lit_for_long() {
         let (mut one, f) = screen();
-        let (mut two, f2) = screen();
-        face(&mut one, &f, "03:20", &facts(), 3.75);
-        face(&mut two, &f2, "03:21", &facts(), 3.75);
+        let mut two = one.clone();
+        face(&mut one, &f, "03:20", &facts(), AodStyle::Digits, 3.75);
+        face(&mut two, &f, "03:21", &facts(), AodStyle::Digits, 3.75);
         assert_ne!(one.data, two.data, "the next minute's face stands somewhere else");
         // And it stays on the glass, whatever minute it is.
         for minute in 0..60 {
             let mut out = one.clone();
-            face(&mut out, &f, &format!("03:{minute:02}"), &facts(), 3.75);
+            face(&mut out, &f, &format!("03:{minute:02}"), &facts(), AodStyle::Digits, 3.75);
             assert!(!out.data.as_chunks::<4>().0.iter().all(|p| p[..3] == [0, 0, 0]), "minute {minute} is on the glass");
             assert_eq!(out.w, 1440, "the face does not resize the frame");
+        }
+        // The other faces stand somewhere else with the minute too, so no
+        // subpixel of them is lit for hours on end either.
+        for style in [AodStyle::Offset, AodStyle::Dial] {
+            let mut one = Canvas::filled(1440, 3200, Rgba::rgb(9, 9, 9));
+            let mut two = Canvas::filled(1440, 3200, Rgba::rgb(9, 9, 9));
+            face(&mut one, &f, "03:20", &facts(), style, 3.75);
+            face(&mut two, &f, "03:21", &facts(), style, 3.75);
+            assert_ne!(one.data, two.data, "{style:?} stands somewhere else the next minute");
         }
         // The odd clock a phone whose RTC never set gives, without a minute,
         // stands in the middle rather than panicking.
         let mut out = one.clone();
-        face(&mut out, &f, "", &facts(), 3.75);
+        face(&mut out, &f, "", &facts(), AodStyle::Digits, 3.75);
         assert_eq!(drift("", 3.75), 3.75 * 0.0);
+    }
+
+    #[test]
+    fn the_faces_go_round_in_the_order_the_setting_names() {
+        assert_eq!(STYLES, [AodStyle::Digits, AodStyle::Offset, AodStyle::Dial]);
+        // A phone that never opens the setting keeps the face it always had.
+        assert_eq!(AodStyle::default(), AodStyle::Digits);
+        let mut style = AodStyle::default();
+        let mut went = Vec::new();
+        for _ in 0..STYLES.len() {
+            went.push(style);
+            style = style.next();
+        }
+        assert_eq!(went, STYLES.to_vec(), "each tap is the next face round");
+        assert_eq!(style, AodStyle::Digits, "and round again to the one it started on");
+    }
+
+    #[test]
+    fn every_language_names_the_three_faces_apart() {
+        for lang in crate::Lang::ALL {
+            let names: Vec<&str> = STYLES.iter().map(|s| s.name(lang)).collect();
+            assert!(names.iter().all(|n| !n.is_empty()), "{lang:?} leaves no face unnamed: {names:?}");
+            for (i, name) in names.iter().enumerate() {
+                assert!(!name.contains(char::is_whitespace), "{name:?} is one word, as the setting shows it");
+                for other in &names[i + 1..] {
+                    assert_ne!(name, other, "{lang:?} tells the faces apart");
+                }
+            }
+        }
+        assert_eq!(STYLES.map(|s| s.name(crate::Lang::Hans)), ["数字", "错位", "表盘"]);
+        assert_eq!(STYLES.map(|s| s.name(crate::Lang::Hant)), ["數字", "錯位", "錶盤"]);
+        assert_eq!(STYLES.map(|s| s.name(crate::Lang::En)), ["Digits", "Offset", "Dial"]);
+    }
+
+    #[test]
+    fn the_three_faces_are_three_different_faces_of_the_same_clock() {
+        let f = crate::font::bundled();
+        let mut drawn: Vec<Canvas> = Vec::new();
+        for style in STYLES {
+            let mut out = Canvas::filled(1440, 3200, Rgba::rgb(9, 9, 9));
+            face(&mut out, &f, "10:08", &facts(), style, 3.75);
+            drawn.push(out);
+        }
+        for (i, one) in drawn.iter().enumerate() {
+            for (j, other) in drawn.iter().enumerate().skip(i + 1) {
+                assert_ne!(one.data, other.data, "{:?} and {:?} are drawn differently", STYLES[i], STYLES[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_dial_with_no_time_on_it_still_draws_what_the_phone_gives() {
+        // The clock a phone whose RTC never set gives, and the odd ones a
+        // clock that is no `HH:MM` gives: the dial draws no ring and no hands
+        // to point, but the date and the readings the phone does have are
+        // still on the glass, and nothing panics.
+        let f = crate::font::bundled();
+        for clock in ["", "nope", "99:99", ":", "12:", ":45", "-1:-1", "03:27:11"] {
+            let mut out = Canvas::filled(1440, 3200, Rgba::rgb(9, 9, 9));
+            face(&mut out, &f, clock, &facts(), AodStyle::Dial, 3.75);
+            assert!(lit(&out) > 0, "{clock:?} still shows the date and the readings");
+        }
+        // A phone that gives neither a time nor a reading lights nothing at
+        // all rather than a ring about a clock it does not know.
+        let mut bare = Canvas::filled(1440, 3200, Rgba::rgb(9, 9, 9));
+        face(&mut bare, &f, "", &Facts::default(), AodStyle::Dial, 3.75);
+        assert_eq!(lit(&bare), 0, "no time, no date and no readings light nothing");
+    }
+
+    #[test]
+    fn every_face_keeps_the_glass_to_a_small_part_of_its_light() {
+        // The face is what glows with the backlight out, so it must stay a
+        // small part of the glass: a page's worth of light would burn the
+        // panel and drain the battery through the night. The digits and the
+        // dial light a few tens of thousands of pixels of the four and a half
+        // million; the offset face lights the most, its two fields being the
+        // largest thing any page of the recovery draws, and is kept to one
+        // part in twenty of the glass.
+        let f = crate::font::bundled();
+        let glass = 1440 * 3200;
+        for (style, ceiling) in [(AodStyle::Digits, 90_000), (AodStyle::Dial, 90_000), (AodStyle::Offset, glass / 20)] {
+            let mut out = Canvas::filled(1440, 3200, Rgba::rgb(9, 9, 9));
+            face(&mut out, &f, "03:27", &facts(), style, 3.75);
+            let on = lit(&out);
+            assert!(on < ceiling, "{style:?} lights {on} pixels, more than the {ceiling} that face is kept to");
+        }
     }
 }

@@ -18,3 +18,8 @@ notes/
 
 # Build scratch space used where the toolchain's own temp folder is not writable.
 .tmpbuild/
+.tmpbuild-host/
+
+# Scratch space of a working session: mirrors of another fork, and the token
+# that reads one, none of which belongs in this history.
+.tmp/

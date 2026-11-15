@@ -133,7 +133,8 @@ this slot. There is no override.
 ### Other features
 
 - Reboot to system, recovery, fastboot, bootloader or EDL, switch slots, or turn
-  the phone off from a page of its own
+  the phone off — the last one being one of the restart page's swipe
+  destinations, not a page of its own
 - Light and dark themes; Simplified Chinese, Traditional Chinese and English
 - Mount partitions, repair and format filesystems
 - WLAN, MTP file transfer, adb and fastbootd; a network joined once is
@@ -165,6 +166,11 @@ need:
   It is a switch on the settings page and ships **off**: the taps are only felt
   while the panel keeps dozing — this driver suspends the touchscreen with the
   panel's blanking — so turning it on costs the phone its suspend.
+- **The always-on display wears one of three faces.** With the panel dozing, the
+  settings page's always-on section offers `Clock style`: the digits it has
+  always shown, an offset face with the hour and the minute apart, and a dial
+  with hands, marks and the battery around it. The choice is kept with the rest
+  of the settings and drawn at once when it is made.
 - **The ADSP is given three seconds, then asked for a retry.** On a build whose
   `/vendor/firmware` carries only the first part of the DSP's firmware, the
   kernel stops at the first missing segment; Skyward asks the loader again once

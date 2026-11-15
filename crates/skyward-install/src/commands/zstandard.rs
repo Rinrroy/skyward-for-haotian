@@ -53,7 +53,7 @@ pub(super) fn run(args: &[OsString], io: &mut Io) -> i32 {
         Ok(Asked::Decompress(request)) => request,
         Ok(Asked::Version) => {
             let library = zstd::zstd_safe::version_string();
-            return say(io, &format!("zstd of Skyward {}, decompressing with libzstd {library}\n", env!("CARGO_PKG_VERSION")));
+            return say(io, &format!("zstd of Skyward {}, decompressing with libzstd {library}\n", skyward_info::VERSION));
         }
         Ok(Asked::Help) => return say(io, HELP),
         Err(e) => {

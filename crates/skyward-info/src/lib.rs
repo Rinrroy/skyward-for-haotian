@@ -11,8 +11,13 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Mutex;
 
-/// Version of this build, shown on the About page.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Version of this build, shown on the About page and told to the update
+/// server: the three numbers Cargo takes, and the fork's own patch level
+/// after them, which Cargo has no room for. It is written here rather than
+/// taken from `CARGO_PKG_VERSION` for that reason, and the two are bumped
+/// together — a release is tagged `v` and this, as `v0.3.1.2`, and the next
+/// one is `0.3.1.3`.
+pub const VERSION: &str = "0.3.1.2";
 
 /// Who made this build, shown beside its version on the specs page's Recovery
 /// version card. Set at build time from `SKYWARD_BUILDER` by `build.rs`;
@@ -458,6 +463,16 @@ mod tests {
         assert!("2026-13-01".parse::<PatchLevel>().is_err());
         assert!("2026-10".parse::<PatchLevel>().is_err());
         assert!("October 2026".parse::<PatchLevel>().is_err());
+    }
+
+    #[test]
+    fn the_version_is_the_one_cargo_takes_and_the_fork_patch_level_after_it() {
+        // Cargo takes three numbers and no more, so the patch level the fork
+        // names its own releases with is written beside it; the two must not
+        // drift apart, or the build says it is one version and is another.
+        let cargo = env!("CARGO_PKG_VERSION");
+        assert!(VERSION.starts_with(cargo), "the build's version {VERSION} begins with the {cargo} Cargo takes");
+        assert!(VERSION[cargo.len()..].starts_with('.'), "the patch level follows the three numbers: {VERSION}");
     }
 
     #[test]

@@ -534,13 +534,25 @@ CI (`.github/workflows/build-haotian.yml`) builds the image **and** runs
 Clippy is `-D warnings`, so an unused import or a needless borrow fails the
 build; `cargo fmt` habits matter.
 
-A release is a tag: `git push ssh://git@github.com/Rinrroy/skyward-for-haotian.git main v0.2.2`
+A release is a tag: `git push ssh://git@github.com/Rinrroy/skyward-for-haotian.git main v0.3.1.2`
 builds the same image and publishes it, with `SHA256SUMS` beside it, as a GitHub
 release named for the tag — the artifact a branch run leaves expires after
 thirty days, a release does not. Bump `[workspace.package] version` in
 `Cargo.toml` first (and let `cargo metadata` rewrite `Cargo.lock`), and put the
 release's own notes in `docs/releases/<tag>.md`; the workflow uses that file
 when it exists and the commits since the last release when it does not.
+
+The fork's versions have **four** parts from 0.3.1.2 on: the three numbers
+Cargo takes — the upstream version the build is made on, which is what
+`[workspace.package] version` holds — and the fork's own patch level after them,
+which Cargo has no room for. The patch level is written in
+`skyward_info::VERSION` (`crates/skyward-info/src/lib.rs`), which is what the
+About page, the boot log and the update check say; it is bumped together with
+the Cargo version, and a test in that file fails if the two drift apart. The
+update check reads four-part tags too (`skyward-net/src/github.rs`), and
+compares a build only with releases named the same way, so the older three-part
+releases are never offered as an update to it — which is why `semver` is no
+longer a dependency.
 
 ## Reading this repo's history
 

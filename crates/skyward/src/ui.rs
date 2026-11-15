@@ -35,7 +35,7 @@ use skyward_net::wlan::{Power as WlanPower, Stage as Joining};
 use skyward_sys::sleep::{Sleeper, Slept};
 use skyward_sys::uevent;
 use skyward_systems::Who;
-use skyward_ui::aod::{Shown, Want};
+use skyward_ui::aod::{AodStyle, Shown, Want};
 use skyward_ui::app::{
     App, Asked, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop, FileKind, FileOp,
     FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop, Place,
@@ -1295,6 +1295,9 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
     // keeps the time on the glass with the backlight at 0.
     let mut doze = cfg.aod.as_ref().map(aod::Panel::new);
     let mut faced = String::new();
+    // The face the doze on the glass was drawn with, so that the next frame
+    // is drawn when the minute turns or the face is changed under it.
+    let mut faced_style: Option<AodStyle> = None;
     // Whether the settings page offers a switch for the panel's own doze: a
     // phone whose panel has one.
     app.state.panel_dozes = cfg.aod.is_some();
@@ -1714,17 +1717,21 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                 faced.clear();
             }
             if app.state.always_on {
-                if !blanked || faced != shown_clock {
+                // A face chosen while the panel dozes is drawn at once rather
+                // than at the next minute, so the setting shows what it did.
+                let style = app.state.aod_style;
+                if !blanked || faced != shown_clock || faced_style != Some(style) {
                     let facts = skyward_ui::aod::Facts {
                         date: skyward_ui::fmt::date(app.state.lang, unix_now()?, app.state.time_zone),
                         battery: info.battery.as_ref().map(|b| (b.level, b.plugged)),
                         slot: info.slot.map(|s| s.letter().to_string()),
                         data: skyward_ui::fmt::data(app.state.lang, &app.state.data).to_string(),
                     };
-                    skyward_ui::aod::face(&mut screen, &fonts, &shown_clock, &facts, cfg.display.density as f32 / 160.0);
+                    skyward_ui::aod::face(&mut screen, &fonts, &shown_clock, &facts, style, cfg.display.density as f32 / 160.0);
                     surface.present(&screen)?;
                     surface.settle()?;
                     faced.clone_from(&shown_clock);
+                    faced_style = Some(style);
                 }
             } else if !blanked {
                 screen.data.fill(0);

@@ -5,6 +5,7 @@
 //! a time zone, a part or a place by its name, so a later version that lists
 //! them otherwise reads them the same.
 
+use crate::aod::{AodStyle, STYLES};
 use crate::app::{Place, SortKey, State, SCREEN_OFF, TIME_ZONES};
 use crate::Lang;
 use anyhow::{Context, Result};
@@ -27,6 +28,9 @@ const USB_DRIVE: &str = "usb_drive";
 /// The orders the file manager can show a folder in, by name, in the order
 /// its page offers them.
 const SORTS: [&str; 3] = ["name", "modified", "kind"];
+/// The faces the dark panel can wear, by name, in the order the setting goes
+/// round them.
+const AOD_STYLES: [&str; STYLES.len()] = ["digits", "offset", "dial"];
 /// The logs exported, and where they go, by name, in the order of the page
 /// that exports them.
 const LOGS: [&str; 2] = ["recovery", "kernel"];
@@ -62,6 +66,10 @@ pub struct Settings {
     /// none leaves it off, which is what a freshly flashed phone starts with:
     /// the face is asked for on the settings page, not found already lit.
     pub always_on: bool,
+    /// The face the dark panel wears while it dozes, by name: digits, offset
+    /// or dial. A file that names none leaves the digits, which is the face
+    /// the recovery has always drawn.
+    pub aod_style: String,
     /// Two taps on the dark panel light it again. A file that names none
     /// leaves it off, which is what a freshly flashed phone starts with: the
     /// gesture costs the phone its suspend, since the panel has to keep
@@ -160,6 +168,12 @@ impl Settings {
             vibration: state.vibration,
             file_transfer: state.file_transfer,
             always_on: state.always_on,
+            aod_style: AOD_STYLES[match state.aod_style {
+                AodStyle::Digits => 0,
+                AodStyle::Offset => 1,
+                AodStyle::Dial => 2,
+            }]
+            .to_string(),
             double_tap: state.double_tap,
             disable_avb: state.disable_avb,
             remember_password: state.remember_password,
@@ -229,6 +243,11 @@ impl Settings {
         }
         state.file_transfer = self.file_transfer;
         state.always_on = self.always_on;
+        // A name this version does not know leaves the face as it is, as an
+        // unknown order or place does.
+        if let Some(at) = AOD_STYLES.iter().position(|name| *name == self.aod_style) {
+            state.aod_style = STYLES[at];
+        }
         state.double_tap = self.double_tap;
         state.disable_avb = self.disable_avb;
         state.remember_password = self.remember_password;
@@ -405,6 +424,7 @@ mod tests {
             vibration: 0.4,
             file_transfer: false,
             always_on: true,
+            aod_style: AodStyle::Dial,
             double_tap: true,
             check_signature: true,
             keep_recovery: false,
@@ -422,6 +442,7 @@ mod tests {
         assert_eq!(Settings::of(&back), Settings::of(&state));
         assert_eq!((back.lang, back.screen_off, back.time_zone), (Lang::En, 6, 7));
         assert!(back.always_on, "a face turned on is still on at the next start");
+        assert_eq!(back.aod_style, AodStyle::Dial, "the face chosen is the one the panel wears at the next start");
         assert!(back.double_tap, "a two-tap wake turned on is still on at the next start");
         // The value carried is the one a start does not have of itself, so
         // what comes back proves the file rather than the default. The
@@ -430,6 +451,29 @@ mod tests {
         // wake — both cost power, so both are asked for.
         assert!(!State::default().always_on, "the face on a dark panel is off until it is turned on");
         assert!(!State::default().double_tap, "the two-tap wake is off until it is turned on");
+    }
+
+    #[test]
+    fn the_face_chosen_is_kept_by_name_and_a_name_it_does_not_know_leaves_it_alone() {
+        // Each face goes through the file as the word the setting shows, not
+        // as a number the order of the list would have to stay the same for.
+        for (style, name) in STYLES.iter().zip(["digits", "offset", "dial"]) {
+            let text = Settings::of(&State { aod_style: *style, ..State::default() }).text();
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["aod_style"], name, "{style:?} is kept as its own word");
+            let mut back = State::default();
+            Settings::read(&text).unwrap().apply(&mut back);
+            assert_eq!(back.aod_style, *style, "{name} comes back as the face it names");
+        }
+        // A file naming no face takes the digits the recovery has always
+        // drawn, and one naming a face this version has not leaves the pages'
+        // as they are, as an unknown order or place does.
+        let mut back = State { aod_style: AodStyle::Offset, ..State::default() };
+        Settings::read("{}").unwrap().apply(&mut back);
+        assert_eq!(back.aod_style, AodStyle::Digits, "a file that names no face is the digits");
+        let mut back = State { aod_style: AodStyle::Offset, ..State::default() };
+        Settings::read(r#"{ "aod_style": "hologram" }"#).unwrap().apply(&mut back);
+        assert_eq!(back.aod_style, AodStyle::Offset, "a face this version has not is left out");
     }
 
     #[test]
@@ -443,6 +487,7 @@ mod tests {
         assert_eq!(json["logs"]["to"], "temporary");
         assert_eq!(json["spoken"], "zh-Hans");
         assert_eq!(json["always_on"], false, "the face on a dark panel is off until it is turned on");
+        assert_eq!(json["aod_style"], "digits", "the face is the digits until the setting goes round them");
         assert_eq!(json["double_tap"], false, "the two-tap wake is off until it is turned on");
         assert!(json.get("language").is_none(), "no language is chosen until one is");
         let never = Settings::of(&State { screen_off: SCREEN_OFF.len() - 1, ..State::default() });

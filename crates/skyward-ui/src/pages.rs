@@ -110,7 +110,6 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::WlanPassword => wlan_password(cx),
         Screen::WlanNetwork => wlan_network(cx),
         Screen::WlanAdd => wlan_add(cx),
-        Screen::PowerOff => power_off(cx),
         Screen::Vbmeta => vbmeta(cx),
     }
 }
@@ -145,7 +144,6 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
         Confirm::VbmetaRestore => (["滑动以写回备份", "滑動以寫回備份", "Slide to write the copy back"], true),
         Confirm::ForgetNetwork => (["滑动以忘记网络", "滑動以忘記網路", "Slide to forget the network"], true),
         Confirm::DeleteDownload => (["滑动以删除安装包", "滑動以刪除安裝檔", "Slide to delete the package"], true),
-        Confirm::PowerOff => (["滑动以关机", "滑動以關機", "Slide to power off"], false),
     };
     (s.lang.pick(label), danger)
 }
@@ -341,24 +339,20 @@ pub fn home(cx: &Ctx) -> Frame {
     ]));
     y = tools.bottom + t.m.card_gap;
     let target = l.pick(REBOOT_TARGETS[cx.state.reboot].0);
-    // Turning the phone off sits beside restarting it: the two ways of
-    // leaving the recovery, one of which brings it back by itself. A phone
-    // is put off from its own page, which says what that means, rather than
-    // by a swipe on the restart page that only names it as one destination
-    // among six.
+    // Turning the phone off is one of the destinations the restart page's
+    // swipe offers, so it is not a page of its own: the home page keeps the
+    // pages a phone is worked with, and the one row that leaves.
     let system = widgets::list(&mut c, t, f, y, &[
         Row::new(l.pick(["清除数据", "清除資料", "Wipe data"])).icon(RED, Icon::Wipe),
         Row::new(l.pick(ADVANCED)).icon(SLATE, Icon::More),
         Row::new(l.pick(SETTINGS)).icon(SLATE, Icon::Gear),
         Row::new(l.pick(REBOOT)).icon(ORANGE, Icon::Power).trail(Trail::Value(target)),
-        Row::new(l.pick(POWER_OFF)).icon(SLATE, Icon::Power),
     ]);
     out.extend(hits(&system.rows, &[
         Action::Open(Screen::Wipe),
         Action::Open(Screen::Advanced),
         Action::Open(Screen::Settings),
         Action::Open(Screen::Reboot),
-        Action::Open(Screen::PowerOff),
     ]));
     // However little it holds, the page scrolls far enough to fold its bar
     // away.
@@ -427,8 +421,13 @@ pub fn settings(cx: &Ctx) -> Frame {
     if s.panel_dozes {
         y = widgets::section(&mut c, t, f, y, l.pick(["息屏显示", "螢幕關閉顯示", "Always-on display"]));
         let on = Row::new(l.pick(ALWAYS_ON)).switch(s.always_on);
-        let aod = widgets::list(&mut c, t, f, y, &[on]);
-        out.extend(hits(&aod.rows, &[Action::Toggle(Switch::AlwaysOn)]));
+        // The face the panel wears while it dozes, which the row goes round:
+        // the digits the recovery has always drawn, the hour and the minute
+        // set askew, and a clock face. It shows whether the face is on or not,
+        // so that the one chosen is there to be seen before it is turned on.
+        let style = Row::new(l.pick(["息屏时钟", "息屏時鐘", "Clock style"])).trail(Trail::Value(s.aod_style.name(l)));
+        let aod = widgets::list(&mut c, t, f, y, &[on, style]);
+        out.extend(hits(&aod.rows, &[Action::Toggle(Switch::AlwaysOn), Action::AodStyle]));
         let note = l.pick([
             "屏幕熄灭后仍显示时间、电量、槽位与解密状态，背光保持关闭。",
             "螢幕關閉後仍顯示時間、電量、槽位與解密狀態，背光保持關閉。",
@@ -4599,45 +4598,6 @@ pub fn unhandled(cx: &Ctx) -> Frame {
     afterwards(&mut c, t, f, l, y, true, &mut out);
     Frame { back: false, ..Frame::new(t, c, out, l.pick(["无法处理该请求", "無法處理這項要求", "Can't handle the request"]), top) }
 }
-
-/// Turning the phone off: what it means, and the swipe that does it. Its
-/// own page rather than one line of the reboot page's list, because a phone
-/// put off is not coming back until someone presses the key again, and
-/// because what happens to work under way deserves saying.
-pub fn power_off(cx: &Ctx) -> Frame {
-    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
-    let mut c = long_page(cx);
-    let mut out = Vec::new();
-    let top = t.m.content_top;
-    let x = t.m.w as f32 / 2.0;
-    let sign_cy = t.m.dp(120.0);
-    c.fill_circle(x, sign_cy, t.m.dp(30.0), t.pal.card);
-    icons::glyph(&mut c, Icon::Power, x, sign_cy, t.m.dp(40.0), t.pal.accent);
-    c.text_center(&f.heading, l.pick(POWER_OFF), x, sign_cy + t.m.dp(64.0), t.m.dp(24.0), t.pal.text);
-    c.text_center(
-        &f.body,
-        l.pick(["手机将完全关闭，按电源键可再次开机。", "手機將完全關閉，按電源鍵可再次開機。", "The phone turns off completely. Press the power key to turn it on again."]),
-        x,
-        sign_cy + t.m.dp(96.0),
-        t.m.sub_px,
-        t.pal.subtitle,
-    );
-    let mut y = sign_cy + t.m.dp(150.0);
-    // Work that would be cut short is named before the swipe, rather than
-    // discovered afterwards.
-    let running = l.pick([
-        "正在进行的安装、备份或写入会被中断，并可能留下未完成的分区。",
-        "正在進行的安裝、備份或寫入會被中斷，並可能留下未完成的分割區。",
-        "An install, backup or write under way is cut off, and may leave a partition half-written.",
-    ]);
-    y = widgets::footnote(&mut c, t, f, y, running);
-    let (label, danger) = confirm_label(Confirm::PowerOff, s);
-    let track = widgets::confirm(&mut c, t, f, y + t.m.dp(28.0), label, danger, s.confirm);
-    out.push(Hit { rect: track, action: Action::Confirm(Confirm::PowerOff) });
-    Frame::new(t, fit(c, t, track.y + track.h), out, l.pick(POWER_OFF), top)
-}
-
-const POWER_OFF: Text = ["关机", "關機", "Power off"];
 
 /// The slot's vbmeta image: what it is, the copies kept of it, making one,
 /// and putting one back. A copy older than the phone's rollback index is
