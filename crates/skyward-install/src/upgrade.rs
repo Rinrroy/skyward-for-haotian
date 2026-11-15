@@ -56,7 +56,7 @@ pub fn slots(dir: &Path, next: Slot) -> Result<Vec<Slot>> {
         let path = image::device(dir, PARTITION, slot);
         let mut file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
         image::drop_cache(&file).with_context(|| format!("drop the cached pages of {}", path.display()))?;
-        if slot == next || image::is_skyward(&mut file).with_context(|| format!("look into {}", path.display()))? {
+        if slot == next || image::is_skyward_at(&mut file, &path)? {
             slots.push(slot);
         }
     }
@@ -73,7 +73,7 @@ pub fn write(dir: &Path, image: &[u8], slots: &[Slot], progress: &mut dyn FnMut(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image::samples::{recovery, skyward_for};
+    use crate::image::samples::{boot_image, recovery, skyward_for};
     use std::io::Write;
 
     /// A zip of `entries`, each a name and what it holds.
@@ -135,6 +135,20 @@ mod tests {
         assert_eq!(slots(partitions(&skyward, &skyward, size).path(), Slot::A).unwrap(), [Slot::A, Slot::B], "an older build in the other slot");
         assert_eq!(slots(partitions(&stock, &skyward, size).path(), Slot::A).unwrap(), [Slot::A, Slot::B], "Skyward started without being flashed");
         assert_eq!(slots(partitions(&stock, &stock, size).path(), Slot::B).unwrap(), [Slot::B]);
+    }
+
+    /// A recovery image whose ramdisk cannot be read, as a stock recovery
+    /// packed another way is: a legacy LZ4 stream whose first block says it
+    /// unpacks to more than a block of that framing does.
+    fn unreadable() -> Vec<u8> {
+        boot_image(0, &[0x02, 0x21, 0x4c, 0x18, 0x00, 0x00, 0x00, 0x08])
+    }
+
+    #[test]
+    fn an_image_this_build_cannot_read_is_no_reason_to_stop_the_build_going_in() {
+        let skyward = skyward_for("ishtar");
+        assert_eq!(slots(partitions(&skyward, &unreadable(), 1 << 20).path(), Slot::A).unwrap(), [Slot::A], "the slot that starts next, and an unreadable image taken for one that is not Skyward");
+        assert_eq!(slots(partitions(&skyward, &unreadable(), 1 << 20).path(), Slot::B).unwrap(), [Slot::A, Slot::B], "the slot that starts next is written whatever it holds");
     }
 
     #[test]

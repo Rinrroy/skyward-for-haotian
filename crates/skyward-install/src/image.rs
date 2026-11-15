@@ -195,6 +195,21 @@ pub fn is_skyward<R: Read + Seek>(file: &mut R) -> Result<bool> {
     Ok(device_config(file)?.is_some())
 }
 
+/// Whether `file`, the image at `path`, is a Skyward recovery, taking one
+/// this build cannot read for one that is not and saying in the log what it
+/// started with: a stock recovery, or any recovery packed another way, is a
+/// thing a phone may well hold in a slot, and what is done with one is
+/// nothing, so it is no reason to stop what was asked for.
+pub fn is_skyward_at<R: Read + Seek>(file: &mut R, path: &Path) -> Result<bool> {
+    Ok(match is_skyward(file) {
+        Ok(skyward) => skyward,
+        Err(error) => {
+            let _ = kmsg(&format!("install: {} holds an image this build cannot read, so it is not taken for Skyward: {error:#}", path.display()));
+            false
+        }
+    })
+}
+
 /// The device configuration a Skyward recovery carries in its ramdisk;
 /// none when `file` is no Skyward recovery.
 pub fn device_config<R: Read + Seek>(file: &mut R) -> Result<Option<Vec<u8>>> {

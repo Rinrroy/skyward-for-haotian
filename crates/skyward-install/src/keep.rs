@@ -5,7 +5,6 @@
 use crate::image;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use skyward_sys::kmsg;
 use skyward_vab::Slot;
 use std::fs::File;
 use std::io::{Cursor, Read};
@@ -72,13 +71,7 @@ fn read(path: &Path) -> Result<(Held, Vec<u8>)> {
     image::drop_cache(&file).with_context(|| format!("drop the cached pages of {}", path.display()))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).with_context(|| format!("read {}", path.display()))?;
-    let skyward = match image::is_skyward(&mut Cursor::new(&bytes)) {
-        Ok(skyward) => skyward,
-        Err(error) => {
-            let _ = kmsg(&format!("install: {} holds an image this build cannot read, so it is not taken for Skyward: {error:#}", path.display()));
-            false
-        }
-    };
+    let skyward = image::is_skyward_at(&mut Cursor::new(&bytes), path)?;
     Ok((Held { digest: Sha256::digest(&bytes).into(), skyward }, bytes))
 }
 
