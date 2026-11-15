@@ -1408,7 +1408,15 @@ fn entities(text: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        let Some(end) = rest[..rest.len().min(34)].find(';') else {
+        // An entity name is short, so the search for its `;` stops after a
+        // few dozen bytes. That limit has to fall on a character the text
+        // can be cut at: a page whose byte 34 is inside a Chinese character
+        // took the whole recovery down when it was cut there.
+        let mut window = rest.len().min(34);
+        while window > 0 && !rest.is_char_boundary(window) {
+            window -= 1;
+        }
+        let Some(end) = rest[..window].find(';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -1733,6 +1741,17 @@ mod tests {
     #[test]
     fn entities_become_their_characters() {
         assert_eq!(entities("a&amp;b &#65; &#x4e2d; &unknown;"), "a&b A 中 &unknown;");
+    }
+
+    #[test]
+    fn an_ampersand_before_chinese_text_does_not_cut_a_character() {
+        // A page wrote an `&` and then Chinese text, so the thirty-fourth
+        // byte of what followed fell inside a character: the reader stopped
+        // the recovery when it cut the text there to look for a `;`.
+        let text = "&【中文】";
+        assert_eq!(entities(text), text);
+        let long = format!("&{}", "中".repeat(40));
+        assert_eq!(entities(&long), long);
     }
 
     fn serve(content_type: &str, body: &[u8]) -> String {

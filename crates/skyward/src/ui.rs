@@ -2546,6 +2546,9 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                         // it is still the one the gestures go to and the one
                         // drawing the page while it moves.
                         app.browser_plugin_shot(shot);
+                        // The frame is now the screen's to draw, so the next
+                        // one may be asked for: only one is ever on its way.
+                        browser::frame_shown();
                     }
                     browser::Event::Focus(focus) => {
                         app.browser_plugin_focus(focus);

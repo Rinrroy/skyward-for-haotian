@@ -281,6 +281,18 @@ fn poke() {
     ASK.store(true, Ordering::Relaxed);
 }
 
+/// Whether the screen has drawn the last frame it was given. Only one frame is
+/// ever on its way: a second one asked for while the first is still being
+/// turned into pixels would be drawn behind it, and the screen — which also
+/// reads the finger — would spend the whole time decoding frames it is about
+/// to replace.
+static SHOWN: AtomicBool = AtomicBool::new(true);
+
+/// Said by the screen once it has drawn the frame it was given.
+pub fn frame_shown() {
+    SHOWN.store(true, Ordering::Relaxed);
+}
+
 /// Whether the frame differs from the one before it: one that stands still is
 /// drawn again rarely, one that moves is drawn as fast as it comes.
 fn drew_again(png: &[u8]) -> bool {
@@ -318,6 +330,12 @@ fn start_pump(alerts: Arc<Alerts>) {
                 thread::sleep(Duration::from_millis(20));
                 continue;
             }
+            // The frame before this one has not been drawn yet: it is still
+            // being asked for, and its replacement would wait behind it.
+            if !SHOWN.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
             let png = match cdp.screenshot() {
                 Ok(png) => png,
                 // A page that stops answering is let go rather than drawn as it
@@ -326,6 +344,7 @@ fn start_pump(alerts: Arc<Alerts>) {
             };
             drew = Instant::now();
             if drew_again(&png) {
+                SHOWN.store(false, Ordering::Relaxed);
                 alerts.tell(Event::Shot(Ok(png)));
             }
         }

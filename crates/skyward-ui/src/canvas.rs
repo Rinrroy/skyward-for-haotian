@@ -343,7 +343,14 @@ impl Canvas {
             let dst = &mut self.data[start..start + src.len()];
             if src.as_chunks::<4>().0.iter().fold(255, |all, s| all & s[3]) == 255 {
                 // Where the layer is opaque, each pixel mixes at the same
-                // strength.
+                // strength. At full strength there is nothing to mix: the
+                // page a browser draws is copied whole, which is the one
+                // case where a frame of it costs a copy rather than a mix
+                // over two million pixels.
+                if strength >= 256 {
+                    dst.copy_from_slice(src);
+                    continue;
+                }
                 for (s, d) in src.as_chunks::<4>().0.iter().zip(dst.as_chunks_mut::<4>().0) {
                     *d = mix(*d, *s, strength);
                 }
