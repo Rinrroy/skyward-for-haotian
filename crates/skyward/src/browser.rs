@@ -39,10 +39,9 @@ pub enum Task {
     FullStart { dir: PathBuf, url: String, view: (u32, u32) },
     /// Touch the page where the frame was touched, in thousandths of it.
     FullTap { x: u16, y: u16 },
-    /// Scroll the page under the frame: `dy` thousandths of the frame's
-    /// height, and `speed` in CSS pixels a second, which is what a flick
-    /// keeps gliding at.
-    FullScroll { dy: i32, speed: i32 },
+    /// Scroll the page under the frame by `dy` thousandths of the frame's
+    /// height: positive moves the page up under the finger, as a drag does.
+    FullScroll { dy: i32 },
     FullPinch { scale: f64 },
     FullText { text: String },
     FullReload,
@@ -576,25 +575,11 @@ impl Worker {
                         }
                     }
                     Task::FullTap { x, y } => full_after(&tell, |cdp| cdp.tap(x as u32, y as u32)),
-                    Task::FullScroll { dy, speed } => full_do(&tell, |cdp| {
-                        if dy != 0 {
-                            cdp.scroll(dy)?;
-                        }
-                        // The finger lifted - or stopped moving, which lifts it
-                        // too: the page is let go of where it is, going the way
-                        // it was going.
-                        if dy == 0 || speed != 0 {
-                            cdp.drag_end(speed)?;
-                        }
-                        Ok(())
-                    }),
+                    Task::FullScroll { dy } => full_do(&tell, |cdp| cdp.scroll(dy)),
                     Task::FullPinch { scale } => full_do(&tell, |cdp| cdp.pinch(scale)),
                     Task::FullText { text } => full_after(&tell, |cdp| cdp.insert_text(&text)),
                     Task::FullReload => full_do(&tell, |cdp| cdp.reload()),
                     Task::FullStop => {
-                        // A finger still down from a drag is lifted, so the
-                        // next page does not open with one held on it.
-                        let _ = with_page(|cdp| cdp.drag_end(0));
                         // The browser is stopped before the thread drawing it,
                         // so that a frame waiting on it comes back at once.
                         stop_full();
@@ -618,8 +603,8 @@ impl Worker {
                     // the moves it has passed are added to that one.
                     while let Ok(newer) = queue.try_recv() {
                         let merged = match (&task, &newer) {
-                            (Task::FullScroll { dy: passed, speed: 0 }, Task::FullScroll { dy: now, speed }) => {
-                                Some(Task::FullScroll { dy: passed.saturating_add(*now), speed: *speed })
+                            (Task::FullScroll { dy: passed }, Task::FullScroll { dy: now }) => {
+                                Some(Task::FullScroll { dy: passed.saturating_add(*now) })
                             }
                             _ => None,
                         };

@@ -3554,9 +3554,9 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                             Err(e) => app.browser_plugin_shot(Err(format!("{e:#}"))),
                         },
                     },
-                    Effect::BrowserPluginScroll { dy, speed } => match &reader {
-                        Some(worker) => worker.tell(browser::Task::FullScroll { dy, speed }),
-                        None => match browser::Worker::start(browser::Task::FullScroll { dy, speed }, servers.clone()) {
+                    Effect::BrowserPluginScroll { dy } => match &reader {
+                        Some(worker) => worker.tell(browser::Task::FullScroll { dy }),
+                        None => match browser::Worker::start(browser::Task::FullScroll { dy }, servers.clone()) {
                             Ok(worker) => reader = Some(worker),
                             Err(e) => app.browser_plugin_shot(Err(format!("{e:#}"))),
                         },

@@ -3144,9 +3144,9 @@ pub enum Effect {
     BrowserPluginStart { dir: String, url: String, view: (u32, u32) },
     /// Tap the persistent full-mode page.
     BrowserPluginTap { x: u16, y: u16 },
-    /// Scroll the persistent full-mode page: `dy` thousandths of the frame's
-    /// height, at `speed` CSS pixels a second once the finger is gone.
-    BrowserPluginScroll { dy: i32, speed: i32 },
+    /// Scroll the persistent full-mode page by `dy` thousandths of the frame's
+    /// height, positive moving the page up under the finger as a drag does.
+    BrowserPluginScroll { dy: i32 },
     /// Pinch the persistent full-mode page.
     BrowserPluginPinch { scale: f64 },
     /// Type into the focused field of the persistent full-mode page.
@@ -9347,7 +9347,7 @@ impl App {
                     // screen stays a frame of the same page.
                     let dy = ((last - y) / high * 1000.0).round();
                     if dy != 0.0 {
-                        fx.push(Effect::BrowserPluginScroll { dy: dy as i32, speed: 0 });
+                        fx.push(Effect::BrowserPluginScroll { dy: dy as i32 });
                     }
                     self.drag = Drag::Picture { last: y };
                 }
@@ -9445,14 +9445,11 @@ impl App {
                     }
                 }
                 Drag::Picture { .. } => {
-                    // The finger is lifted even when it stopped moving: a
-                    // touch left down on the page would keep it pressed and
-                    // take the next tap for a second finger. Lifted while the
-                    // page was still moving, it keeps gliding at the speed the
-                    // finger left it at, in the page's own measure - CSS
-                    // pixels a second.
-                    let speed = -self.tracker.velocity(now) / self.px_per_dp * 160.0 / 2.0;
-                    fx.push(Effect::BrowserPluginScroll { dy: 0, speed: speed.round() as i32 });
+                    // Nothing is thrown when the finger lifts: the page stays
+                    // where the finger left it. What a page does with a throw
+                    // is the page's own business - one throws itself half a
+                    // document on - and a page that keeps running after the
+                    // finger has gone is the opposite of following it.
                 }
                 Drag::Edge { armed: true, .. } => fx.extend(self.finish_edge(true, now)),
                 Drag::Edge { start, from_left, x, cy, .. } => {

@@ -19,11 +19,22 @@ const CSS_W: f64 = 412.0;
 /// a phone viewport at three device pixels to the CSS one.
 const FALLBACK_CSS_H: f64 = 915.0;
 const FALLBACK_SCALE: f64 = 3.0;
-/// How much of the distance a gesture asks for the page actually moves, which
-/// was measured at a little over half: a touch that goes down, moves and comes
-/// up settles short of where it was taken. The recovery asks for the distance
-/// its finger went, so the distance the page is asked for is this much larger.
-const GAIN: f64 = 0.42;
+/// A move of a drag is given up on after this long: a page busy running a
+/// script of its own would otherwise hold every move of the drag behind it.
+const SCROLL_WITHIN: Duration = Duration::from_millis(600);
+/// Move what is under the middle of the frame by `__PX__` CSS pixels: the
+/// nearest thing that can scroll, or the page itself when nothing between the
+/// finger and the page can.
+const SCROLL: &str = "(()=>{\
+const px=__PX__;\
+const cx=Math.round(innerWidth/2),cy=Math.round(innerHeight/2);\
+let e=document.elementFromPoint(cx,cy);\
+while(e&&e!==document.body&&e!==document.documentElement){\
+const s=getComputedStyle(e);\
+if(e.scrollHeight-e.clientHeight>2&&/(auto|scroll|overlay)/.test(s.overflowY)){e.scrollTop+=px;return 1}\
+e=e.parentElement}\
+const d=document.scrollingElement||document.documentElement;\
+d.scrollTop+=px;return 1})()";
 
 pub struct Cdp {
     stream: TcpStream,
@@ -174,62 +185,32 @@ impl Cdp {
         self.touch(px.round() as u32, py.round() as u32)
     }
 
-    /// Scroll the page itself, `dy` being thousandths of the frame's height
-    /// and positive meaning the page moves up under the finger, as a drag
-    /// does.
+    /// Scroll the page under the finger by `dy` thousandths of the frame's
+    /// height, moving whatever is under the middle of the frame: the page
+    /// itself, or the scrollable box the page puts there.
     ///
-    /// Each move is a whole gesture of its own — a finger down, taken along
-    /// the frame, and lifted — because that is what moves this page: a page
-    /// answers a synthesized scroll gesture only once it has carried the whole
-    /// gesture out, which took most of a second, and a finger held down across
-    /// several moves either did nothing or took the page back. One gesture
-    /// costs a little over forty milliseconds, which is fast enough for the
-    /// moves a finger makes.
+    /// This is asked of the page rather than done with a synthesized gesture
+    /// because nothing else moved this page where the finger went: a
+    /// synthesized scroll gesture answered only after the whole gesture had
+    /// been carried out and then scrolled nothing, a wheel event scrolled
+    /// nothing at all, and a touch from down to up scrolled about half of what
+    /// it was asked for — and, being a touch, it left the page thrown on by
+    /// its own momentum when the finger lifted. A page told where to go goes
+    /// exactly there, at once, and stays.
     pub fn scroll(&mut self, dy: i32) -> Result<()> {
-        // The page follows the finger: it goes up the frame by the distance
-        // the page is to move down.
-        let want = f64::from(dy) * self.view.1 / 1000.0;
-        self.gesture(-want / GAIN)
-    }
-
-    /// Let the page go where it was thrown, at `speed` CSS pixels a second in
-    /// the same direction as `dy`: the flick a finger makes when it lifts
-    /// while still moving.
-    pub fn drag_end(&mut self, speed: i32) -> Result<()> {
-        if speed == 0 {
+        let px = (f64::from(dy) * self.view.1 / 1000.0).round();
+        if px == 0.0 {
             return Ok(());
         }
-        // A quarter of a second of the finger's speed is where the page comes
-        // to rest, which is a throw rather than a jump.
-        self.gesture(-f64::from(speed) * 0.25 / GAIN)
-    }
-
-    /// Take a finger `ask` CSS pixels down the frame — up it, when `ask` is
-    /// negative — as one whole gesture: down, moved, up.
-    fn gesture(&mut self, ask: f64) -> Result<()> {
-        let (w, h) = self.view;
-        if ask.abs() < 1.0 {
-            return Ok(());
-        }
-        let x = (w / 2.0).round();
-        let (low, high) = (24.0, (h - 24.0).max(24.0));
-        // The finger goes down where the drag will take it from, so that the
-        // whole of the move is still on the frame.
-        let mut at = (h / 2.0 - ask / 2.0).clamp(low, high);
-        let mut to = at + ask;
-        if to < low || to > high {
-            // A move longer than the frame takes the finger off it: it is put
-            // down at one end and the page takes the whole of the frame.
-            at = if ask > 0.0 { low } else { high };
-            to = if ask > 0.0 { high } else { low };
-        }
-        // Each event is waited for, and that spacing is what keeps the page
-        // from taking the move for a throw: sent within a millisecond of each
-        // other, three events read as an enormously fast flick and the page
-        // went the whole length of the document.
-        self.call("Input.dispatchTouchEvent", json!({"type": "touchStart", "touchPoints": [{"x": x, "y": at, "id": 1}]}))?;
-        self.call("Input.dispatchTouchEvent", json!({"type": "touchMove", "touchPoints": [{"x": x, "y": to, "id": 1}]}))?;
-        self.call("Input.dispatchTouchEvent", json!({"type": "touchEnd", "touchPoints": []}))?;
+        let code = SCROLL.replace("__PX__", &format!("{px}"));
+        // A page busy running a script of its own holds this call up for as
+        // long as that script runs, so the move is given up on rather than
+        // waited for: the next move of the drag brings the page down anyway.
+        self.call_within(
+            "Runtime.evaluate",
+            json!({"expression": code, "returnByValue": true}),
+            SCROLL_WITHIN,
+        )?;
         Ok(())
     }
 
@@ -279,7 +260,11 @@ impl Cdp {
             "Page.captureScreenshot",
             json!({
                 "format": "jpeg",
-                "quality": 70,
+                "quality": 60,
+                // The frame is a picture of a page being dragged: encoding it
+                // for size rather than for speed is what made a drag feel like
+                // it was answered a moment late.
+                "optimizeForSpeed": true,
                 "fromSurface": true,
                 "clip": {
                     "x": 0.0,
