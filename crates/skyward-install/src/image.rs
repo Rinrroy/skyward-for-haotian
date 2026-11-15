@@ -213,12 +213,24 @@ pub fn device_config<R: Read + Seek>(file: &mut R) -> Result<Option<Vec<u8>>> {
     if ![LZ4_LEGACY, LZ4_FRAME, GZIP, NEWC].iter().any(|magic| start.starts_with(magic)) {
         return Ok(None);
     }
+    let mut first = [0u8; 8];
+    first[..start.len().min(8)].copy_from_slice(&start[..start.len().min(8)]);
+    let (at, size) = (header.ramdisk_position(), header.ramdisk_size());
     let read = |entry: &mut dyn Read| {
         let mut config = Vec::new();
         entry.read_to_end(&mut config).context("read the device configuration")?;
         Ok(config)
     };
-    find(ramdisk, |name| name == skyward_config::ramdisk::CONFIG, read).context("read the ramdisk")
+    match find(ramdisk, |name| name == skyward_config::ramdisk::CONFIG, read) {
+        Ok(config) => Ok(config),
+        Err(error) => {
+            // The phone's own log is where the reason a stock recovery on the
+            // other slot is not read can be found afterwards, with what the
+            // ramdisk it was packed in started with.
+            let _ = kmsg(&format!("install: the ramdisk at {at} of {size} bytes, a version {} header, starts {first:02x?} and cannot be read: {error:#}", header.header_version()));
+            Err(error).context("read the ramdisk")
+        }
+    }
 }
 
 /// The partition `name` of `slot` among the links in `dir`.
