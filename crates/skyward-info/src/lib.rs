@@ -17,7 +17,7 @@ use std::sync::Mutex;
 /// taken from `CARGO_PKG_VERSION` for that reason, and the two are bumped
 /// together — a release is tagged `v` and this, as `v0.3.1.2`, and the next
 /// one is `0.3.1.3`.
-pub const VERSION: &str = "0.5.1.2";
+pub const VERSION: &str = "0.5.1.3";
 
 /// Who made this build, shown beside its version on the specs page's Recovery
 /// version card. Set at build time from `SKYWARD_BUILDER` by `build.rs`;
