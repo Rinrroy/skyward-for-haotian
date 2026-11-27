@@ -163,6 +163,46 @@ pub fn libraries() -> Result<Option<PathBuf>> {
     Ok(bundle(&format!("com.android.vndk.v{version}"))?.map(|at| at.join(BUNDLE_LIBS)))
 }
 
+/// The libraries the phone's own programs link against that only the system
+/// they run on carries: the vendor interface support a vendor program opens
+/// them through, and the bionic one the linker keeps its own state in. The
+/// bundle of the vendor interface is opened from the system too, before any of
+/// them starts, and a recovery does not. Without them every one of the
+/// phone's hardware services ends as soon as it starts, keymint's among
+/// them, and the data partition stays closed for want of it.
+const SYSTEM_LIBRARIES: [&str; 2] = ["libvndksupport.so", "libdl_android.so"];
+
+/// Where the recovery's own programs load their libraries from.
+const RECOVERY_LIBRARY_DIR: &str = "/system/lib64";
+
+/// Copy the libraries `SYSTEM_LIBRARIES` names from the installed system
+/// into the folder the recovery's own programs load from, so the phone's
+/// hardware services can be loaded at all.
+pub fn provide_system_libraries() -> Result<usize> {
+    let into = Path::new(RECOVERY_LIBRARY_DIR);
+    // The system is mounted at /mnt/system; its libraries are where its own
+    // linker looks, and the bionic ones sit beside its bootstrap copy.
+    let dirs = [Path::new("/mnt/system/system/lib64"), Path::new("/mnt/system/system/lib64/bootstrap")];
+    let mut copied = 0;
+    for name in SYSTEM_LIBRARIES {
+        let to = into.join(name);
+        if to.exists() {
+            // A library an earlier run of the recovery put there is as good
+            // as the one on the system, which does not change under it.
+            continue;
+        }
+        let Some(from) = dirs.iter().map(|d| d.join(name)).find(|p| p.is_file()) else { continue };
+        // Copied beside where it goes and renamed into place, so a program
+        // starting at the same moment never reads half a library.
+        let mut part = to.clone().into_os_string();
+        part.push(".part");
+        fs::copy(&from, &part).with_context(|| format!("copy {} to {}", from.display(), Path::new(&part).display()))?;
+        fs::rename(&part, &to).with_context(|| format!("put {} in place", to.display()))?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
 /// Open the bundle of this name where it lies, and give where it is. A
 /// bundle the phone does not carry gives nothing; one already open is left
 /// as it is.

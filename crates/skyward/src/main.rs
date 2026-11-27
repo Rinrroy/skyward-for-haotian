@@ -625,6 +625,14 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     if let Some(dir) = &libraries {
         skyward_sys::kmsg(&format!("the phone's own libraries are at {}", dir.display()))?;
     }
+    // The phone's hardware services are built against the installed system's
+    // bionic, which a recovery's own library folder leaves out. Without the
+    // two it is missing, every one of them ends as soon as it starts.
+    match secure::provide_system_libraries() {
+        Ok(0) => {}
+        Ok(copied) => skyward_sys::kmsg(&format!("{copied} libraries of the installed system are in place for its services"))?,
+        Err(e) => skyward_sys::kmsg(&format!("the installed system's libraries are not in place: {e:#}"))?,
+    }
     services::start(&services, libraries.as_deref())?;
     let steps = found.context("make out from the phone's partitions how its keys are used")?;
     for line in keys::describe(&steps) {

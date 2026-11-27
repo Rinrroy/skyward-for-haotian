@@ -601,6 +601,33 @@ pub enum Effect {
     Merge,
 }
 
+/// Where a finger came down on the glass, in screen pixels: kept to compare
+/// the next tap of a possible double tap with.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Tap {
+    x: f32,
+    y: f32,
+}
+
+impl Tap {
+    /// How long after a tap another may come and still be the second of a
+    /// double tap: Android's own window.
+    const WINDOW_MS: u64 = 300;
+    /// How far apart two taps of one double tap may land, as a share of the
+    /// screen's width: the slop the phone's own system uses. A tap is in
+    /// screen pixels, so this is measured against the width the pages are
+    /// laid out in.
+    const SLOP: f32 = 0.08;
+
+    /// Whether `other` lands near enough to be the second tap of one double
+    /// tap started by this, on a screen `w` pixels wide.
+    fn doubles(&self, other: &Tap, w: f32) -> bool {
+        let slop = Self::SLOP * w;
+        (other.x - self.x).abs() <= slop && (other.y - self.y).abs() <= slop
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Drag {
     Idle,
     /// Finger down and not yet past the touch slop. `edge` is set when the
@@ -1151,6 +1178,9 @@ pub struct App {
     /// When the panel last lit from dark, for the brief guard that keeps a
     /// stray touch or key from acting on a page just put up.
     woke_at: Option<u64>,
+    /// The first tap of a possible double tap on the dark panel, and when it
+    /// landed, for the two-tap wake to compare the next one with.
+    tapped: Option<(Tap, u64)>,
     /// The panel at full brightness, or easing to the dim level it takes
     /// shortly before going off.
     bright: Fade,
@@ -1246,6 +1276,7 @@ impl App {
             display_on: true,
             active: None,
             woke_at: None,
+            tapped: None,
             bright: full_brightness(),
             curtain: Fade::shown(BRIGHTEN, DARKEN),
             darkening: None,

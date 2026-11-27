@@ -314,7 +314,28 @@ impl App {
             }
             None => {
                 self.layer = None;
-                self.paint_page(out, &t, Some((f, info)), &view);
+                // A swipe in from an edge pulls the page under the page shown
+                // in from that edge as the finger goes, and carries the page
+                // shown out behind it: what the finger lets go to is already
+                // on the glass, as the system's own predictive back shows it.
+                let pulled = match self.drag {
+                    Drag::Edge { start, from_left: true, x, .. } => Some((x - start).max(0.0).round() as i32),
+                    _ => None,
+                };
+                match (pulled, self.backdrop.take()) {
+                    (Some(at), Some(backdrop)) if at > 0 && self.stack.len() > 1 => {
+                        let along = (at as f32 / self.w as f32).clamp(0.0, 1.0);
+                        let mut page = Canvas::new(out.w, out.h);
+                        self.paint_page(&mut page, &t, Some((f, info)), &view);
+                        let shift = (BEHIND_SHIFT * self.w as f32 * (1.0 - along)).round() as i32;
+                        out.slide(&page, &backdrop, at, shift, BEHIND_DIM * (1.0 - along), self.corners);
+                        self.backdrop = Some(backdrop);
+                    }
+                    (_, backdrop) => {
+                        self.backdrop = backdrop;
+                        self.paint_page(out, &t, Some((f, info)), &view);
+                    }
+                }
             }
         }
         self.shown = Some(view);

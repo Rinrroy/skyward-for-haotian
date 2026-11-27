@@ -5,9 +5,17 @@ use super::*;
 
 impl App {
     pub fn touch(&mut self, ev: Touch, f: &Fonts, now: u64) -> Vec<Effect> {
-        // A finger on the dark panel lights nothing, as on the phone's own
-        // system, where the power key lights it.
+        // A finger on the dark panel lights nothing by itself, as on the
+        // phone's own system, where the power key lights it - except that a
+        // second tap where the first one landed lights it, which is that
+        // system's own double tap. Neither tap works anything on the page.
         if !self.display_on {
+            if let Touch::Down(x, y) = ev
+                && self.state.panel_taps
+                && self.state.double_tap
+            {
+                self.tap(now, x, y);
+            }
             return Vec::new();
         }
         // A finger on the charging screen sends it away for the page, and

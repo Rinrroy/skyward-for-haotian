@@ -36,7 +36,22 @@ impl App {
             self.curtain.set(true, now);
         }
         self.woke_at = Some(now);
+        self.tapped = None;
         self.stir(now);
+    }
+
+    /// A finger came down on the dark panel: the second of two taps that land
+    /// near each other, soon enough, lights it, as the phone's own double tap
+    /// does. One that comes later than the window is a tap of its own and
+    /// starts the count again.
+    pub(super) fn tap(&mut self, now: u64, x: f32, y: f32) {
+        let tap = Tap { x, y };
+        let doubled =
+            self.tapped.filter(|(first, at)| now.saturating_sub(*at) <= Tap::WINDOW_MS && first.doubles(&tap, self.w as f32));
+        match doubled {
+            Some(_) => self.wake(now),
+            None => self.tapped = Some((tap, now)),
+        }
     }
 
     /// A charger or a computer was attached, `cable_in`, or taken away: the
