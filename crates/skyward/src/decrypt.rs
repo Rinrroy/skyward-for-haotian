@@ -2,13 +2,12 @@
 //! own, so the screen keeps up: the keys come from the secure world, and
 //! what a user enters at their screen lock is checked slowly on purpose.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use skyward_binder::driver::Binder;
 use skyward_crypto::data::{self, Closed, Opening};
 use skyward_crypto::keymint::KeyMint;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::mpsc::{self, Receiver};
-use std::thread::{self, JoinHandle};
+use skyward_sys::worker::Worker;
+use std::os::fd::RawFd;
 
 pub enum Job {
     /// Open the partition as far as it opens with nothing a user knows.
@@ -21,88 +20,49 @@ pub enum Job {
 /// How a job ended: what it opened, or why it did not.
 pub enum Ended {
     Opened(Result<Opening, String>),
-    Unlocked(Result<Vec<Closed>, UnlockError>),
+    Unlocked(Result<Vec<Closed>, String>),
 }
 
-#[derive(Debug)]
-pub struct UnlockError {
-    pub rejection: Option<skyward_crypto::credential::Rejection>,
-    pub details: String,
-}
-
-impl UnlockError {
-    fn of(error: anyhow::Error) -> Self {
-        Self { rejection: skyward_crypto::credential::rejection(&error), details: format!("{error:#}") }
-    }
-}
-
-/// The whole chain, as the log has always written it. The page shows a
-/// sentence of its own instead, so this is only what the log says.
-impl std::fmt::Display for UnlockError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.details)
-    }
-}
-
+/// A job done on a thread of its own, which the screen lets go once the
+/// job has ended.
 pub struct Decryptor {
-    ended: Receiver<Ended>,
-    /// Readable once the job has ended.
-    wake: OwnedFd,
-    thread: Option<JoinHandle<()>>,
+    /// Tells how the job ended, once.
+    worker: Worker<Ended>,
 }
 
 impl Decryptor {
     pub fn start(job: Job) -> Result<Decryptor> {
-        let mut fds = [0; 2];
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("make the decrypting thread's wake pipe");
-        }
-        let (wake, signal) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        let (tx, ended) = mpsc::channel();
-        let thread = thread::Builder::new()
-            .name("decrypt".into())
-            .spawn(move || {
-                let ended_as = match job {
-                    Job::Open => Ended::Opened(with_data_keys(data::open_without_credential)),
-                    Job::Unlock { closed, user, credential } => {
-                        Ended::Unlocked(work_with_key_service(|service| data::unlock(service, &closed, user, &credential)).map_err(UnlockError::of))
-                    }
-                };
-                // The screen only stops listening once it has let the
-                // thread go.
-                let _ = tx.send(ended_as);
-                unsafe { libc::write(signal.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
-            })
-            .context("start the decrypting thread")?;
-        Ok(Decryptor { ended, wake, thread: Some(thread) })
+        let worker = Worker::start("decrypt", move |tell| {
+            tell.tell(match job {
+                Job::Open => Ended::Opened(with_data_keys(data::open_without_credential)),
+                Job::Unlock { closed, user, credential } => {
+                    Ended::Unlocked(with_key_service(|service| data::unlock(service, &closed, user, &credential)))
+                }
+            });
+        })?;
+        Ok(Decryptor { worker })
     }
 
+    /// Readable once the job has ended.
     pub fn fd(&self) -> RawFd {
-        self.wake.as_raw_fd()
+        self.worker.fd()
     }
 
     /// How the job ended, once it has.
     pub fn ended(&self) -> Option<Ended> {
-        let mut drain = [0u8; 8];
-        while unsafe { libc::read(self.wake.as_raw_fd(), drain.as_mut_ptr().cast(), drain.len()) } > 0 {}
-        self.ended.try_recv().ok()
+        self.worker.events().pop()
     }
 }
 
-impl Drop for Decryptor {
-    /// The screen lets the thread go once its job has ended.
-    fn drop(&mut self) {
-        if let Some(thread) = self.thread.take() {
-            thread.join().expect("the decrypting thread does not panic");
-        }
-    }
-}
-
-/// Do `work` with the phone's key service, reached afresh for it.
-fn work_with_key_service<T>(work: impl FnOnce(&KeyMint) -> Result<T>) -> Result<T> {
-    let binder = Binder::open()?;
-    let service = KeyMint::open(&binder)?;
-    work(&service)
+/// Do `work` with the phone's key service, reached afresh for it, and say
+/// why it failed in words for the page.
+pub fn with_key_service<T>(work: impl FnOnce(&KeyMint) -> Result<T>) -> Result<T, String> {
+    let done = (|| {
+        let binder = Binder::open()?;
+        let service = KeyMint::open(&binder)?;
+        work(&service)
+    })();
+    done.map_err(|e| format!("{e:#}"))
 }
 
 /// Do `work` with what reaching the data partition takes: the phone's key

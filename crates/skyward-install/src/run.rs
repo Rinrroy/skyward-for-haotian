@@ -7,17 +7,17 @@
 use crate::adb::{self, Connection, Offer, Service};
 use crate::asked::Asked;
 use crate::blockmap::BlockMap;
-use crate::engine::{engine_lines, wait_engine};
 use crate::ffs::{Endpoints, Shared, Usb};
-use crate::fuse::{self, Fault, LocalFile, Mount, Name};
-use crate::image::{self, ImageKind};
+use crate::fuse::{self, Fault, LocalFile, Mount};
+use crate::image::{self, Image, ImageKind, Layout, Place, Target};
 use crate::keep::Kept;
 use crate::ota::{self, Log, Status};
 use crate::package::{self, Build, Package, Phone, Update};
 use crate::script::{self, Bar, Request};
 use crate::signature::{self, Verdict};
-use crate::{Avb, Command, Event, Failure, Options, Outcome, Reflash, Refusal, Stage, ENGINE_LOG, SCRIPT_LOG};
+use crate::{Command, Event, Failure, Options, Outcome, Reflash, Refusal, Stage, ENGINE_LOG, SCRIPT_LOG};
 use anyhow::{anyhow, bail, ensure, Context as _, Result};
+use skyward_sys::worker::{Teller, Worker};
 use skyward_sys::{kmsg, prop};
 use skyward_vab::{Slot, SlotMaps, SnapshotState};
 use std::collections::HashSet;
@@ -28,10 +28,9 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// What runs right before update_engine or an install script starts
@@ -42,13 +41,9 @@ pub type Detach = Box<dyn FnOnce() -> Result<()> + Send>;
 const METADATA: &str = "/metadata";
 const DATA: &str = "/data";
 
-/// Where a zip's install script is put to run, and the version of the
-/// interface the script is told it runs under. Android's recovery puts it in
-/// /tmp, which is where a script goes looking for what it copied there; but a
-/// script that clears /tmp before it starts would take the binary running it
-/// down with the rest, so it is kept beside the recovery's own logs, which
-/// nothing a package runs is told about.
-const BINARY: &str = "/skyward/run/update-binary";
+/// Where a zip's install script is put to run, as Android's recovery puts
+/// it, and the version of the interface the script is told it runs under.
+const BINARY: &str = "/tmp/update-binary";
 const API_VERSION: &str = "3";
 const RETRY: &str = "retry";
 
@@ -63,47 +58,14 @@ const SCRIPT_PATH: &str = "/sbin:/system/bin:/system/xbin";
 /// long its output is waited on before it is let go.
 const LINGER: Duration = Duration::from_secs(1);
 
-/// How long the install script may print nothing and ask for nothing before
-/// the recovery says so in the kernel log, and how often it says it again
-/// while the script stays quiet. The log kept in memory dies with a reboot,
-/// so an install that stalls where the phone cannot show it would otherwise
-/// leave nothing behind of what it was doing.
-const STALL: Duration = Duration::from_secs(30);
-
 /// The most often progress is told.
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 
-/// How much of a line the install script prints is mirrored into the kernel
-/// log, and the most lines of it: enough of both to tell what the script was
-/// doing, without moving all of its output there.
-const MIRRORED_CHARS: usize = 200;
-const MIRRORED_LINES: usize = 400;
-
-/// How much of what `/proc` says of a script that has stalled is kept for
-/// the report of it.
-const PROC_CHARS: usize = 64;
-
-/// How long an install waits for the sideload serving thread to end once it
-/// has been told to. The thread can be inside a read from the computer, which
-/// has no deadline of its own, so it is left behind rather than waited on: the
-/// install has already ended, and the screen is owed how it ended.
-const UNMOUNT_PATIENCE: Duration = Duration::from_secs(5);
-
-/// How long an install script may go on with neither output nor requests
-/// while not one block of the package it reads has been served before the
-/// install is stopped. Every wait on this path is without a deadline, so a
-/// script that is waiting on a package that will never arrive waits for ever:
-/// ten minutes of nothing at all is not a write making progress, since a write
-/// that is going on keeps the package being read.
-const GIVE_UP: Duration = Duration::from_secs(600);
-
 pub struct Installer {
-    events: Receiver<Event>,
     commands: Sender<Command>,
-    /// Readable while events wait.
-    wake: OwnedFd,
     shared: Arc<Shared>,
-    thread: Option<JoinHandle<()>>,
+    /// The screen lets it go once it has finished.
+    worker: Worker<Event>,
 }
 
 impl Installer {
@@ -147,36 +109,30 @@ impl Installer {
         options: Options,
         work: impl FnOnce(&mut Context) -> Outcome + Send + 'static,
     ) -> Result<Installer> {
-        let (wake, signal) = pipe(libc::O_NONBLOCK)?;
-        let (event_tx, events) = mpsc::channel();
         let (commands, command_rx) = mpsc::channel();
         let shared = Arc::new(Shared::default());
-        let mut ctx =
-            Context { events: event_tx, signal, commands: command_rx, shared: shared.clone(), detach: Some(detach), options, origin, local: None };
-        let thread = thread::Builder::new()
-            .name("installer".into())
-            .spawn(move || {
-                let outcome = work(&mut ctx);
-                let _ = kmsg(&format!("install: {outcome:?}"));
-                ctx.send(Event::Finished(outcome));
-            })
-            .context("start the installer")?;
-        Ok(Installer { events, commands, wake, shared, thread: Some(thread) })
+        let theirs = shared.clone();
+        let worker = Worker::start("installer", move |events| {
+            let mut ctx = Context { events, commands: command_rx, shared: theirs, detach: Some(detach), options, origin };
+            let outcome = work(&mut ctx);
+            let _ = kmsg(&format!("install: {outcome:?}"));
+            ctx.send(Event::Finished(outcome));
+        })?;
+        Ok(Installer { commands, shared, worker })
     }
 
+    /// Readable while events wait.
     pub fn fd(&self) -> RawFd {
-        self.wake.as_raw_fd()
+        self.worker.fd()
     }
 
     /// The events since the last call.
     pub fn events(&self) -> Vec<Event> {
-        let mut drain = [0u8; 64];
-        while unsafe { libc::read(self.wake.as_raw_fd(), drain.as_mut_ptr().cast(), drain.len()) } > 0 {}
-        self.events.try_iter().collect()
+        self.worker.events()
     }
 
     /// Write the image the installer holds to `partition` in `slots`.
-    pub fn flash(&self, partition: &'static str, slots: Vec<Slot>) {
+    pub fn flash(&self, partition: String, slots: Vec<Slot>) {
         // Only a finished installer stops listening, and then there is
         // nothing left to write.
         let _ = self.commands.send(Command::Flash { partition, slots });
@@ -211,15 +167,6 @@ impl Installer {
     }
 }
 
-impl Drop for Installer {
-    /// The screen lets the installer go once it has finished.
-    fn drop(&mut self) {
-        if let Some(thread) = self.thread.take() {
-            thread.join().expect("the installer does not panic");
-        }
-    }
-}
-
 /// Where the package comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Origin {
@@ -233,57 +180,18 @@ enum Origin {
     Asked { retry: bool },
 }
 
-/// The name a package the phone holds as a file is served under beside
-/// package.zip, so that an install script handed that path names what it is
-/// installing.
-///
-/// A package the computer sends with `adb sideload` has none: the service
-/// string that offers it gives its length and its block size and nothing
-/// else, so the name the user typed stays on the computer, as it does for
-/// Android's own recovery. Such a package is served under package.zip alone,
-/// which is what this recovery has always done. A package the phone holds as
-/// a file is served under that file's own name too: it is the name the owner
-/// picked, and the one a script naming what it installs should see.
-fn name_of(path: &Path) -> Option<Name> {
-    Name::of(path)
-}
-
 struct Context {
-    events: Sender<Event>,
-    /// The write end of the wake pipe.
-    signal: OwnedFd,
+    events: Teller<Event>,
     commands: Receiver<Command>,
     shared: Arc<Shared>,
     detach: Option<Detach>,
     options: Options,
     origin: Origin,
-    /// Where a package the phone holds lies, when it is a file the phone can
-    /// read: what the install reads, so that it does not read it through the
-    /// mount this binary serves. Nothing is here for a package the computer
-    /// sends or one left on a partition: those exist only as what is served.
-    local: Option<PathBuf>,
 }
 
 impl Context {
     fn send(&self, event: Event) {
-        if self.events.send(event).is_ok() {
-            // A full pipe already wakes the screen.
-            unsafe { libc::write(self.signal.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
-        }
-    }
-
-    /// Where the bytes of the package are to be read from: the file the phone
-    /// holds, where the package is one, and the mount it is served at where it
-    /// is not.
-    ///
-    /// Reading a package the phone holds through the mount is reading it
-    /// through this binary's own serving loop, one request at a time and 64 KiB
-    /// to a request: nine gigabytes is a hundred and forty thousand of those,
-    /// and a write that could have taken seconds takes minutes. What the
-    /// computer sends has no other way to be read, and neither has a package
-    /// left on a partition, so those are read as they are served.
-    fn source<S>(&self, mount: &Mount<S>) -> PathBuf {
-        self.local.clone().unwrap_or_else(|| mount.path().to_path_buf())
+        self.events.tell(event);
     }
 }
 
@@ -301,24 +209,15 @@ fn run(ctx: &mut Context) -> Outcome {
         // Cancelled as the computer started sending.
         Ok(_) if ctx.shared.cancelled() => {
             finish(&mut conn, adb::DONE);
-            (Outcome::Cancelled, Some(conn))
+            (Outcome::Cancelled, conn)
         }
         Ok(offer) => receive(ctx, conn, offer, false),
-        Err(adb::Error::Interrupted) => (Outcome::Cancelled, Some(conn)),
-        Err(adb::Error::OldHost) => (Outcome::Refused(Refusal::OldHost), Some(conn)),
-        Err(e) => (failed(anyhow!(e).context("wait for adb sideload")), Some(conn)),
+        Err(adb::Error::Interrupted) => (Outcome::Cancelled, conn),
+        Err(adb::Error::OldHost) => (Outcome::Refused(Refusal::OldHost), conn),
+        Err(e) => (failed(anyhow!(e).context("wait for adb sideload")), conn),
     };
-    match conn {
-        Some(conn) => {
-            if let Err(e) = usb.close(conn.into_link()) {
-                let _ = kmsg(&format!("install: USB not handed back to adb: {e:#}"));
-            }
-        }
-        // The connection is held by a serving thread that would not end, and
-        // taking the port back under it would take it away mid-read.
-        None => {
-            let _ = kmsg("install: the sideload connection stays with the thread that would not end\n");
-        }
+    if let Err(e) = usb.close(conn.into_link()) {
+        let _ = kmsg(&format!("install: USB not handed back to adb: {e:#}"));
     }
     // Cancelling while the transfer starts cuts it off.
     if ctx.shared.cancelled() && matches!(outcome, Outcome::Failed(_)) {
@@ -341,7 +240,7 @@ enum Done {
 /// Install the package the computer offers. `rescue` tells the computer
 /// how the install went, as rescue does, where sideload only says the
 /// package was read.
-fn receive(ctx: &mut Context, mut conn: Connection<Endpoints>, offer: Offer, rescue: bool) -> (Outcome, Option<Connection<Endpoints>>) {
+fn receive(ctx: &mut Context, mut conn: Connection<Endpoints>, offer: Offer, rescue: bool) -> (Outcome, Connection<Endpoints>) {
     let _ = kmsg(&format!("install: {} bytes offered in blocks of {}", offer.size, offer.block_size));
     let ending = |outcome: &Outcome| match (rescue, outcome) {
         (true, Outcome::Installed { .. } | Outcome::Flashed { .. } | Outcome::Ran { .. } | Outcome::SystemInstalled { .. }) | (false, _) => adb::DONE,
@@ -350,32 +249,23 @@ fn receive(ctx: &mut Context, mut conn: Connection<Endpoints>, offer: Offer, res
     if let Err(e) = offer.check() {
         let outcome = failed(anyhow!(e));
         finish(&mut conn, ending(&outcome));
-        return (outcome, Some(conn));
+        return (outcome, conn);
     }
     ctx.send(Event::Checking { size: offer.size });
-    // A package the computer sends comes with no name: the service string it
-    // was offered in says nothing of one.
-    let mounted = match fuse::mount(offer, None) {
+    let mounted = match fuse::mount(offer) {
         Ok(mounted) => mounted,
         Err(e) => {
             let outcome = failed(e);
             finish(&mut conn, ending(&outcome));
-            return (outcome, Some(conn));
+            return (outcome, conn);
         }
     };
     let mount = mounted.serve(conn);
-    let done = install(ctx, &mount, offer.size).unwrap_or_else(Done::Error);
-    // Waiting on the serving thread is bounded: it can be in a read from the
-    // computer that has no deadline of its own, and an install that has
-    // ended must be able to say how it ended either way.
-    let (conn, served) = mount.unmount_within(UNMOUNT_PATIENCE);
+    let done = install(ctx, &mount, offer.size, None).unwrap_or_else(Done::Error);
+    let (mut conn, served) = mount.unmount();
     let outcome = conclude(done, served, ctx.origin);
-    let mut conn = match conn {
-        Some(conn) => conn,
-        None => return (outcome, None),
-    };
     finish(&mut conn, ending(&outcome));
-    (outcome, Some(conn))
+    (outcome, conn)
 }
 
 /// Install the file at `path`, read where it is.
@@ -385,18 +275,11 @@ fn run_file(ctx: &mut Context, path: &Path) -> Outcome {
         Err(e) => return Outcome::Failed(Failure::Unreadable(format!("{e:#}"))),
     };
     let _ = kmsg(&format!("install: {}, {} bytes", path.display(), offer.size));
-    // The package is where the owner put it, and can be read from there: what
-    // arrives through the computer, or as the map of a partition's blocks,
-    // cannot.
-    ctx.local = Some(path.to_owned());
-    serve_local(ctx, file, offer, path, name_of(path))
+    serve_local(ctx, file, offer, path, path.file_name().and_then(|name| name.to_str()))
 }
 
 /// Install the package the system left on a partition, read through the
-/// map of its blocks at `map`. The map is a name for where the package's
-/// blocks are, not the name of the package: the file the map describes is
-/// the one the owner picked, and nothing here remembers what it was called,
-/// so the package is served under package.zip alone.
+/// map of its blocks at `map`.
 fn run_mapped(ctx: &mut Context, map: &Path) -> Outcome {
     let (blocks, offer) = match BlockMap::read(map).and_then(|m| m.open()) {
         Ok(opened) => opened,
@@ -406,15 +289,9 @@ fn run_mapped(ctx: &mut Context, map: &Path) -> Outcome {
     serve_local(ctx, blocks, offer, map, None)
 }
 
-/// Serve a package the phone holds, which `path` names, and install it. It
-/// is served under `name` beside package.zip where there is one.
-fn serve_local<S: fuse::Source + Send + 'static>(
-    ctx: &mut Context,
-    source: S,
-    offer: Offer,
-    path: &Path,
-    name: Option<Name>,
-) -> Outcome {
+/// Serve a package the phone holds, which `path` names, and install it;
+/// `file_name` is the name of its file, where it lies in one of its own.
+fn serve_local<S: fuse::Source + Send + 'static>(ctx: &mut Context, source: S, offer: Offer, path: &Path, file_name: Option<&str>) -> Outcome {
     if offer.size == 0 {
         return Outcome::Refused(Refusal::Unknown);
     }
@@ -422,12 +299,12 @@ fn serve_local<S: fuse::Source + Send + 'static>(
         return failed(anyhow!(e).context(format!("serve {}", path.display())));
     }
     ctx.send(Event::Checking { size: offer.size });
-    let mounted = match fuse::mount(offer, name) {
+    let mounted = match fuse::mount(offer) {
         Ok(mounted) => mounted,
         Err(e) => return failed(e),
     };
     let mount = mounted.serve(source);
-    let done = install(ctx, &mount, offer.size).unwrap_or_else(Done::Error);
+    let done = install(ctx, &mount, offer.size, file_name).unwrap_or_else(Done::Error);
     let (_, served) = mount.unmount();
     conclude(done, served, ctx.origin)
 }
@@ -450,14 +327,11 @@ fn rescue(ctx: &mut Context) -> Outcome {
         Err(e) => return failed(e.context("set USB up for rescue")),
     };
     ctx.send(Event::Waiting);
-    let mut conn = Some(Connection::new(endpoints, banner(adb::RESCUE)));
+    let mut conn = Connection::new(endpoints, banner(adb::RESCUE));
     let mut last = Outcome::Cancelled;
     let ended = loop {
-        // A connection a serving thread would not give back cannot be served
-        // on any more, and the loop ends with it.
-        let Some(mut current) = conn.take() else { break Ok(()) };
         ctx.shared.accepting(true);
-        let accepted = current.accept_service();
+        let accepted = conn.accept_service();
         ctx.shared.accepting(false);
         let (service, remote) = match accepted {
             Ok(opened) => opened,
@@ -465,24 +339,22 @@ fn rescue(ctx: &mut Context) -> Outcome {
             Err(e) => break Err(anyhow!(e).context("wait for adb rescue")),
         };
         let _ = kmsg(&format!("rescue: the computer asks for {service:?}"));
-        let (served, back) = match service {
-            Service::RescueInstall(offer) => match current.take(remote) {
+        let served = match service {
+            Service::RescueInstall(offer) => match conn.take(remote) {
                 Ok(()) => {
-                    let (outcome, back) = receive(ctx, current, offer, true);
+                    let (outcome, back) = receive(ctx, conn, offer, true);
+                    conn = back;
                     ctx.send(Event::Done(outcome.clone()));
                     last = outcome;
                     // The screen may have left the page meanwhile.
                     if ctx.shared.cancelled() {
                         break Ok(());
                     }
-                    (Ok(()), back)
+                    Ok(())
                 }
-                Err(e) => (Err(e), Some(current)),
+                Err(e) => Err(e),
             },
-            Service::RescueGetprop(name) => {
-                let answered = current.take(remote).and_then(|()| current.answer(rescue_answer(&name).as_bytes()));
-                (answered, Some(current))
-            }
+            Service::RescueGetprop(name) => conn.take(remote).and_then(|()| conn.answer(rescue_answer(&name).as_bytes())),
             Service::RescueWipe { target, size } if target == "userdata" => {
                 ctx.send(Event::Wipe);
                 let erased = match ctx.commands.recv() {
@@ -490,37 +362,25 @@ fn rescue(ctx: &mut Context) -> Outcome {
                     Ok(Command::Cancel) | Err(_) => break Ok(()),
                     Ok(other) => break Err(anyhow!("rescue waiting for user data to be erased was told {other:?}")),
                 };
-                let wiped = current.take(remote).and_then(|()| current.answer(&adb::rescue_wiped(erased, size)));
-                (wiped, Some(current))
+                conn.take(remote).and_then(|()| conn.answer(&adb::rescue_wiped(erased, size)))
             }
             Service::Reboot(target) => {
                 // Taken and closed at once, as the phone leaves.
-                if let Err(e) = current.take(remote).and_then(|()| current.end()) {
+                if let Err(e) = conn.take(remote).and_then(|()| conn.end()) {
                     let _ = kmsg(&format!("rescue: the computer's reboot was not answered: {e}"));
                 }
                 ctx.send(Event::Reboot(target));
                 break Ok(());
             }
             // What rescue does not serve is refused, as minadbd refuses it.
-            _ => (current.send(&adb::Packet::new(adb::CLSE, 0, remote, [])), Some(current)),
+            _ => conn.send(&adb::Packet::new(adb::CLSE, 0, remote, [])),
         };
-        conn = back;
         if let Err(e) = served {
             let _ = kmsg(&format!("rescue: the computer went away mid-command: {e}"));
         }
-        if conn.is_none() {
-            break Ok(());
-        }
     };
-    match conn {
-        Some(conn) => {
-            if let Err(e) = usb.close(conn.into_link()) {
-                let _ = kmsg(&format!("rescue: USB not handed back to adb: {e:#}"));
-            }
-        }
-        None => {
-            let _ = kmsg("rescue: the connection stays with the thread that would not end\n");
-        }
+    if let Err(e) = usb.close(conn.into_link()) {
+        let _ = kmsg(&format!("rescue: USB not handed back to adb: {e:#}"));
     }
     match ended {
         Ok(()) => last,
@@ -567,8 +427,10 @@ fn conclude(done: Done, served: Result<Option<Fault>>, origin: Origin) -> Outcom
     }
 }
 
-fn install<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<Done> {
-    let file = File::open(mount.path()).context("open the package")?;
+/// Install the package being served, `size` bytes; `file_name` is the name
+/// of its file, where it is one on the phone.
+fn install<S>(ctx: &mut Context, mount: &Mount<S>, size: u64, file_name: Option<&str>) -> Result<Done> {
+    let file = File::open(fuse::PACKAGE).context("open the package")?;
     let package = package::identify(BufReader::with_capacity(1 << 16, file))?;
     let _ = kmsg(&format!("install: {}", describe(&package)));
     match package {
@@ -576,9 +438,12 @@ fn install<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<Done> {
         // The system asks for packages that install themselves, as Android's
         // own recovery takes nothing else; an image needs someone to say
         // where it goes.
-        Package::Image(_) if matches!(ctx.origin, Origin::Asked { .. }) => Ok(Done::Decided(Outcome::Refused(Refusal::Image))),
-        Package::Image(kind) => flash_image(ctx, mount, kind, size),
-        Package::Script => run_script(ctx, mount, size),
+        Package::Image(image) if matches!(ctx.origin, Origin::Asked { .. }) => Ok(Done::Decided(Outcome::Refused(match image.kind {
+            ImageKind::Other => Refusal::Unknown,
+            _ => Refusal::Image,
+        }))),
+        Package::Image(image) => flash_image(ctx, &image, file_name),
+        Package::Script => run_script(ctx, size),
         Package::System(contents) => install_system(ctx, &contents),
         Package::Unknown => Ok(Done::Decided(Outcome::Refused(Refusal::Unknown))),
     }
@@ -689,7 +554,8 @@ fn detach_once(ctx: &mut Context) -> Result<()> {
 fn describe(package: &Package) -> String {
     match package {
         Package::Update(u) => format!("an update to {}", u.version().unwrap_or("an unnamed version")),
-        Package::Image(kind) => format!("an image of {kind:?}"),
+        Package::Image(image) if image.layout.sparse => format!("a sparse image of {:?}, {} bytes in its partition", image.kind, image.layout.size),
+        Package::Image(image) => format!("an image of {:?}", image.kind),
         Package::Script => "a zip with an install script".into(),
         Package::System(c) => format!("the system {} {}, to install beside the installed one", c.manifest.name, c.manifest.version),
         Package::Unknown => "a file of no known kind".into(),
@@ -741,17 +607,6 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
         0 => {
             if let Some(kept) = &kept {
                 reflash(ctx, kept, Ok(slot.other()));
-            }
-            // An update package installs to the other slot and switches to
-            // it, so that is where the checks have to come off for the new
-            // system to start. As with a script, the system asking for the
-            // update is not the owner asking for this.
-            if ctx.options.disable_avb && !matches!(ctx.origin, Origin::Asked { .. }) {
-                // The screen is told either way; an update that went in is
-                // not failed over the checks being left on.
-                if let Err(e) = post_avb(ctx, Ok(slot.other())) {
-                    let _ = kmsg(&format!("install: the AVB checks are not written: {e:#}"));
-                }
             }
             Done::Decided(Outcome::Installed { slot: slot.other(), wipe })
         }
@@ -835,11 +690,15 @@ enum Line {
 /// Run update_engine on the package, telling the screen how far it is,
 /// and give its exit code.
 fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
-    let (status_read, status_write) = pipe(0)?;
+    // How far the program is in writing the system is how much of the
+    // payload it has read, followed from before it starts so that none of
+    // its reads is missed.
+    mount.follow(update.payload_offset, update.payload_size);
+    let (status_read, status_write) = pipe()?;
     let status_fd = status_write.as_raw_fd();
     let mut command = std::process::Command::new(ota::PROGRAM);
     command
-        .args(ota::arguments(mount.path(), update, status_fd))
+        .args(ota::arguments(fuse::PACKAGE, update, status_fd))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -857,25 +716,18 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
     let stderr = child.stderr.take().expect("stderr is piped");
     let mut log = File::create(ENGINE_LOG).with_context(|| format!("create {ENGINE_LOG}"))?;
 
-    // Both pipes are read until they are told to stop. A helper the engine
-    // starts inherits them, and one that serves the snapshots of the slot
-    // outlives the engine: a reader that waited for the pipe itself to close
-    // would keep the install from ever ending.
-    let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let status_tx = tx.clone();
-    let status_stop = stop.clone();
     let status = thread::spawn(move || {
-        engine_lines(File::from(status_read), &status_stop, |line| {
+        lines(File::from(status_read), |line| {
             if let Some(s) = ota::status(line) {
                 let _ = status_tx.send(Line::Status(s));
             }
             Ok(())
         })
     });
-    let log_stop = stop.clone();
     let logged = thread::spawn(move || {
-        engine_lines(stderr, &log_stop, |line| {
+        lines(stderr, |line| {
             if let Some(l) = ota::log(line) {
                 let _ = tx.send(Line::Log(l));
             }
@@ -887,29 +739,24 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
     let mut stage = Stage::Writing { done: 0, total };
     ctx.send(Event::Progress(stage.clone()));
     let mut told = Instant::now();
-    let (mut partitions, mut verifying, mut finishing, mut error, mut progress) = (0, None, false, None, None);
-    let mut receive = |line| {
-        match line {
-            Line::Status(Status::Step(step)) => finishing = step == 2,
-            Line::Status(Status::Progress(value)) | Line::Log(Log::Progress(value)) => {
-                // The engine's own count, never how far into the package
-                // something has read: the zip's directory is at its end and
-                // is read before any of it is applied.
-                if !finishing && verifying.is_none() {
-                    progress = Some(progress.unwrap_or(0).max(value));
-                }
-            }
-            Line::Status(Status::Error(code)) => error = Some(code),
-            Line::Log(Log::Partition(_)) => partitions += 1,
-            Line::Log(Log::Overwriting) => ctx.send(Event::Overwriting),
-            Line::Log(Log::Hashing { index, partition }) => verifying = Some((index, partition)),
+    let (mut partitions, mut verifying, mut finishing, mut error) = (0, None, false, None);
+    loop {
+        match rx.recv_timeout(PROGRESS_EVERY) {
+            Ok(Line::Status(Status::Step(step))) => finishing = step == 2,
+            Ok(Line::Status(Status::Error(code))) => error = Some(code),
+            Ok(Line::Log(Log::Partition(_))) => partitions += 1,
+            Ok(Line::Log(Log::Overwriting)) => ctx.send(Event::Overwriting),
+            Ok(Line::Log(Log::Hashing { index, partition })) => verifying = Some((index, partition)),
+            Err(RecvTimeoutError::Timeout) => {}
+            // Both outputs closed: the program has ended.
+            Err(RecvTimeoutError::Disconnected) => break,
         }
         let now = if finishing {
             Stage::Finishing
         } else if let Some((index, partition)) = &verifying {
             Stage::Verifying { index: *index, count: partitions.max(index + 1), partition: partition.clone() }
         } else {
-            Stage::Writing { done: total.saturating_mul(u64::from(progress.unwrap_or(0))) / 1000, total }
+            Stage::Writing { done: mount.followed(), total }
         };
         let moved_on = std::mem::discriminant(&now) != std::mem::discriminant(&stage);
         if now != stage && (moved_on || told.elapsed() >= PROGRESS_EVERY) {
@@ -917,19 +764,10 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
             ctx.send(Event::Progress(stage.clone()));
             told = Instant::now();
         }
-    };
-    let ended = wait_engine(&mut child, &rx, &mut receive);
-    // The engine has ended, or waiting on it failed. Reading stops here; what
-    // is already in the pipes is handed over below, and a helper still
-    // holding one is left alone.
-    stop.store(true, Ordering::Relaxed);
+    }
+    let ended = child.wait().context("wait for update_engine")?;
     status.join().expect("the status reader does not panic").context("read update_engine's status")?;
     logged.join().expect("the log reader does not panic").context("read update_engine's log")?;
-    for line in rx.try_iter() {
-        receive(line);
-    }
-    let ended = ended?;
-    let _ = kmsg(&format!("install: update_engine ended with {ended}, having reported {error:?}"));
     match (ended.code(), error) {
         (_, Some(code)) => Ok(code),
         (Some(code), None) => Ok(code),
@@ -951,76 +789,123 @@ fn lines(from: impl Read, mut each: impl FnMut(&str) -> io::Result<()>) -> io::R
     }
 }
 
-fn flash_image<S>(ctx: &mut Context, mount: &Mount<S>, kind: ImageKind, size: u64) -> Result<Done> {
+/// Write the image being served to the partition the screen picks among
+/// those it can go to; `file_name` is the name of its file, where it is
+/// one on the phone. A partition the phone has in each slot is written as
+/// it lies. A logical one is first made as large as the image, and super
+/// is written whole, both once the recovery has moved off the installed
+/// system, and neither while an update is in flight, whose partitions
+/// they are.
+fn flash_image(ctx: &mut Context, image: &Image, file_name: Option<&str>) -> Result<Done> {
     let dir = Path::new(skyward_block::BY_NAME);
-    let partitions = image::partitions(kind, dir)?;
+    let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+    // A super that does not read lists no partition to write into.
+    let logical = skyward_vab::slot_names(slot).unwrap_or_else(|e| {
+        let _ = kmsg(&format!("install: super lists no logical partitions: {e:#}"));
+        Vec::new()
+    });
+    let all = image::targets(image.kind, file_name.map(image::named), dir, &logical)?;
+    let state = skyward_vab::snapshot_state()?;
+    let partitions: Vec<Target> = all.iter().filter(|t| state == SnapshotState::None || t.place == Place::Slotted).cloned().collect();
     if partitions.is_empty() {
-        return Ok(Done::Decided(Outcome::Refused(Refusal::NoPartition)));
+        let refusal = match image.kind {
+            _ if !all.is_empty() => Refusal::Pending(state),
+            ImageKind::Other => Refusal::Unknown,
+            _ => Refusal::NoPartition,
+        };
+        return Ok(Done::Decided(Outcome::Refused(refusal)));
     }
-    // Super holds the partitions the running system is mapped through, built
-    // from metadata that writing it replaces: an update in flight would lose
-    // where its own are.
-    if kind == ImageKind::Super {
-        let state = skyward_vab::snapshot_state()?;
-        if state != SnapshotState::None {
-            return Ok(Done::Decided(Outcome::Refused(Refusal::Pending(state))));
-        }
-    }
-    ctx.send(Event::Image { kind, size, partitions: partitions.clone() });
+    let layout = &image.layout;
+    ctx.send(Event::Image { kind: image.kind, size: layout.size, partitions: partitions.clone() });
     let (partition, slots) = match ctx.commands.recv() {
         Ok(Command::Flash { partition, slots }) => (partition, slots),
         Ok(Command::Cancel) | Err(_) => return Ok(Done::Decided(Outcome::Cancelled)),
         Ok(other) => bail!("an image waiting for its partition was told {other:?}"),
     };
-    ensure!(partitions.contains(&partition), "{partition} is not among {partitions:?}");
-    // A super image has no slot of its own to pick: it holds the partitions
-    // of both slots, so the screen sends none and the whole of super is
-    // written.
-    if kind == ImageKind::Super {
-        flash_super(ctx, mount, size)?;
-        return Ok(Done::Decided(Outcome::Flashed { partition, slots: Vec::new() }));
+    let target = partitions.iter().find(|t| t.name == partition).with_context(|| format!("{partition} is not among {partitions:?}"))?;
+    let mut file = BufReader::with_capacity(1 << 20, File::open(fuse::PACKAGE).context("open the package")?);
+    match target.place {
+        Place::Slotted => {
+            ensure!(!slots.is_empty(), "no slot chosen for {partition}");
+            if [skyward_systems::store::BOOT, skyward_systems::store::INIT_BOOT].contains(&partition.as_str()) {
+                installed_boot_set()?;
+            }
+            let devices: Vec<_> = slots.iter().map(|&slot| image::device(dir, &partition, slot)).collect();
+            write_unmounted(ctx, &mut file, layout, &devices)?;
+        }
+        Place::Single => {
+            ensure!(slots.is_empty(), "{partition} is in no slot, and was sent to {slots:?}");
+            let device = dir.join(&partition);
+            image::check_super(&mut image::Expanded::new(&mut file, layout), skyward_block::size_bytes(&device)?)?;
+            detach_once(ctx)?;
+            write_image(ctx, &mut file, layout, &[device], false)?;
+        }
+        Place::Logical => {
+            ensure!(slots == [slot], "{partition} is a logical partition of slot {slot:?}, and was sent to {slots:?}");
+            skyward_vab::can_remake(slot, &partition, layout.size)?;
+            detach_once(ctx)?;
+            ctx.send(Event::Progress(Stage::Resizing));
+            let remade = skyward_vab::remake(slot, &partition, layout.size)?;
+            let written = write_image(ctx, &mut file, layout, std::slice::from_ref(&remade.device), false);
+            let settled = skyward_vab::settle(&remade).with_context(|| format!("put the mapping of {} away", remade.name));
+            written?;
+            settled?;
+        }
     }
-    ensure!(!slots.is_empty(), "no slot chosen for {partition}");
-    if [skyward_systems::store::BOOT, skyward_systems::store::INIT_BOOT].contains(&partition) {
-        installed_boot_set()?;
-    }
-    let devices: Vec<_> = slots.iter().map(|&slot| image::device(dir, partition, slot)).collect();
-    flash_to(ctx, mount, size, &devices)?;
     Ok(Done::Decided(Outcome::Flashed { partition, slots }))
 }
 
-/// Write a super image over the whole of super, so that the partitions it
-/// holds are the ones the image describes.
-///
-/// The slot's partitions are mapped through the metadata super holds now, so
-/// they come off with the rest first, as they do before an install script
-/// runs: a table built from the metadata this write replaces must be neither
-/// mounted nor mapped while super is written. Afterwards what is mapped is
-/// stale, and nothing here maps it again — the next start maps what super
-/// then holds, which is what the image says.
-fn flash_super<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<()> {
-    let dir = Path::new(skyward_block::BY_NAME);
-    detach_once(ctx)?;
-    flash_to(ctx, mount, size, &[image::super_device(dir)])?;
-    let _ = kmsg("super: written, a reboot maps what it now holds");
-    Ok(())
-}
-
-/// Write `size` bytes of the package being served to `devices`, telling the
-/// screen how far it is.
-fn flash_to<S>(ctx: &Context, mount: &Mount<S>, size: u64, devices: &[PathBuf]) -> Result<()> {
-    let path = ctx.source(mount);
-    if ctx.local.is_some() {
-        let _ = kmsg(&format!("install: the image is read where it lies, {}", path.display()));
-    }
-    let mut file = BufReader::with_capacity(1 << 20, File::open(&path).with_context(|| format!("open {}", path.display()))?);
+/// Write the image `file` holds to `devices` as `layout` lays it out and
+/// read it back, telling the screen how far it is.
+fn write_image<R: Read + io::Seek>(ctx: &Context, file: &mut R, layout: &Layout, devices: &[PathBuf], footer: bool) -> Result<()> {
     let mut told: Option<Instant> = None;
-    image::flash(&mut file, size, devices, &mut |done, total| {
+    image::write(file, layout, devices, footer, &mut |done, total| {
         if done == total || told.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
             ctx.send(Event::Progress(Stage::Flashing { done, total }));
             told = Some(Instant::now());
         }
     })
+}
+
+/// Write the image to partitions the phone has in each slot. One of them
+/// that is mounted, as the one the firmware the phone's programs load is
+/// on, comes off its mount points while it is written, and goes back on
+/// them after, holding what was written; where a program holds it there,
+/// nothing is written. One marked read-only, as Android marks what it
+/// mounts read-only, has the mark off while it is written, as
+/// update_engine takes it off the partitions it writes, and on again
+/// after.
+fn write_unmounted<R: Read + io::Seek>(ctx: &Context, file: &mut R, layout: &Layout, devices: &[PathBuf]) -> Result<()> {
+    let mut released = Vec::new();
+    let mut unmarked = Vec::new();
+    let readied = (|| -> Result<()> {
+        for device in devices {
+            let mounts = skyward_block::mount::release(device).with_context(|| format!("take {} off its mount points", device.display()))?;
+            released.push((device, mounts));
+            if skyward_block::read_only(device)? {
+                skyward_block::set_read_only(device, false)?;
+                unmarked.push(device);
+            }
+        }
+        Ok(())
+    })();
+    let ended = readied.and_then(|()| write_image(ctx, file, layout, devices, true));
+    for device in unmarked {
+        if let Err(e) = skyward_block::set_read_only(device, true) {
+            let _ = kmsg(&format!("install: {} is left writable: {e:#}", device.display()));
+        }
+    }
+    for (device, mounts) in released.iter().filter(|(_, mounts)| !mounts.is_empty()) {
+        match skyward_block::mount::restore(device, mounts) {
+            Ok(()) => {
+                let _ = kmsg(&format!("install: {} is mounted again where it was", device.display()));
+            }
+            Err(e) => {
+                let _ = kmsg(&format!("install: {} is not mounted again where it was: {e:#}", device.display()));
+            }
+        }
+    }
+    ended
 }
 
 /// Run the install script of the zip being served, `size` bytes, once the
@@ -1029,12 +914,12 @@ fn flash_to<S>(ctx: &Context, mount: &Mount<S>, size: u64, devices: &[PathBuf]) 
 /// for give them: their shell at /sbin, and the slot's partitions mapped
 /// writable and unmounted. Where the screen asked for it, the zip is first
 /// checked to be signed with one of the phone's update keys.
-fn run_script<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<Done> {
+fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
     if let Some(refusal) = short_of_charge(ctx.origin)? {
         return Ok(Done::Decided(Outcome::Refused(refusal)));
     }
     if ctx.options.signed {
-        match verify_signature(ctx, mount, size)? {
+        match verify_signature(ctx, size)? {
             Verdict::Signed => {}
             Verdict::Unsigned => return Ok(Done::Decided(Outcome::Refused(Refusal::Unsigned))),
             Verdict::Unverified => return Ok(Done::Decided(Outcome::Refused(Refusal::Unverified))),
@@ -1056,7 +941,7 @@ fn run_script<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<Done>
         }
     }
     let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-    extract_script(mount)?;
+    extract_script()?;
     shell_at_sbin()?;
     let kept = hold(ctx, slot)?;
     installed_boot_set()?;
@@ -1071,7 +956,7 @@ fn run_script<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<Done>
         }
     };
     let mounted = skyward_block::mount::mount_ids()?;
-    let ran = run_binary(ctx, mount);
+    let ran = run_binary(ctx);
     if let Err(e) = clean_up(&mounted, &mapped) {
         let _ = kmsg(&format!("install: not all the script left behind was taken away: {e:#}"));
     }
@@ -1082,51 +967,16 @@ fn run_script<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<Done>
         reflash(ctx, kept, skyward_vab::boot::next_slot().context("ask which slot starts next"));
     }
     let (code, wipe_cache) = ran?;
-    // A ROM flashed without the phone's keys will not start on a locked
-    // bootloader, so the checks go off after a script that ended cleanly, in
-    // the slot the phone will start from next. An install the system asked
-    // for never does this: no one is at the screen to have asked for it.
-    if code == 0 && ctx.options.disable_avb && !matches!(ctx.origin, Origin::Asked { .. }) {
-        // The package is written and the phone is otherwise ready: a check
-        // left on is something the owner can change from the AVB page, not a
-        // reason to call a finished install failed.
-        if let Err(e) = post_avb(ctx, skyward_vab::boot::next_slot().context("ask which slot the phone starts from next")) {
-            let _ = kmsg(&format!("install: the AVB checks are not written: {e:#}"));
-        }
-    }
     Ok(Done::Script { code, wipe_cache })
-}
-
-/// Turn both AVB checks off in `slot`, telling the screen what happened.
-///
-/// Failing does not fail the install: the package is written and the phone is
-/// otherwise ready, and a check left on is something the owner can change
-/// from the AVB page afterwards. What went wrong is said, so that a phone
-/// that will not start is not a mystery.
-fn post_avb(ctx: &mut Context, slot: Result<skyward_vab::Slot>) -> Result<()> {
-    let slot = match slot {
-        Ok(slot) => slot,
-        Err(e) => {
-            ctx.send(Event::Avb(Avb { slot: None, done: Err(format!("{e:#}")) }));
-            return Ok(());
-        }
-    };
-    let outcome = crate::commands::avbctl::disable_slot(slot).map_err(|e| format!("{e}"));
-    let done = outcome.map(|backup| backup.map(|b| b.display().to_string()));
-    ctx.send(Event::Avb(Avb { slot: Some(slot), done }));
-    Ok(())
 }
 
 /// Check the zip being served, `size` bytes, was signed with one of the
 /// phone's update keys, telling the screen how much of it the check has
 /// read; the screen leaving the page stops it.
-fn verify_signature<S>(ctx: &Context, mount: &Mount<S>, size: u64) -> Result<Verdict> {
+fn verify_signature(ctx: &Context, size: u64) -> Result<Verdict> {
     let certificates = File::open(signature::CERTIFICATES).with_context(|| format!("open {}", signature::CERTIFICATES))?;
     let keys = signature::keys(BufReader::new(certificates)).with_context(|| format!("read {}", signature::CERTIFICATES))?;
-    // The whole of the package is read to check it, so where it lies is read
-    // rather than what is served of it.
-    let path = ctx.source(mount);
-    let package = File::open(&path).with_context(|| format!("open {}", path.display()))?;
+    let package = File::open(fuse::PACKAGE).context("open the package")?;
     let mut told: Option<Instant> = None;
     let verdict = signature::verify(package, size, &keys, |done, total| {
         if done == total || told.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
@@ -1140,8 +990,8 @@ fn verify_signature<S>(ctx: &Context, mount: &Mount<S>, size: u64) -> Result<Ver
 }
 
 /// Put the zip's install script where it runs from, for anyone to run.
-fn extract_script<S>(mount: &Mount<S>) -> Result<()> {
-    let zip = File::open(mount.path()).context("open the package")?;
+fn extract_script() -> Result<()> {
+    let zip = File::open(fuse::PACKAGE).context("open the package")?;
     let mut zip = zip::ZipArchive::new(BufReader::new(zip)).context("read the zip directory")?;
     let mut script = zip.by_name(package::UPDATE_BINARY).context("open the install script")?;
     match fs::remove_file(BINARY) {
@@ -1190,18 +1040,13 @@ impl Drop for Group {
 /// keep all it asks for and writes in the log, and give how it ended and
 /// whether it asked for the cache partition to be erased after. What it
 /// leaves running is ended with it.
-fn run_binary<S>(ctx: &Context, mount: &Mount<S>) -> Result<(i32, bool)> {
+fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
     let mut log = File::create(SCRIPT_LOG).with_context(|| format!("create {SCRIPT_LOG}"))?;
-    let (requests_read, requests_write) = pipe(0)?;
-    let (output_read, output_write) = pipe(0)?;
+    let (requests_read, requests_write) = pipe()?;
+    let (output_read, output_write) = pipe()?;
     let fd = requests_write.as_raw_fd();
-    // The path the script is handed, as Android's own recovery hands it one:
-    // the name of the package file, and nothing else about it. Scripts work
-    // out what they are installing from that name, so it is where the name a
-    // package is served under is given them.
-    let package = mount.path().display().to_string();
     let mut command = std::process::Command::new(BINARY);
-    command.args([API_VERSION, &fd.to_string(), &package]);
+    command.args([API_VERSION, &fd.to_string(), fuse::PACKAGE]);
     // A script started again after a restart cut it off is told so, as
     // Android's own recovery tells it, to pick up where it was.
     if ctx.origin == (Origin::Asked { retry: true }) {
@@ -1244,11 +1089,7 @@ fn run_binary<S>(ctx: &Context, mount: &Mount<S>) -> Result<(i32, bool)> {
         })
     });
     thread::spawn(move || {
-        let mut mirrored = 0;
         lines(File::from(output_read), |line| {
-            // What the script prints is kept where a reboot does not lose
-            // it, so that an install that stalls can still be told of after.
-            mirror(line, &mut mirrored);
             let _ = output_tx.send(Said::Output(line.to_string()));
             Ok(())
         })
@@ -1261,21 +1102,8 @@ fn run_binary<S>(ctx: &Context, mount: &Mount<S>) -> Result<(i32, bool)> {
     let mut wipe_cache = false;
     let mut ended = None;
     let mut others_ended = false;
-    // What the script last said, and when: a script that says nothing and
-    // asks for nothing for long is stalled, and told of as such.
-    let mut last_heard = Instant::now();
-    let mut last_output = String::new();
-    let mut stalled: Option<Instant> = None;
-    // How far into the package reads have reached, and when they last did: a
-    // script waiting on a package that never comes has both standing still.
-    let mut served = mount.served();
-    let mut served_at = Instant::now();
     loop {
-        let said = rx.recv_timeout(PROGRESS_EVERY);
-        if said.is_ok() {
-            last_heard = Instant::now();
-        }
-        match said {
+        match rx.recv_timeout(PROGRESS_EVERY) {
             // An empty line only ends the one before it, in the recoveries
             // these scripts are written for.
             Ok(Said::Request(Request::Print(text))) if text.is_empty() => {}
@@ -1291,10 +1119,7 @@ fn run_binary<S>(ctx: &Context, mount: &Mount<S>) -> Result<(i32, bool)> {
             Ok(Said::Request(Request::Other(what))) => writeln!(log, "[asked for {what}]").context("write the log")?,
             Ok(Said::Request(moving)) => bar.hear(&moving, started.elapsed()),
             Ok(Said::Unknown(line)) => writeln!(log, "[unknown request] {line}").context("write the log")?,
-            Ok(Said::Output(line)) => {
-                writeln!(log, "{line}").context("write the log")?;
-                last_output = line;
-            }
+            Ok(Said::Output(line)) => writeln!(log, "{line}").context("write the log")?,
             Err(RecvTimeoutError::Timeout) => {}
             // Every output has closed: the script, and all it ran, are done.
             Err(RecvTimeoutError::Disconnected) => break,
@@ -1306,31 +1131,6 @@ fn run_binary<S>(ctx: &Context, mount: &Mount<S>) -> Result<(i32, bool)> {
         }
         if ended.is_none() {
             ended = child.try_wait().context("see whether the install script has ended")?.map(|status| (status, Instant::now()));
-        }
-        let now_served = mount.served();
-        if now_served != served {
-            served = now_served;
-            served_at = Instant::now();
-        }
-        // A script that has printed nothing and asked for nothing for long
-        // shows as nothing happening at all on the phone: say where it waits,
-        // while there is still a phone running to read that from.
-        if ended.is_none() && last_heard.elapsed() >= STALL && stalled.is_none_or(|at| at.elapsed() >= STALL) {
-            stalled = Some(Instant::now());
-            let report = stall_report(child.id(), last_heard.elapsed(), &last_output);
-            let _ = kmsg(&report);
-            // Said on the screen too, where the script's own output is shown:
-            // a phone that stalls here cannot be asked for its log afterwards,
-            // so what it was doing is said while it is still stuck.
-            ctx.send(Event::Print(report));
-        }
-        // Nothing printed, nothing asked for, and not one block of the package
-        // read for as long as that: every wait on this path is without a
-        // deadline, so a script waiting on a package that is not coming waits
-        // for ever. The install is stopped here instead, and the screen is
-        // told what the script was doing when it was stopped.
-        if ended.is_none() && last_heard.elapsed() >= GIVE_UP && served_at.elapsed() >= GIVE_UP {
-            bail!("{}; the install is stopped", stall_report(child.id(), last_heard.elapsed(), &last_output));
         }
         if let Some((_, at)) = ended {
             if at.elapsed() >= LINGER && !others_ended {
@@ -1356,53 +1156,6 @@ fn run_binary<S>(ctx: &Context, mount: &Mount<S>) -> Result<(i32, bool)> {
     Ok((status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)), wipe_cache))
 }
 
-/// Mirror a line the install script printed into the kernel log, which a
-/// reboot does not lose: the first [`MIRRORED_CHARS`] of it, and no more than
-/// [`MIRRORED_LINES`] lines per install, so that a script printing a great
-/// deal cannot flood the kernel log either.
-fn mirror(line: &str, mirrored: &mut usize) {
-    if line.trim().is_empty() {
-        return;
-    }
-    if *mirrored < MIRRORED_LINES {
-        *mirrored += 1;
-        let short: String = line.chars().take(MIRRORED_CHARS).collect();
-        let _ = kmsg(&format!("install: {short}"));
-    } else if *mirrored == MIRRORED_LINES {
-        // Said once, where the mirroring stops, so that a log read afterwards
-        // tells a quiet script from one whose words were not kept.
-        *mirrored += 1;
-        let _ = kmsg(&format!("install: the script's output stops being mirrored after {MIRRORED_LINES} lines"));
-    }
-}
-
-/// What the recovery says of an install script that has printed nothing and
-/// asked for nothing for `quiet`: how long that has been, which process it
-/// is, where it waits and in what state, and the last line it printed.
-fn stall_report(pid: u32, quiet: Duration, last_output: &str) -> String {
-    let waiting = read_proc(pid, "wchan").unwrap_or_else(|| "?".to_string());
-    let state = process_state(pid).map_or_else(|| "?".to_string(), |state| state.to_string());
-    let short: String = last_output.chars().take(MIRRORED_CHARS).collect();
-    let last = if short.is_empty() { "nothing".to_string() } else { format!("\"{short}\"") };
-    format!("install: the script has printed nothing and asked for nothing for {}s (pid {pid}, waiting in {waiting}, state {state}); its last line was {last}", quiet.as_secs())
-}
-
-/// What `/proc/<pid>/<what>` holds, trimmed and cut short: none when it
-/// cannot be read, which telling of a stall must never fail over.
-fn read_proc(pid: u32, what: &str) -> Option<String> {
-    let text = fs::read_to_string(format!("/proc/{pid}/{what}")).ok()?;
-    Some(text.trim().chars().take(PROC_CHARS).collect())
-}
-
-/// The state `/proc/<pid>/stat` gives the process, as it names it: `R` for
-/// running, `D` for waiting on storage, `S` for sleeping; none when there is
-/// no such file. The program's name comes second in brackets and may hold
-/// anything, so the state is the first field after the bracket closing it.
-fn process_state(pid: u32) -> Option<char> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit_once(')')?.1.split_whitespace().next()?.chars().next()
-}
-
 /// Take away what the script mounted and left mounted, the latest first,
 /// and undo how the slot's partitions were mapped for it; and mount
 /// /metadata again as the recovery keeps it, for a script that took it
@@ -1426,10 +1179,10 @@ fn failed(e: anyhow::Error) -> Outcome {
     Outcome::Failed(Failure::Error(format!("{e:#}")))
 }
 
-/// A pipe, both ends closed on exec, with `flags` added.
-fn pipe(flags: libc::c_int) -> Result<(OwnedFd, OwnedFd)> {
+/// A pipe, both ends closed on exec.
+fn pipe() -> Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | flags) } != 0 {
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(io::Error::last_os_error()).context("make a pipe");
     }
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })

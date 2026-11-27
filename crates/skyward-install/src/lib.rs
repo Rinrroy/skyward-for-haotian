@@ -22,12 +22,7 @@ mod ffs;
 #[cfg(target_os = "android")]
 mod run;
 
-/// Waiting on the OTA engine is the same on the phone and in a test, and it
-/// is what the tests of it here exercise.
-#[cfg(any(target_os = "android", all(test, unix)))]
-mod engine;
-
-pub use image::{ImageKind, Ramdisk};
+pub use image::{Filesystem, ImageKind, Place, Ramdisk, Target};
 #[cfg(target_os = "android")]
 pub use run::{Detach, Installer};
 use skyward_info::{Battery, Charge};
@@ -73,16 +68,6 @@ pub struct Options {
     /// A zip with an install script runs only if it was signed with one of
     /// the keys the phone's updates are signed with.
     pub signed: bool,
-    /// Turn both AVB checks off in the slot the install leaves the phone
-    /// starting from, once it has finished.
-    ///
-    /// This is the recovery's own act rather than the package's: a ROM built
-    /// without the phone's keys makes a locked bootloader refuse to start it,
-    /// and an install script is an arbitrary program that may or may not call
-    /// `avbctl` for itself. What the owner set on the install page decides,
-    /// and an install the system asked for never does it — no one is at the
-    /// screen to have asked.
-    pub disable_avb: bool,
 }
 
 /// What the installer tells the screen, in the order it happens.
@@ -107,8 +92,9 @@ pub enum Event {
     /// start.
     Overwriting,
     /// A partition image, held until [`Command::Flash`] says where it goes:
-    /// the partitions of this phone it fits, the likeliest first.
-    Image { kind: ImageKind, size: u64, partitions: Vec<&'static str> },
+    /// the bytes it takes in a partition, and the partitions of this phone
+    /// it can go to, the likeliest first.
+    Image { kind: ImageKind, size: u64, partitions: Vec<Target> },
     /// A zip that installs itself by running the script inside it, held
     /// until [`Command::Install`]: a script may write over any partition,
     /// so it always waits.
@@ -125,9 +111,6 @@ pub enum Event {
     /// The install wrote over this recovery in the recovery partitions,
     /// which the screen asked to keep: how writing it back went.
     Reflashed(Reflash),
-    /// Both AVB checks were to be turned off in the slot the install leaves
-    /// the phone starting from, and how that went.
-    Avb(Avb),
     /// In rescue, the computer asked for all user data to be erased: the
     /// screen erases it and says how that went with [`Command::Wiped`].
     Wipe,
@@ -151,18 +134,6 @@ pub enum Reflash {
     Failed(String),
 }
 
-/// Turning both AVB checks off after an install, and how it went.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Avb {
-    /// The slot whose vbmeta was changed; `None` where the slot the phone
-    /// starts from next could not be read at all.
-    pub slot: Option<Slot>,
-    /// `Ok(None)` where the checks were already off, `Ok(Some(backup))` where
-    /// they were turned off and the image as it was kept at that path, and
-    /// why it did not happen.
-    pub done: Result<Option<String>, String>,
-}
-
 /// How far the work is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stage {
@@ -173,6 +144,9 @@ pub enum Stage {
     Verifying { index: usize, count: usize, partition: String },
     /// It runs the package's own last steps and switches slots.
     Finishing,
+    /// The logical partition an image goes to is made as large as the
+    /// image, in super's own record of its partitions.
+    Resizing,
     /// An image is written and read back: bytes so far, of all.
     Flashing { done: u64, total: u64 },
     /// The install script runs, as far as it says it is, in thousandths.
@@ -197,10 +171,9 @@ pub enum Outcome {
     /// The update is in `slot`, which starts next; `wipe` when all user data
     /// is to be erased before it does.
     Installed { slot: Slot, wipe: bool },
-    /// The image is in the partition of these slots, which is empty for a
-    /// super image: it is written to the one partition that holds the
-    /// partitions of both slots, and has no slot of its own.
-    Flashed { partition: &'static str, slots: Vec<Slot> },
+    /// The image is in the partition of these slots; of none, where the
+    /// phone has the partition once.
+    Flashed { partition: String, slots: Vec<Slot> },
     /// The install script ran to its end; `wipe_cache` when it asked for
     /// the cache partition to be erased after.
     Ran { wipe_cache: bool },
@@ -245,7 +218,7 @@ pub enum Refusal {
     /// Its security patch is older than the installed one, which leaves
     /// the data partition unreadable unless it is erased.
     OlderPatch { package: String, installed: String },
-    /// An image for partitions this phone does not have.
+    /// An image that fits no partition this phone has.
     NoPartition,
     /// Too little charge to install safely: the level, and whether a
     /// charger is in.
@@ -299,9 +272,11 @@ pub enum Failure {
 /// What the screen tells the installer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Write the image held in [`Event::Image`] to `partition` in these
-    /// slots.
-    Flash { partition: &'static str, slots: Vec<Slot> },
+    /// Write the image held in [`Event::Image`] to `partition`, one of
+    /// those it offered: in these slots where the phone has it in each, in
+    /// the slot it runs from where it is a logical one, and in no slot
+    /// where it has it once.
+    Flash { partition: String, slots: Vec<Slot> },
     /// Install the update held in [`Event::Ready`], or run the script held
     /// in [`Event::Script`].
     Install,

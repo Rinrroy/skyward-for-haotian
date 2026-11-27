@@ -1,4 +1,3 @@
-pub mod aod;
 pub mod app;
 pub mod canvas;
 pub mod charge;
@@ -17,10 +16,10 @@ pub mod motion;
 pub mod pages;
 pub mod search;
 pub mod settings;
-pub mod sort;
 pub mod sprite;
 pub mod surface;
 pub mod term;
+pub(crate) mod texts;
 pub mod theme;
 pub mod widgets;
 

@@ -2,35 +2,23 @@
 //! the Settings page's, the install page's options, what a backup takes and
 //! where it goes, and which logs are exported where. They are kept as JSON,
 //! each value as what it means, a language as its locale, a time in seconds,
-//! a time zone, a part or a place by its name, so a later version that lists
-//! them otherwise reads them the same.
+//! a time zone by its name in the tz database, a part or a place by its
+//! name, so a later version that lists them otherwise reads them the same.
 
-use crate::aod::{AodStyle, STYLES};
-use crate::app::{Place, SortKey, State, SCREEN_OFF, TIME_ZONES};
+use crate::app::{Place, State, SystemZone, SCREEN_OFF, TIME_ZONES};
 use crate::Lang;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-
-/// What a switch that is not named in the file is: on.
-fn yes() -> bool {
-    true
-}
 
 /// How long settings stand unchanged before they are written, so a slider
 /// dragged across the page is written once, after the hand stops.
 pub const WAIT_MS: u64 = 2000;
 
 /// The parts a backup takes, by name, in the order of the backup page.
-const PARTS: [&str; 4] = ["boot", "system", "data", "modem"];
+const PARTS: [&str; 5] = ["boot", "system", "data", "media", "modem"];
 /// Where a backup goes, by name.
 const STORAGE: &str = "storage";
 const USB_DRIVE: &str = "usb_drive";
-/// The orders the file manager can show a folder in, by name, in the order
-/// its page offers them.
-const SORTS: [&str; 3] = ["name", "modified", "kind"];
-/// The faces the dark panel can wear, by name, in the order the setting goes
-/// round them.
-const AOD_STYLES: [&str; STYLES.len()] = ["digits", "offset", "dial"];
 /// The logs exported, and where they go, by name, in the order of the page
 /// that exports them.
 const LOGS: [&str; 2] = ["recovery", "kernel"];
@@ -54,42 +42,22 @@ pub struct Settings {
     /// How long the screen stays on with nothing touched, in seconds; 0
     /// keeps it on.
     pub screen_off: u64,
-    /// The time zone, by its name in the tz database.
+    /// The clock keeps the time zone the installed system is set to.
+    pub follow_system_time_zone: bool,
+    /// The time zone chosen on its pages, by its name in the tz database.
     pub time_zone: String,
+    /// The time zone the installed system was last seen set to, by its
+    /// name in the tz database, for a start before the data partition
+    /// opens.
+    pub system_time_zone: Option<String>,
     pub vibrate: bool,
     /// The vibration slider's place, from 0 at its left end to 1.
     pub vibration: f32,
     /// A computer connected over USB is offered internal storage.
     pub file_transfer: bool,
-    /// A dark panel keeps the clock and the phone's readings on the glass in
-    /// the panel's own doze, rather than being put out. A file that names
-    /// none leaves it off, which is what a freshly flashed phone starts with:
-    /// the face is asked for on the settings page, not found already lit.
-    pub always_on: bool,
-    /// The face the dark panel wears while it dozes, by name: digits, offset
-    /// or dial. A file that names none leaves the digits, which is the face
-    /// the recovery has always drawn.
-    pub aod_style: String,
-    /// Two taps on the dark panel light it again. A file that names none
-    /// leaves it off, which is what a freshly flashed phone starts with: the
-    /// gesture costs the phone its suspend, since the panel has to keep
-    /// dozing for the taps to be felt, so it is asked for rather than given.
-    pub double_tap: bool,
-    /// Turn both AVB checks off after a ROM is installed.
-    pub disable_avb: bool,
-    /// Remember the screen lock that opens the data partition, and try it
+    /// The screen lock is kept once it opens the data partition, and tried
     /// by itself at the next start.
     pub remember_password: bool,
-    /// The order the file manager shows a folder in, by name: by name,
-    /// modified or kind.
-    pub sort: String,
-    /// The recovery's own update reaches GitHub through a mirror in the
-    /// mainland. A file that names none leaves it on: the check asks GitHub
-    /// first either way, so the mirror is only tried when that does not
-    /// answer, and a phone that cannot reach GitHub at all is the phone this
-    /// is for.
-    #[serde(default = "yes")]
-    pub mirror: bool,
     pub install: Install,
     pub backup: Backup,
     pub logs: Logs,
@@ -163,27 +131,13 @@ impl Settings {
             dark: state.dark,
             brightness: state.brightness,
             screen_off: SCREEN_OFF[state.screen_off].map_or(0, |ms| ms / 1000),
-            time_zone: TIME_ZONES[state.time_zone].2.to_string(),
+            follow_system_time_zone: state.follow_system_zone,
+            time_zone: TIME_ZONES[state.time_zone].tz.to_string(),
+            system_time_zone: state.system_zone.as_ref().map(|zone| zone.name.clone()),
             vibrate: state.vibrate,
             vibration: state.vibration,
             file_transfer: state.file_transfer,
-            always_on: state.always_on,
-            aod_style: AOD_STYLES[match state.aod_style {
-                AodStyle::Digits => 0,
-                AodStyle::Offset => 1,
-                AodStyle::Dial => 2,
-            }]
-            .to_string(),
-            double_tap: state.double_tap,
-            disable_avb: state.disable_avb,
             remember_password: state.remember_password,
-            sort: SORTS[match state.sort {
-                SortKey::Name => 0,
-                SortKey::Modified => 1,
-                SortKey::Kind => 2,
-            }]
-            .to_string(),
-            mirror: state.mirror,
             install: Install { check_signature: state.check_signature, keep_recovery: state.keep_recovery },
             backup: Backup {
                 parts: names(&state.backup, &PARTS),
@@ -234,29 +188,19 @@ impl Settings {
         if let Some(at) = SCREEN_OFF.iter().position(|off| off.map_or(0, |ms| ms / 1000) == self.screen_off) {
             state.screen_off = at;
         }
-        if let Some(at) = TIME_ZONES.iter().position(|zone| zone.2 == self.time_zone) {
+        state.follow_system_zone = self.follow_system_time_zone;
+        if let Some(at) = TIME_ZONES.iter().position(|zone| zone.tz == self.time_zone) {
             state.time_zone = at;
+        }
+        if let Some(zone) = self.system_time_zone.as_deref().and_then(|name| SystemZone::named(name).ok()) {
+            state.system_zone = Some(zone);
         }
         state.vibrate = self.vibrate;
         if (0.0..=1.0).contains(&self.vibration) {
             state.vibration = self.vibration;
         }
         state.file_transfer = self.file_transfer;
-        state.always_on = self.always_on;
-        // A name this version does not know leaves the face as it is, as an
-        // unknown order or place does.
-        if let Some(at) = AOD_STYLES.iter().position(|name| *name == self.aod_style) {
-            state.aod_style = STYLES[at];
-        }
-        state.double_tap = self.double_tap;
-        state.disable_avb = self.disable_avb;
         state.remember_password = self.remember_password;
-        state.mirror = self.mirror;
-        // A name this version does not know leaves the order as it is, as an
-        // unknown time zone or place does.
-        if let Some(at) = SORTS.iter().position(|name| *name == self.sort) {
-            state.sort = [SortKey::Name, SortKey::Modified, SortKey::Kind][at];
-        }
         state.check_signature = self.install.check_signature;
         state.keep_recovery = self.install.keep_recovery;
         state.backup = picked(&self.backup.parts, &PARTS);
@@ -286,11 +230,8 @@ fn picked<const N: usize>(kept: &[String], all: &[&str; N]) -> [bool; N] {
 
 /// What the settings file held as the recovery started.
 #[derive(Debug, Clone, PartialEq)]
-// The settings are read once at the start and stay as one value for the whole
-// recovery, so boxing the big variant would buy nothing.
-#[allow(clippy::large_enum_variant)]
 pub enum Kept {
-    Settings(Settings),
+    Settings(Box<Settings>),
     /// No settings: no file, or one that does not read as settings.
     Nothing,
     /// Where the file is could not be read; it is left alone this time.
@@ -322,7 +263,7 @@ pub struct Keeper {
 impl Keeper {
     pub fn new(kept: &Kept) -> Keeper {
         let holds = match kept {
-            Kept::Settings(settings) => Some(Some(settings.clone())),
+            Kept::Settings(settings) => Some(Some(settings.as_ref().clone())),
             Kept::Nothing => Some(None),
             Kept::Unreadable => None,
         };
@@ -371,64 +312,30 @@ impl Keeper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::listed;
 
-    #[test]
-    fn the_avb_and_remember_switches_are_kept_and_start_off() {
-        // Both change something the owner should have chosen: one the
-        // signatures the bootloader checks, the other a password written
-        // to /metadata. A phone flashed and never visited is neither.
-        let fresh = State::default();
-        assert!(!fresh.disable_avb, "a ROM is installed without turning the checks off");
-        assert!(!fresh.remember_password, "no password is kept unless asked for");
-        assert!(fresh.remembered.is_none());
-
-        // A value the pages set comes back at the next start.
-        let state = State { disable_avb: true, remember_password: true, ..State::default() };
-        let kept = Settings::read(&Settings::of(&state).text()).unwrap();
-        let mut back = State::default();
-        kept.apply(&mut back);
-        assert!(back.disable_avb && back.remember_password);
-        // What was remembered is never written to the settings file: it
-        // lives in its own sealed file, and a settings file copied off
-        // the phone must not carry it.
-        let text = Settings::of(&State { remembered: Some("1234".into()), ..state }).text();
-        assert!(!text.contains("1234"), "the credential is not in the settings file");
+    /// Where a zone is in [`TIME_ZONES`], by its name in the tz database.
+    fn zone(tz: &str) -> usize {
+        listed(tz).expect("a zone listed")
     }
 
     #[test]
-    fn the_mirror_is_on_unless_the_file_says_otherwise() {
-        // A phone that has never reached the settings page still tries the
-        // mirror, because the check asks GitHub first either way: the only
-        // phone the mirror takes anything away from is one whose owner
-        // turned it off.
-        let mut fresh = State::default();
-        Settings::of(&State::default()).apply(&mut fresh);
-        assert!(fresh.mirror, "the mirror is on before anything is chosen");
-        assert!(Settings::read("{}").unwrap().mirror, "a file naming no mirror leaves it on");
-
-        let off = Settings::of(&State { mirror: false, ..State::default() }).text();
-        let mut back = State::default();
-        Settings::read(&off).unwrap().apply(&mut back);
-        assert!(!back.mirror, "a switch turned off stays off across a start");
-    }
-
-    #[test]
-    fn the_settings_go_round_through_their_file() {        let state = State {
+    fn the_settings_go_round_through_their_file() {
+        let state = State {
             lang: Lang::En,
             language_chosen: true,
             dark: true,
             brightness: 0.7,
             screen_off: 6,
-            time_zone: 7,
+            follow_system_zone: false,
+            time_zone: zone("America/New_York"),
+            system_zone: Some(SystemZone::named("Asia/Kabul").unwrap()),
             vibrate: false,
             vibration: 0.4,
             file_transfer: false,
-            always_on: true,
-            aod_style: AodStyle::Dial,
-            double_tap: true,
             check_signature: true,
             keep_recovery: false,
-            backup: [false, true, true, false],
+            backup: [false, true, true, true, false],
             backup_to: Place::UsbDrive,
             compress: true,
             verify: false,
@@ -440,55 +347,24 @@ mod tests {
         let mut back = State::default();
         kept.apply(&mut back);
         assert_eq!(Settings::of(&back), Settings::of(&state));
-        assert_eq!((back.lang, back.screen_off, back.time_zone), (Lang::En, 6, 7));
-        assert!(back.always_on, "a face turned on is still on at the next start");
-        assert_eq!(back.aod_style, AodStyle::Dial, "the face chosen is the one the panel wears at the next start");
-        assert!(back.double_tap, "a two-tap wake turned on is still on at the next start");
-        // The value carried is the one a start does not have of itself, so
-        // what comes back proves the file rather than the default. The
-        // default is the other half of the same question: a phone flashed and
-        // never visited here has no face on its dark panel, and no two-tap
-        // wake — both cost power, so both are asked for.
-        assert!(!State::default().always_on, "the face on a dark panel is off until it is turned on");
-        assert!(!State::default().double_tap, "the two-tap wake is off until it is turned on");
-    }
-
-    #[test]
-    fn the_face_chosen_is_kept_by_name_and_a_name_it_does_not_know_leaves_it_alone() {
-        // Each face goes through the file as the word the setting shows, not
-        // as a number the order of the list would have to stay the same for.
-        for (style, name) in STYLES.iter().zip(["digits", "offset", "dial"]) {
-            let text = Settings::of(&State { aod_style: *style, ..State::default() }).text();
-            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(json["aod_style"], name, "{style:?} is kept as its own word");
-            let mut back = State::default();
-            Settings::read(&text).unwrap().apply(&mut back);
-            assert_eq!(back.aod_style, *style, "{name} comes back as the face it names");
-        }
-        // A file naming no face takes the digits the recovery has always
-        // drawn, and one naming a face this version has not leaves the pages'
-        // as they are, as an unknown order or place does.
-        let mut back = State { aod_style: AodStyle::Offset, ..State::default() };
-        Settings::read("{}").unwrap().apply(&mut back);
-        assert_eq!(back.aod_style, AodStyle::Digits, "a file that names no face is the digits");
-        let mut back = State { aod_style: AodStyle::Offset, ..State::default() };
-        Settings::read(r#"{ "aod_style": "hologram" }"#).unwrap().apply(&mut back);
-        assert_eq!(back.aod_style, AodStyle::Offset, "a face this version has not is left out");
+        assert_eq!((back.lang, back.screen_off, back.time_zone), (Lang::En, 6, zone("America/New_York")));
+        assert!(!back.follow_system_zone);
+        assert_eq!(back.system_zone, state.system_zone, "a zone of the system's that the pages do not list");
     }
 
     #[test]
     fn each_value_is_kept_as_what_it_means() {
-        let state = State { screen_off: 3, time_zone: 1, backup: [true, false, false, true], ..State::default() };
+        let system = Some(SystemZone::named("Europe/Rome").unwrap());
+        let state = State { screen_off: 3, time_zone: zone("Asia/Hong_Kong"), system_zone: system, backup: [true, false, false, false, true], ..State::default() };
         let text = Settings::of(&state).text();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(json["screen_off"], 120, "two minutes, in seconds");
         assert_eq!(json["time_zone"], "Asia/Hong_Kong");
+        assert_eq!(json["follow_system_time_zone"], true, "the system's zone is followed until one is chosen");
+        assert_eq!(json["system_time_zone"], "Europe/Rome", "by the name the system gives it");
         assert_eq!(json["backup"]["parts"], serde_json::json!(["boot", "modem"]));
         assert_eq!(json["logs"]["to"], "temporary");
         assert_eq!(json["spoken"], "zh-Hans");
-        assert_eq!(json["always_on"], false, "the face on a dark panel is off until it is turned on");
-        assert_eq!(json["aod_style"], "digits", "the face is the digits until the setting goes round them");
-        assert_eq!(json["double_tap"], false, "the two-tap wake is off until it is turned on");
         assert!(json.get("language").is_none(), "no language is chosen until one is");
         let never = Settings::of(&State { screen_off: SCREEN_OFF.len() - 1, ..State::default() });
         assert_eq!(never.screen_off, 0, "a screen that stays on");
@@ -513,6 +389,7 @@ mod tests {
             vibration: f32::NAN,
             screen_off: 7,
             time_zone: "Mars/Olympus".into(),
+            system_time_zone: Some("Mars/Olympus".into()),
             backup: Backup { parts: vec!["boot".into(), "photos".into()], to: "cloud".into(), ..Backup::default() },
             logs: Logs { kinds: vec!["kernel".into()], to: "printer".into() },
             ..Settings::default()
@@ -523,13 +400,14 @@ mod tests {
         assert_eq!((state.brightness, state.vibration), (start.brightness, start.vibration));
         assert_eq!((state.screen_off, state.time_zone, state.backup_to, state.logs_to), (start.screen_off, start.time_zone, start.backup_to, start.logs_to));
         assert!(!state.language_chosen);
-        assert_eq!(state.backup, [true, false, false, false], "a part this version has not is left out");
+        assert_eq!(state.system_zone, None, "a zone the recovery carries no rules for");
+        assert_eq!(state.backup, [true, false, false, false, false], "a part this version has not is left out");
         assert_eq!(state.logs, [false, true]);
     }
 
     #[test]
     fn changed_settings_are_written_once_they_have_stood_for_a_moment() {
-        let mut keeper = Keeper::new(&Kept::Settings(Settings::default()));
+        let mut keeper = Keeper::new(&Kept::Settings(Box::default()));
         assert_eq!(keeper.due(Settings::default(), 0), None, "what the file holds is not written again");
         let dark = Settings { dark: true, ..Settings::default() };
         assert_eq!(keeper.due(dark.clone(), 1_000), None);

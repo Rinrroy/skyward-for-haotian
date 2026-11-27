@@ -3,11 +3,10 @@
 //! output or nowhere, with the zstd command's switches that bear on
 //! decompressing. It does not compress.
 
-use super::{copy, Failed, Io, Written, CHUNK};
+use super::{copy, Failed, Io, CHUNK};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -53,7 +52,7 @@ pub(super) fn run(args: &[OsString], io: &mut Io) -> i32 {
         Ok(Asked::Decompress(request)) => request,
         Ok(Asked::Version) => {
             let library = zstd::zstd_safe::version_string();
-            return say(io, &format!("zstd of Skyward {}, decompressing with libzstd {library}\n", skyward_info::VERSION));
+            return say(io, &format!("zstd of Skyward {}, decompressing with libzstd {library}\n", env!("CARGO_PKG_VERSION")));
         }
         Ok(Asked::Help) => return say(io, HELP),
         Err(e) => {
@@ -306,15 +305,7 @@ fn decompress(request: &Request, input: &Input, io: &mut Io) -> Result<(), Strin
         Input::Standard => None,
     };
     let (mut out, made) = create(&into, request.force, input_path)?;
-    // What is written here may be a partition, as `zstd -d -o
-    // /dev/block/by-name/super` writes one: the rate it goes at is a line in
-    // the kernel log a gigabyte, and the flush at the end has all of it in the
-    // flash before the command ends, which is as long as the script that ran
-    // it gives it.
-    let fd = out.as_raw_fd();
-    let shown = into.file_name().map_or_else(|| into.display().to_string(), |name| name.to_string_lossy().into_owned());
-    let mut written = Written::new(&mut out, &shown, fd);
-    let decompressed = match decode(from, &mut written, request.window_log, request.pass_through) {
+    let decompressed = match decode(from, &mut out, request.window_log, request.pass_through) {
         Ok(decompressed) => decompressed,
         Err(e) => {
             // What was written of a file made for it is no use, as zstd
@@ -328,7 +319,6 @@ fn decompress(request: &Request, input: &Input, io: &mut Io) -> Result<(), Strin
             });
         }
     };
-    written.finish();
     if let (true, Some(path)) = (request.remove, input_path) {
         fs::remove_file(path).map_err(|e| format!("remove {name}: {e}"))?;
     }

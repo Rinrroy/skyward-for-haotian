@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use skyward_config::DeviceConfig;
 use skyward_info::{Battery, Boot, Charge, Cpu, DeviceInfo, PatchLevel, Storage};
-use skyward_install::{Failure, ImageKind, Outcome, Ramdisk, Reflash, Refusal, Stage};
+use skyward_install::{Failure, Filesystem, ImageKind, Outcome, Place as FlashPlace, Ramdisk, Reflash, Refusal, Stage, Target as FlashTarget};
 use skyward_net::download::{Failure as DownloadFailure, Progress};
 use skyward_net::github::{Build, Newest};
 use skyward_net::reach::Reach;
@@ -12,12 +12,14 @@ use skyward_systems::{Named, Other, Overview, Who};
 use skyward_ui::app::{
     Action, Adding, App, Asked, BackupAt, BackupEnd, BackupEntry, BackupJob, BackupRefusal, Choice, Clip, Damage, Data, DownloadEnd,
     DownloadJob, EraseStop, Field, FileKind, FileOp, FileRow, FileTask, FsAction, FsRow, Have, Held, Install, ItemEnd, JobEnd, Key, Keys,
-    MountFailure, MountRow, Part, PartKind, PartStop, Pick, Place, Screen, SkywardEnd, SkywardJob, SkywardStage, Source, SystemChoice,
-    SystemsWork, TermEnd, Touch, UsbDrive, UsbLink, SCREEN_OFF,
+    MountFailure, MountRow, Part, PartKind, PartStop, Pick, Place, Region, Screen, SkywardEnd, SkywardJob, SkywardStage, Source, State,
+    SystemChoice, SystemsWork, TermEnd, Touch, UsbDrive, UsbLink, SCREEN_OFF, listed,
 };
+use skyward_ui::canvas::Drawn;
 use skyward_ui::widgets::{self, Bar, Bolt, Cap, Layer};
 use skyward_ui::{editor, fmt, pages, Canvas, Ctx, Fonts, Lang, Theme};
 use skyward_vab::{BootSlots, FailureCode, Hold, Slot, SnapshotState, Standing};
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -134,6 +136,7 @@ fn main() -> Result<()> {
         None => Lang::Hans,
     };
     LANG.set(lang).expect("the language is chosen once");
+    skyward_ui::canvas::watch_texts();
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let font_path = font_path()?;
@@ -143,7 +146,7 @@ fn main() -> Result<()> {
         eprintln!("axis {tag}: {min}..{max} (default {def})");
     }
 
-    let cfg = DeviceConfig::load(root.join("devices/haotian.toml"))?;
+    let cfg = DeviceConfig::load(root.join("devices/nezha.toml"))?;
     let (w, h) = (cfg.display.width, cfg.display.height);
     let ppd = cfg.display.density as f32 / 160.0;
     let light = Theme::light(w, h, ppd);
@@ -162,7 +165,7 @@ fn main() -> Result<()> {
         _ => {}
     }
 
-    let info = haotian(&cfg);
+    let info = nezha(&cfg);
     let pending = DeviceInfo { snapshot: SnapshotState::Snapshotted, ..info.clone() };
     let pattern = Data::Locked { user: 0, keys: Keys::Pattern, checking: false };
     // Whole pages, the way a long screenshot shows them. The About page's
@@ -202,7 +205,13 @@ fn main() -> Result<()> {
 
     // The sideload page through an install, as the installer tells it.
     let recovery = ImageKind::Boot { kernel: false, ramdisk: Ramdisk::Recovery };
-    let installing: [(&str, bool, Install); 17] = [
+    let slotted = |name: &str| FlashTarget { name: name.into(), place: FlashPlace::Slotted };
+    // A filesystem image named for vendor, which fits every logical
+    // partition of a Xiaomi 13 Ultra.
+    let logical: Vec<FlashTarget> = ["vendor", "odm", "product", "system", "system_dlkm", "system_ext", "vendor_dlkm", "mi_ext"]
+        .map(|name| FlashTarget { name: name.into(), place: FlashPlace::Logical })
+        .to_vec();
+    let installing: [(&str, bool, Install); 22] = [
         ("30-sideload-waiting", false, Install::Waiting),
         ("31-sideload-checking", false, Install::Checking { size: 7_103_043_868, stage: None }),
         (
@@ -213,7 +222,40 @@ fn main() -> Result<()> {
         (
             "32-sideload-choosing",
             false,
-            Install::Choosing(Choice { kind: recovery, size: 43_257_856, partitions: vec!["recovery"], partition: 0, pick: Pick::Current }),
+            Install::Choosing(Choice { kind: recovery, size: 43_257_856, partitions: vec![slotted("recovery")], partition: 0, pick: Pick::Current }),
+        ),
+        (
+            "204-flash-choosing-logical",
+            false,
+            Install::Choosing(Choice {
+                kind: ImageKind::Filesystem(Filesystem::Erofs),
+                size: 1_610_612_736,
+                partitions: logical,
+                partition: 0,
+                pick: Pick::Current,
+            }),
+        ),
+        (
+            "204-flash-choosing-super-dark",
+            true,
+            Install::Choosing(Choice {
+                kind: ImageKind::Super,
+                size: 9_663_676_416,
+                partitions: vec![FlashTarget { name: "super".into(), place: FlashPlace::Single }],
+                partition: 0,
+                pick: Pick::Current,
+            }),
+        ),
+        (
+            "204-flash-choosing-named",
+            false,
+            Install::Choosing(Choice { kind: ImageKind::Other, size: 314_572_800, partitions: vec![slotted("modem")], partition: 0, pick: Pick::Both }),
+        ),
+        ("204-flash-resizing-dark", true, Install::Flashing { partition: "vendor".into(), stage: Some(Stage::Resizing) }),
+        (
+            "204-flash-flashed-super",
+            false,
+            Install::Finished { outcome: Outcome::Flashed { partition: "super".into(), slots: Vec::new() }, damage: None },
         ),
         (
             "33-sideload-writing-dark",
@@ -233,14 +275,14 @@ fn main() -> Result<()> {
                 overwriting: false,
             },
         ),
-        ("35-sideload-flashing", false, Install::Flashing { partition: "boot", stage: Some(Stage::Flashing { done: 300, total: 800 }) }),
+        ("35-sideload-flashing", false, Install::Flashing { partition: "boot".into(), stage: Some(Stage::Flashing { done: 300, total: 800 }) }),
         ("36-sideload-installed", false, Install::Finished { outcome: Outcome::Installed { slot: Slot::A, wipe: false }, damage: None }),
         ("96-sideload-light-wipes", false, Install::Confirming { version: Some("OS3.0.306.0.WMACNXM".into()), wipe: true }),
         ("18-install-ready", false, Install::Confirming { version: Some("OS3.0.306.0.WMACNXM".into()), wipe: false }),
         (
             "37-sideload-flashed-recovery-dark",
             true,
-            Install::Finished { outcome: Outcome::Flashed { partition: "recovery", slots: vec![Slot::A, Slot::B] }, damage: None },
+            Install::Finished { outcome: Outcome::Flashed { partition: "recovery".into(), slots: vec![Slot::A, Slot::B] }, damage: None },
         ),
         (
             "38-sideload-refused",
@@ -286,21 +328,6 @@ fn main() -> Result<()> {
         println!("wrote {}", path.display());
     }
 
-    // The settings page as a phone whose panel offers both the always-on face
-    // and the two-tap wake shows it: both switches there, both off, which is
-    // what a freshly flashed phone has.
-    for (name, dark) in [("202-settings-panel-switches-light", false), ("203-settings-panel-switches-dark", true)] {
-        let mut app = App::new(Screen::Settings, w, h, ppd);
-        app.state.lang = lang;
-        app.state.dark = dark;
-        app.state.data = Data::Open;
-        app.state.panel_dozes = true;
-        app.state.panel_taps = true;
-        let path = out.join(format!("{name}.png"));
-        write_png(&path, &whole_page(&mut app, &fonts, &info))?;
-        println!("wrote {}", path.display());
-    }
-
     // The mount page as it opens after boot, after an unmount that failed,
     // and while an update waits to merge, with some partitions unmounted.
     let busy = MountFailure {
@@ -328,11 +355,11 @@ fn main() -> Result<()> {
     // The pages the remaining features open, each with what it would show.
     let made = |place, made, size, parts, system: &str| {
         let held = Held { made, size, parts, device: cfg.device.codename.clone(), system: Some(system.into()), slot: Some(Slot::B) };
-        BackupEntry { place, name: fmt::stamp(made, 0), held: Ok(held) }
+        BackupEntry { place, name: fmt::stamp(made, State::default().zone()), held: Ok(held) }
     };
     let backups = vec![
-        made(Place::Storage, 1_792_348_260, 6_214_000_000, [true, true, false, true], "OS4.0.4.0.XPACNXM"),
-        made(Place::UsbDrive, 1_791_830_000, 141_000_000, [true, false, false, false], "OS4.0.3.0.XPACNXM"),
+        made(Place::Storage, 1_792_348_260, 58_214_000_000, [true; 5], "OS4.0.4.0.XPACNXM"),
+        made(Place::UsbDrive, 1_791_830_000, 141_000_000, [true, false, false, false, false], "OS4.0.3.0.XPACNXM"),
         BackupEntry {
             place: Place::Storage,
             name: "20261020-221500".into(),
@@ -410,7 +437,7 @@ fn main() -> Result<()> {
     let adding = |app: &mut App, name: &str, security: Security, field: Field, choosing: bool| {
         app.state.adding = Some(Adding { name: name.into(), security, field, choosing });
     };
-    let pages: [PageShot; 178] = [
+    let pages: [PageShot; 185] = [
         ("11-install-light-locked", Screen::Install, false, &|app| {
             app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false };
         }),
@@ -513,17 +540,17 @@ fn main() -> Result<()> {
         ("46-restore-light-none", Screen::Restore, false, &|_| {}),
         ("47-restore-light", Screen::Restore, false, &|app| app.set_backups(backups.clone())),
         ("48-restore-backup-light", Screen::RestoreBackup, false, &|app| {
-            app.state.restore = Some((backups[0].clone(), [true, false, false, true]));
+            app.state.restore = Some((backups[0].clone(), [true, false, true, true, true]));
         }),
         ("48-restore-backup-dark-deleting", Screen::RestoreBackup, true, &|app| {
-            app.state.restore = Some((backups[0].clone(), [true, true, false, true]));
+            app.state.restore = Some((backups[0].clone(), [true, true, false, false, true]));
             app.state.asking_delete = true;
         }),
         ("48-restore-backup-light-other-version", Screen::RestoreBackup, false, &|app| {
-            app.state.restore = Some((backups[1].clone(), [true, false, false, false]));
+            app.state.restore = Some((backups[1].clone(), [true, false, false, false, false]));
         }),
         ("48-restore-backup-light-unreadable", Screen::RestoreBackup, false, &|app| {
-            app.state.restore = Some((backups[2].clone(), [false; 4]));
+            app.state.restore = Some((backups[2].clone(), [false; 5]));
         }),
         ("100-backup-job-light-measuring", Screen::BackupJob, false, &|app| app.state.backup_job = job(false, Vec::new(), None, None)),
         ("101-backup-job-light", Screen::BackupJob, false, &|app| {
@@ -554,7 +581,8 @@ fn main() -> Result<()> {
             app.state.backup_job = job(true, plan(), at, Some(BackupEnd::Failed("write /dev/block/dm-61: Input/output error (os error 5)".into())))
         }),
         ("109-restore-job-dark-refused", Screen::BackupJob, true, &|app| {
-            app.state.backup_job = job(true, Vec::new(), None, Some(BackupEnd::Refused(BackupRefusal::OlderAndroid { was: "17".into(), now: "16".into() })))
+            let older = BackupRefusal::OlderAndroid { was: "17".into(), now: "16".into() };
+            app.state.backup_job = job(true, Vec::new(), None, Some(BackupEnd::Refused(older)))
         }),
         ("49-advanced-light", Screen::Advanced, false, &|_| {}),
         ("50-files-light", Screen::Files, false, &|app| app.set_files("/".into(), Ok(sample_root()), LISTED)),
@@ -868,8 +896,21 @@ fn main() -> Result<()> {
             app.term_ended(TermEnd::Exited(0));
         }),
         ("55-language-light", Screen::Language, false, &|_| {}),
-        ("56-time-zone-light", Screen::TimeZone, false, &|_| {}),
-        ("56-time-zone-dark-london", Screen::TimeZone, true, &|app| app.state.time_zone = 5),
+        ("56-time-zone-light-system", Screen::TimeZone, false, &|app| app.set_system_zone("Asia/Shanghai").expect("a zone the recovery carries")),
+        ("56-time-zone-light-system-unlisted", Screen::TimeZone, false, &|app| app.set_system_zone("Asia/Kabul").expect("a zone the recovery carries")),
+        ("56-time-zone-dark-chosen", Screen::TimeZone, true, &|app| {
+            app.set_system_zone("Europe/Rome").expect("a zone the recovery carries");
+            app.state.follow_system_zone = false;
+            app.state.time_zone = listed("Europe/London").expect("London is listed");
+        }),
+        ("56-time-zone-light-no-system", Screen::TimeZone, false, &|_| {}),
+        ("56-time-zones-light-americas", Screen::TimeZones(Region::Americas), false, &|_| {}),
+        ("56-time-zones-dark-europe-africa", Screen::TimeZones(Region::EuropeAfrica), true, &|app| {
+            app.state.time_zone = listed("Europe/London").expect("London is listed");
+        }),
+        ("56-time-zones-light-russia", Screen::TimeZones(Region::Russia), false, &|_| {}),
+        ("56-time-zones-light-asia", Screen::TimeZones(Region::Asia), false, &|_| {}),
+        ("56-time-zones-light-oceania", Screen::TimeZones(Region::Oceania), false, &|_| {}),
         ("57-logs-light", Screen::Logs, false, &|_| {}),
         ("113-update-light-waiting", Screen::Update, false, &|app| app.set_update(Standing::Waiting)),
         ("114-update-dark-merging", Screen::Update, true, &|app| app.set_update(Standing::Merging(0.37))),
@@ -976,14 +1017,14 @@ fn main() -> Result<()> {
         }),
         ("85-decrypt-light-opening", Screen::Decrypt, false, &|app| app.state.data = Data::Opening),
         ("86-decrypt-light-digits", Screen::Decrypt, false, &|app| {
-            app.data_waiting(Some((0, Keys::Digits)), Vec::new());
+            app.data_waiting(Some((0, Keys::Digits)));
             app.state.code = "123".into();
         }),
-        ("87-decrypt-dark-letters", Screen::Decrypt, true, &|app| app.data_waiting(Some((10, Keys::Letters)), Vec::new())),
+        ("87-decrypt-dark-letters", Screen::Decrypt, true, &|app| app.data_waiting(Some((10, Keys::Letters)))),
         ("88-decrypt-light-checking", Screen::Decrypt, false, &|app| {
             app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: true };
         }),
-        ("89-decrypt-light-open", Screen::Decrypt, false, &|app| app.data_waiting(None, Vec::new())),
+        ("89-decrypt-light-open", Screen::Decrypt, false, &|app| app.data_waiting(None)),
         ("90-decrypt-dark-failed", Screen::Decrypt, true, &|app| {
             app.data_failed("android.hardware.security.keymint.IKeyMintDevice/default is not running".into())
         }),
@@ -1512,6 +1553,7 @@ fn opened(screen: Screen, w: u32, h: u32, ppd: f32) -> App {
     let mut app = App::new(screen, w, h, ppd);
     app.state.lang = lang();
     app.state.data = Data::Open;
+    app.set_now(LISTED);
     app
 }
 
@@ -1546,38 +1588,38 @@ fn whole_page(app: &mut App, f: &Fonts, info: &DeviceInfo) -> Canvas {
     c
 }
 
-/// Xiaomi 15 Pro as `skyward info` read it on 2026-11-08 (the config supplies
-/// the SoC name, panel and screen size).
-fn haotian(cfg: &DeviceConfig) -> DeviceInfo {
+/// Xiaomi 17 Ultra by Leica as `skyward info` read it on 2026-10-18 (the
+/// config supplies the SoC name, panel and screen size).
+fn nezha(cfg: &DeviceConfig) -> DeviceInfo {
     DeviceInfo {
-        model: "Xiaomi 15 Pro".into(),
+        model: "Xiaomi 17 Ultra by Leica".into(),
         codename: cfg.device.codename.clone(),
         soc: cfg.device.soc.clone(),
-        cpu: Cpu { cores: 8, max_khz: Some(4_320_000) },
-        ram_kib: 15_914_632,
+        cpu: Cpu { cores: 8, max_khz: Some(4_608_000) },
+        ram_kib: 15_472_464,
         panel: Some((cfg.display.width, cfg.display.height)),
         screen: cfg.display.diagonal,
-        os_version: Some("OS4.0.0.19.XOBCNXM".into()),
+        os_version: Some("OS4.0.4.0.XPACNXM".into()),
         android: Some("17".into()),
         locale: Some("zh-CN".into()),
         time_zone: Some("Asia/Shanghai".into()),
-        security_patch: Some(PatchLevel { year: 2026, month: 9, day: 1 }),
-        kernel: "6.6.118-android15-8-gb9cc6ec16bc8-abogki536571621-4k".into(),
-        storage: Storage { total: 1_024_209_543_168, free: Some(611_375_398_912) },
+        security_patch: Some(PatchLevel { year: 2026, month: 10, day: 1 }),
+        kernel: "6.12.69-android16-6-g43b5ab7e247d-abogki561813157-4k".into(),
+        storage: Storage { total: 1_039_535_157_248, free: Some(620_652_802_048) },
         battery: Some(Battery {
-            level: 78,
+            level: 95,
             charge: Charge::Charging,
-            temp: Some(306),
+            temp: Some(350),
             health: Some("Good".into()),
-            cycles: Some(120),
-            design: Some(5_410_000),
-            full: Some(5_372_000),
-            voltage: Some(4_351_000),
+            cycles: Some(300),
+            design: Some(6_800_000),
+            full: Some(6_543_000),
+            voltage: Some(4_442_000),
             // The recovery has no fast charging handshake with the charger.
             quick: false,
             plugged: true,
         }),
-        slot: Some(Slot::A),
+        slot: Some(Slot::B),
         snapshot: SnapshotState::None,
         boot: Boot { unlocked: Some(true), verified: Some("orange".into()) },
     }
@@ -1627,6 +1669,11 @@ fn font_path() -> Result<PathBuf> {
     Err(anyhow!("no font found; set SKYWARD_FONT to a .ttf/.ttc path"))
 }
 
+/// Write `canvas` as a PNG, and say which of the texts drawn since the last
+/// one was written did not fit its place: among the names the samples make
+/// long on purpose, a text the language writes too long. A text is cut
+/// short where it has a room to end in; where it has none, it runs past
+/// the screen's edge or into the text beside it.
 fn write_png(path: &Path, canvas: &Canvas) -> Result<()> {
     let file = File::create(path)?;
     let w = BufWriter::new(file);
@@ -1634,5 +1681,35 @@ fn write_png(path: &Path, canvas: &Canvas) -> Result<()> {
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
     enc.write_header()?.write_image_data(&canvas.data)?;
+    let shot = path.file_stem().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    let watched = skyward_ui::canvas::take_watched();
+    for text in &watched.cut {
+        println!("cut short in {shot}: {text}");
+    }
+    for (text, part) in &watched.smaller {
+        println!("set at {:.0}% in {shot}: {text}", part * 100.0);
+    }
+    // Of what was drawn for this picture, only what was drawn on a canvas
+    // of its size lies where the picture shows it; a text drawn again in
+    // the same place, as a page drawn twice draws it, is one text.
+    let runs: Vec<&Drawn> = watched.drawn.iter().filter(|run| run.canvas == (canvas.w, canvas.h) && !run.text.trim().is_empty()).collect();
+    let mut said = BTreeSet::new();
+    for (k, run) in runs.iter().enumerate() {
+        if (run.left < -EDGE || run.right > canvas.w as f32 + EDGE) && said.insert(run.text.clone()) {
+            println!("past the edge in {shot}: {}", run.text);
+        }
+        for other in &runs[k + 1..] {
+            let same = run.text == other.text && run.left == other.left && run.top == other.top;
+            let across = run.left.max(other.left) + EDGE < run.right.min(other.right);
+            let down = run.top.max(other.top) + EDGE < run.bottom.min(other.bottom);
+            if !same && across && down && said.insert(format!("{}\n{}", run.text, other.text)) {
+                println!("overlap in {shot}: {} | {}", run.text, other.text);
+            }
+        }
+    }
     Ok(())
 }
+
+/// How far, in pixels, a text's box may reach past the screen's edge or
+/// into another's before the preview says so.
+const EDGE: f32 = 1.0;

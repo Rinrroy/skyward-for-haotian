@@ -1,4 +1,3 @@
-use crate::aod;
 use crate::backup;
 use crate::decrypt::{self, Decryptor};
 use crate::filework;
@@ -31,20 +30,19 @@ use skyward_block::usb::{self, Drive};
 use skyward_net::download::{self, Failure};
 use skyward_net::http::Servers;
 use skyward_net::release::{Installed, Release, Unanswered};
-use skyward_net::wlan::{Power as WlanPower, Stage as Joining};
+use skyward_net::wlan::{Power as WlanPower, Stage as Joining, Wlan};
 use skyward_sys::sleep::{Sleeper, Slept};
 use skyward_sys::uevent;
 use skyward_systems::Who;
-use skyward_ui::aod::{AodStyle, Shown, Want};
 use skyward_ui::app::{
     App, Asked, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop, FileKind, FileOp,
     FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop, Place,
     RenameRefused, Screen, Shot, SkywardEnd, SkywardStage, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION, DOWNLOADS,
     INSTALL_UNFINISHED, USB_DRIVE,
 };
+use skyward_ui::fmt::TimeZone;
 use skyward_ui::settings::Keeper;
 use skyward_ui::surface::kms::KmsSurface;
-use skyward_ui::surface::{Idle, Sleep};
 use skyward_ui::{Canvas, Fonts, Lang, Surface};
 use skyward_vab::{Merge, Standing};
 use std::collections::{BTreeSet, VecDeque};
@@ -71,17 +69,6 @@ const TOUCH_WAIT: Duration = Duration::from_secs(5);
 /// the display turns off; the phone's own system keeps its panel dozing
 /// about as long after the screen goes off.
 const REST: Duration = Duration::from_secs(5);
-
-/// How long the loop waits with the panel off and nothing to do, in
-/// milliseconds.
-///
-/// Every file it waits on is still polled, so a key, a cable, a touch or the
-/// phone's own service answering wakes it at once: this only spaces out the
-/// periodic look, which with the panel dark is the battery and the USB drive
-/// and nothing a person is watching. Five seconds is a fifth of the wakeups a
-/// second would make, and a fifth of what the process costs the sleeping
-/// phone.
-const DARK_WAIT: i32 = 5000;
 
 /// Where logs saved to the temporary folder go, in the recovery service's
 /// own folder, and where in internal storage the others do.
@@ -124,21 +111,7 @@ impl Backlight {
                 .parse()
                 .with_context(|| format!("parse {name}"))
         };
-        let max = read("max_brightness")?;
-        // The panel's normal maximum is read from the node the display
-        // driver booted with, which not every panel gives the same way. A
-        // panel whose node says it as none of them still shows the pages,
-        // at the whole of the backlight's range, and the reason goes to the
-        // kernel log rather than ending the recovery.
-        let top = match normal_max(max) {
-            Ok(top) => top,
-            Err(e) => {
-                let _ = skyward_sys::kmsg(&format!(
-                    "the panel's normal maximum brightness is not known, so the backlight's own maximum is used: {e:#}"
-                ));
-                max
-            }
-        };
+        let top = normal_max(read("max_brightness")?)?;
         let level = read("brightness")?;
         Ok(Backlight { path: dir.join("brightness"), top, level })
     }
@@ -217,35 +190,18 @@ fn power(target: Target) -> Result<()> {
     })
 }
 
-/// Put the radio away before the recovery stops.
-///
-/// The WLAN's thread is told to end, and it ends by setting the switch the
-/// start set back, letting the chip go of its firmware, and taking the driver
-/// out of the kernel. A chip left running is one the system's own driver finds
-/// already up as it boots and will not start cold: no interface appears, the
-/// WLAN stays dead until the phone loses its power, and only flashing the phone
-/// again brings it back.
-///
-/// Init is asked to stop the services on the way out, but nothing in that queue
-/// cuts the chip's power: it keeps its firmware across the restart.
-fn put_radio_away(wlan: &mut Option<wlan::Worker>) {
-    if let Some(worker) = wlan.take() {
-        worker.stop();
-    }
-}
-
 /// File transfer: the service offering internal storage to a computer over
-/// USB, whether it offers the storage now, and the zone, by its place in
-/// the settings, it tells the times of files in.
+/// USB, whether it offers the storage now, and the zone it tells the times
+/// of files in.
 struct Transfer {
     service: skyward_mtp::Service,
     offered: bool,
-    zone: usize,
+    zone: TimeZone,
 }
 
 impl Transfer {
     /// Serve file transfer; the port offers it from when it next rests.
-    fn start(cfg: &DeviceConfig, info: &skyward_info::DeviceInfo, zone: usize) -> Result<Transfer> {
+    fn start(cfg: &DeviceConfig, info: &skyward_info::DeviceInfo, zone: &TimeZone) -> Result<Transfer> {
         let device = skyward_mtp::Device {
             manufacturer: cfg.device.brand.clone(),
             model: info.model.clone(),
@@ -254,9 +210,9 @@ impl Transfer {
             name: info.model.clone(),
             battery: Box::new(|| skyward_info::battery_now().ok().flatten().map(|b| b.level)),
         };
-        let service = skyward_mtp::Service::start(device, skyward_ui::fmt::rules(zone).clone())?;
+        let service = skyward_mtp::Service::start(device, zone.clone())?;
         skyward_sys::usb::set_mtp(true);
-        Ok(Transfer { service, offered: false, zone })
+        Ok(Transfer { service, offered: false, zone: zone.clone() })
     }
 
     /// Offer internal storage, named for the computer in `lang`, or take it
@@ -315,6 +271,38 @@ fn plug(app: &mut App, was: &Option<skyward_info::Battery>, is: &Option<skyward_
     Ok(())
 }
 
+/// The phone's readings that could not be taken, and why the log was last
+/// told each could not: the battery's, read each second, and all the
+/// phone's details, read less often and after what changes them.
+#[derive(Default)]
+struct Untaken {
+    battery: skyward_sys::ToldOnce,
+    details: skyward_sys::ToldOnce,
+}
+
+/// Take in how reading `what` went, `why` it failed where it did. A reading
+/// that cannot be taken leaves the pages with the one they have, and what
+/// is under way goes on; the log is told why, once for as long as the
+/// reason stays the same.
+fn untaken(told: &mut skyward_sys::ToldOnce, what: &str, why: Option<&anyhow::Error>) -> Result<()> {
+    let why = why.map(|e| format!("{e:#}"));
+    if told.untold(why.as_deref()) {
+        skyward_sys::kmsg(&format!("{what} could not be read, and the pages keep what they have: {}", why.unwrap_or_default()))?;
+    }
+    Ok(())
+}
+
+/// Read all the phone's details anew into `info`, which keeps what it has
+/// where they cannot be read.
+fn read_details(cfg: &DeviceConfig, info: &mut skyward_info::DeviceInfo, told: &mut skyward_sys::ToldOnce) -> Result<()> {
+    let read = skyward_info::collect(cfg);
+    untaken(told, "the phone's details", read.as_ref().err())?;
+    if let Ok(read) = read {
+        *info = read;
+    }
+    Ok(())
+}
+
 /// How far a computer has the USB port, as the port's controller tells.
 fn usb_link() -> Result<UsbLink> {
     let controller = skyward_sys::prop("sys.usb.controller").context("init names no USB controller")?;
@@ -339,64 +327,17 @@ fn asked(request: &bcb::Request) -> Asked {
     }
 }
 
-/// Read a folder for the file manager, as it is now. A folder of a user
-/// whose own files are still closed says so in place of its entries: the
-/// names in it cannot be read until that user's credential is given.
-fn list(app: &mut App, folder: String, closed: &[Closed]) -> Result<()> {
-    let mut files = match closed_to_user(closed, Path::new(&folder)) {
-        Some((_, why)) => Err(why),
-        None => read_folder(Path::new(&folder)).map_err(|e| format!("{e:#}")),
-    };
-    // The order is the file page's own switch, applied in the one place an
-    // order is decided: `sort` is the only function that orders a listing, so
-    // a folder cannot come out one way here and another way there.
-    if let Ok(rows) = &mut files {
-        skyward_ui::sort::sort(rows, app.state.sort);
-    }
+/// Read a folder for the file manager, as it is now.
+fn list(app: &mut App, folder: String) -> Result<()> {
+    let files = read_folder(Path::new(&folder)).map_err(|e| format!("{e:#}"));
     app.set_files(folder, files, unix_now()?);
     Ok(())
-}
-
-/// The number of the user a folder of the data partition belongs to, where
-/// it is one of the phone's own user areas: `/data/user/<n>`, where each
-/// user's own files live, and `/data/media/<n>`, where a user's shared
-/// storage does. `None` for every other folder.
-fn user_of(path: &Path) -> Option<u32> {
-    skyward_crypto::users::user_of(path)
-}
-
-/// What to say of a folder that cannot be listed because the own files of
-/// `user` are still closed, or `None` when that is not why.
-///
-/// A phone that keeps a second space or a cloned app open has users whose
-/// own files stay closed until their credential is given: the recovery
-/// opens the owner's and leaves the rest for the file manager to offer. A
-/// folder of theirs, opened before that, reads as names it cannot show, so
-/// the page says which user's files are still closed rather than that the
-/// folder is empty or broken.
-fn closed_to_user(closed: &[Closed], path: &Path) -> Option<(u32, String)> {
-    let user = user_of(path)?;
-    let entry = closed.iter().find(|c| c.user == user)?;
-    let why = match &entry.why {
-        Some(why) => format!("user {user}'s own files did not open: {why}"),
-        None => format!(
-            "user {user}'s own files are still closed. The recovery opens the owner's first; \
-             return to the decrypt page and enter this user's screen lock to open them."
-        ),
-    };
-    Some((user, why))
 }
 
 /// Read a folder of `place` to choose a file to install in, as it is now;
 /// `folder` is its path from the place's top.
 fn list_place(app: &mut App, place: Place, folder: String) -> Result<()> {
-    let mut files = read_folder(&in_place(place, &folder)).map_err(|e| format!("{e:#}"));
-    // A place's list is for choosing something to install, not for browsing,
-    // so it is always by name: the file page's switch has nothing to mean
-    // here.
-    if let Ok(rows) = &mut files {
-        skyward_ui::sort::sort(rows, skyward_ui::app::SortKey::Name);
-    }
+    let files = read_folder(&in_place(place, &folder)).map_err(|e| format!("{e:#}"));
     app.set_place(place, folder, files, unix_now()?);
     Ok(())
 }
@@ -420,7 +361,7 @@ fn in_place(place: Place, path: &str) -> PathBuf {
 /// what update_engine wrote while it last installed an update and what the
 /// last install script wrote, and the kernel's. Each file is owned as a
 /// copy into the folder would be. Gives the folder.
-fn export_logs(recovery: bool, kernel: bool, into: &Path, zone: usize) -> Result<PathBuf> {
+fn export_logs(recovery: bool, kernel: bool, into: &Path, zone: &TimeZone) -> Result<PathBuf> {
     let there = into.ancestors().find(|p| p.exists()).context("the root is always there")?;
     let ownership = ownership(there)?;
     let folder = into.join(skyward_ui::fmt::stamp(unix_now()?, zone));
@@ -451,7 +392,7 @@ fn export_logs(recovery: bool, kernel: bool, into: &Path, zone: usize) -> Result
 /// taken: into the gallery's screenshots where internal storage is open, as
 /// `storage` says, and otherwise into the recovery's own memory until it
 /// opens. Each is made as the system makes what it saves there.
-fn save_screenshot(frame: &Canvas, storage: bool, zone: usize) -> Result<Shot> {
+fn save_screenshot(frame: &Canvas, storage: bool, zone: &TimeZone) -> Result<Shot> {
     let (folder, shot) = match storage {
         true => (Path::new(skyward_crypto::data::SDCARD).join(SCREENSHOTS), Shot::Album),
         false => (PathBuf::from(HELD_SCREENSHOTS), Shot::Held),
@@ -522,24 +463,14 @@ fn backups_at(place: Place) -> Result<Vec<BackupEntry>> {
 
 /// What a backup's manifest records, as the pages show it.
 fn held(m: &skyward_backup::Manifest) -> Held {
-    let [boot, system, data, media, efs] = m.parts();
     Held {
         made: m.made,
         size: m.size(),
-        // The pages tell four parts: the data partition and internal
-        // storage are offered together, as the one data part.
-        parts: [boot, system, data || media, efs],
+        parts: m.parts(),
         device: m.device.clone(),
         system: m.system.clone(),
         slot: skyward_vab::Slot::from_suffix(&m.slot),
     }
-}
-
-/// The parts the pages offer, as the manifest of a backup states them: the
-/// data part is the data partition and internal storage together.
-fn backup_parts(parts: [bool; 4]) -> [bool; 5] {
-    let [boot, system, data, efs] = parts;
-    [boot, system, data, data, efs]
 }
 
 /// Look for backups in the places asked, the restore page showing what is
@@ -911,9 +842,29 @@ fn answer(request: Request, fastboot: bool) -> Vec<Effect> {
     }
 }
 
-/// The time of day for the status bar, in the zone the settings chose.
-fn clock(zone: usize) -> Result<String> {
-    Ok(skyward_ui::fmt::clock(unix_now()?, zone))
+/// Tell the pages which time zone the installed system is set to, where
+/// one is named: `kept`, the one init keeps in the data partition, and
+/// else the one the system is built to start in. A name the recovery
+/// carries no rules for goes to the kernel log, and the clock stays in the
+/// zone it keeps.
+fn follow_system_zone(app: &mut App, kept: Option<&str>, info: &skyward_info::DeviceInfo) -> Result<()> {
+    let Some(name) = kept.or(info.time_zone.as_deref()) else { return Ok(()) };
+    match app.set_system_zone(name) {
+        Ok(()) => skyward_sys::kmsg(&format!("the installed system keeps the time zone {name}")),
+        Err(e) => skyward_sys::kmsg(&format!("the installed system's time zone is not followed: {e:#}")),
+    }
+}
+
+/// The time zone init keeps in the data partition, once that is mounted.
+/// One that cannot be read goes to the kernel log, and counts as none.
+fn kept_time_zone() -> Result<Option<String>> {
+    match skyward_info::kept_time_zone(Path::new(skyward_crypto::data::MOUNT)) {
+        Ok(zone) => Ok(zone),
+        Err(e) => {
+            skyward_sys::kmsg(&format!("the time zone the installed system keeps was not read: {e:#}"))?;
+            Ok(None)
+        }
+    }
 }
 
 /// Tell the kernel log how the data partition was mounted, where opening
@@ -931,17 +882,11 @@ fn log_mounted(mounted: &Opened) -> Result<()> {
     skyward_sys::kmsg(&format!("{} holds {} at {}", mounted.mapped.display(), mounted.filesystem, skyward_crypto::data::MOUNT))
 }
 
-/// Show what the data partition still keeps closed: the owner's screen lock,
-/// where the owner's own files wait on one, with the control it is answered
-/// with, or nothing. Users whose credential the phone made up open behind
-/// the owner and are never asked; one that did not open goes to the kernel
-/// log with why.
-///
-/// A further user's own files — a second space's, a cloned app's — are left
-/// closed without being asked about: the owner came to open the owner's
-/// files, and holding the recovery at such a user's prompt while the
-/// owner's files are open behind it helps nobody. The file manager offers to
-/// open one when a folder of theirs is opened instead.
+/// Show what the data partition still keeps closed: the first user whose
+/// own files wait on a screen lock they set themselves, with the control
+/// that lock is answered with, or nothing. Users whose credential the phone
+/// made up open behind the owner and are never asked; one that did not
+/// open goes to the kernel log with why.
 fn show_closed(app: &mut App, closed: &[Closed]) -> Result<()> {
     use skyward_crypto::user::Lock;
     skyward_sys::kmsg(&format!("the users whose own files are still closed: {:?}", closed.iter().map(|c| c.user).collect::<Vec<_>>()))?;
@@ -950,100 +895,60 @@ fn show_closed(app: &mut App, closed: &[Closed]) -> Result<()> {
             skyward_sys::kmsg(&format!("the files of user {} stay closed: {why}", c.user))?;
         }
     }
-    let asking = skyward_crypto::users::ask(&waiting_of(closed));
-    let waiting = asking.and_then(|user| {
-        closed.iter().find(|c| c.user == user).map(|c| {
-            let keys = match c.lock {
-                Lock::PATTERN => Keys::Pattern,
-                Lock::PIN => Keys::Digits,
-                _ => Keys::Letters,
-            };
-            (c.user, keys)
-        })
+    let waiting = closed.iter().find(|c| !c.made_up).map(|c| {
+        let keys = match c.lock {
+            Lock::PATTERN => Keys::Pattern,
+            Lock::PIN => Keys::Digits,
+            _ => Keys::Letters,
+        };
+        (c.user, keys)
     });
-    // Those the page offers by name rather than asks for: every user still
-    // closed that the phone did not make a credential up for, but not the
-    // one being asked for.
-    let others = closed
-        .iter()
-        .filter(|c| !c.made_up && Some(c.user) != asking)
-        .map(|c| {
-            let keys = match c.lock {
-                Lock::PATTERN => Keys::Pattern,
-                Lock::PIN => Keys::Digits,
-                _ => Keys::Letters,
-            };
-            (c.user, keys)
-        })
-        .collect();
-    app.data_waiting(waiting, others);
+    app.data_waiting(waiting);
     Ok(())
-}
-
-/// The users `closed` names, as much of each as the choice between them
-/// needs.
-fn waiting_of(closed: &[Closed]) -> Vec<skyward_crypto::users::Waiting> {
-    closed.iter().map(|c| skyward_crypto::users::Waiting { user: c.user, made_up: c.made_up }).collect()
 }
 
 /// What the file manager lists for a folder: its entries, folders and
 /// links to folders first, then by name ignoring case, each folder with how
 /// many entries it holds. An entry gone by the time it is looked at, as
 /// processes in /proc go, is left out.
-pub(crate) fn read_folder(path: &Path) -> Result<Vec<FileRow>> {
+fn read_folder(path: &Path) -> Result<Vec<FileRow>> {
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
     let mut rows = Vec::new();
     for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
         let full = entry.with_context(|| format!("read {}", path.display()))?.path();
-        if let Some(row) = read_row(&full)? {
-            rows.push(row);
-        }
+        let meta = match fs::symlink_metadata(&full) {
+            Ok(meta) => meta,
+            Err(e) if gone(&e) => continue,
+            Err(e) => return Err(e).with_context(|| format!("stat {}", full.display())),
+        };
+        let kind = if meta.file_type().is_symlink() {
+            let target = fs::read_link(&full).with_context(|| format!("read the link {}", full.display()))?;
+            // A link to nothing leads to no folder.
+            let folder = match fs::metadata(&full) {
+                Ok(to) => to.is_dir(),
+                Err(e) if gone(&e) => false,
+                Err(e) => return Err(e).with_context(|| format!("follow {}", full.display())),
+            };
+            FileKind::Link { target: target.to_string_lossy().into_owned(), folder }
+        } else if meta.is_dir() {
+            // A folder that may not be read shows that in place of a count.
+            let items = match fs::read_dir(&full) {
+                Ok(inside) => Some(inside.count()),
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
+                Err(e) if gone(&e) => continue,
+                Err(e) => return Err(e).with_context(|| format!("read {}", full.display())),
+            };
+            FileKind::Folder { items }
+        } else if meta.is_file() {
+            FileKind::File
+        } else {
+            FileKind::Special
+        };
+        let name = full.file_name().with_context(|| format!("{} has no name", full.display()))?.to_string_lossy().into_owned();
+        rows.push(FileRow { name, kind, size: meta.len(), modified: meta.mtime(), mode: meta.mode(), uid: meta.uid(), gid: meta.gid() });
     }
-    // The order is not decided here: `skyward_ui::sort::sort` is the one
-    // place that decides one, so that the file page's switch and the choose
-    // pages cannot disagree with each other about the same folder.
+    rows.sort_by_key(|r| (!matches!(r.kind, FileKind::Folder { .. } | FileKind::Link { folder: true, .. }), r.name.to_lowercase()));
     Ok(rows)
-}
-
-/// What the file manager shows for one entry of a folder: its name, what
-/// kind of thing it is, and the size, time and owner its row says. `Ok(None)`
-/// is an entry gone by the time it is looked at, as processes in /proc go.
-///
-/// This is the only place one entry is looked at closely, so that a walk of
-/// a whole tree can ask it about the entries it is going to show and not
-/// about every entry it passes: a stat per entry, and a count of the
-/// contents of every folder passed, is what makes such a walk slow.
-pub(crate) fn read_row(full: &Path) -> Result<Option<FileRow>> {
-    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
-    let meta = match fs::symlink_metadata(full) {
-        Ok(meta) => meta,
-        Err(e) if gone(&e) => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("stat {}", full.display())),
-    };
-    let kind = if meta.file_type().is_symlink() {
-        let target = fs::read_link(full).with_context(|| format!("read the link {}", full.display()))?;
-        // A link to nothing leads to no folder.
-        let folder = match fs::metadata(full) {
-            Ok(to) => to.is_dir(),
-            Err(e) if gone(&e) => false,
-            Err(e) => return Err(e).with_context(|| format!("follow {}", full.display())),
-        };
-        FileKind::Link { target: target.to_string_lossy().into_owned(), folder }
-    } else if meta.is_dir() {
-        // A folder that may not be read shows that in place of a count.
-        let items = match fs::read_dir(full) {
-            Ok(inside) => Some(inside.count()),
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
-            Err(e) if gone(&e) => return Ok(None),
-            Err(e) => return Err(e).with_context(|| format!("read {}", full.display())),
-        };
-        FileKind::Folder { items }
-    } else if meta.is_file() {
-        FileKind::File
-    } else {
-        FileKind::Special
-    };
-    let name = full.file_name().with_context(|| format!("{} has no name", full.display()))?.to_string_lossy().into_owned();
-    Ok(Some(FileRow { name, kind, size: meta.len(), modified: meta.mtime(), mode: meta.mode(), uid: meta.uid(), gid: meta.gid() }))
 }
 
 /// The slot's logical partitions and how each shows now, for the mount page.
@@ -1127,14 +1032,7 @@ fn detach(services: Vec<Service>) -> Detach {
 /// on a phone that has them, and checks a zip's signature before its
 /// install script runs.
 fn install_options(app: &App) -> Options {
-    Options {
-        keep: app.state.keep_recovery && app.state.recovery_partitions,
-        signed: app.state.check_signature,
-        // The system asking for an update never does this: no one is at
-        // the screen to have asked for it, and the install refuses it
-        // on that origin besides.
-        disable_avb: app.state.disable_avb,
-    }
+    Options { keep: app.state.keep_recovery && app.state.recovery_partitions, signed: app.state.check_signature }
 }
 
 /// How often the WLAN page scans while it shows.
@@ -1198,757 +1096,538 @@ fn wait(fds: &[i32], timeout_ms: i32) -> Result<()> {
     Ok(())
 }
 
-/// Run the pages. What `request`, read from misc, asks for decides the
-/// first of them; asking for nothing, they start at `start`.
-pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&Path>) -> Result<()> {
-    if cfg.display.density == 0 {
-        return Err(anyhow!("{}: [display] density is required to lay out the UI", cfg.device.codename));
+/// How work on files ended, as its page tells it.
+fn job_end(end: filework::End) -> JobEnd {
+    match end {
+        filework::End::Done => JobEnd::Done,
+        filework::End::Stopped => JobEnd::Stopped,
+        filework::End::Failed(why) => JobEnd::Failed(why),
     }
-    let mut info = skyward_info::collect(cfg)?;
-    let fonts = Fonts::load(font, 0, mono)?;
-    let mut surface = KmsSurface::open("/dev/dri/card0", cfg.display.fastest_refresh)?;
-    // What the display was told is worth having in the kernel log even when
-    // the pages come up: it says which subpixel block, if any, went out.
-    let _ = skyward_sys::kmsg(&format!("the display is {}", surface.describe()));
-    let (w, h) = surface.size();
-    let mut inputs = Inputs::open(w, h, cfg.touch.writes.clone())?;
-    let started = Instant::now();
-    let mut touch_known = false;
-    // adbd and fastbootd ask over it to go over to fastboot and back.
-    let control = Control::open()?;
-    // Neither the motor nor the backlight is what shows the pages: a phone
-    // whose motor driver is not loaded, or whose panel backlight is not
-    // reached where the phone's own driver keeps it, still works, and why
-    // one is not used goes to the kernel log.
-    let mut haptics = match cfg.haptics.as_ref().map(Haptics::open).transpose() {
-        Ok(haptics) => haptics,
-        Err(e) => {
-            let _ = skyward_sys::kmsg(&format!("the motor is not used: {e:#}"));
-            None
-        }
-    };
-    let mut backlight = match Backlight::open() {
-        Ok(backlight) => Some(backlight),
-        Err(e) => {
-            let _ = skyward_sys::kmsg(&format!("the panel's backlight is not reached: {e:#}"));
-            None
-        }
-    };
-    let first = match &request.work {
-        Work::Fastboot => Screen::Fastboot,
-        Work::PromptWipeData => Screen::CantStart,
-        Work::Unsupported(_) => Screen::Unhandled,
-        Work::Menu
-        | Work::Exit
-        | Work::Update(_)
-        | Work::WipeData { .. }
-        | Work::WipeCache { .. }
-        | Work::WipeAb { .. }
-        | Work::Sideload { .. }
-        | Work::Rescue
-        | Work::UnshareBlocks
-        | Work::SwitchSystem { .. }
-        | Work::SystemStopped => start,
-    };
-    let mut app = App::new(first, w, h, cfg.display.density as f32 / 160.0);
-    app.set_screen_corners(cfg.display.corner_radius as f32);
-    // The settings kept from the starts before are back before the first
-    // frame, and before file transfer starts with its switch and the time
-    // zone. The pages speak the language chosen then, or else the one the
-    // system named with the work it asks for, or the one the installed
-    // system is built to start in, or else the one they last spoke.
-    let kept = settings::read()?;
-    let locale = request.locale.as_deref().or(info.locale.as_deref());
-    let named = locale.map(Lang::for_locale).transpose()?;
-    app.take_settings(kept.settings(), named);
-    // Whether the update reaches for a mirror is settled before the first
-    // frame, so a file that says no is honoured without the switch being
-    // touched. Nothing here can fail the run: `set` writes a flag.
-    skyward_net::mirror::set(app.state.mirror);
-    let mut keeper = Keeper::new(&kept);
-    skyward_sys::kmsg(&format!(
-        "the pages speak {:?}, {}, and the locale named is {}",
-        app.state.lang,
-        if app.state.language_chosen { "the language chosen" } else { "with none chosen" },
-        locale.unwrap_or("none")
-    ))?;
-    // The home page tells of a restart into the slot the system does not
-    // run from now: an update or a switch left for the next boot.
-    if info.slot.is_some() {
-        app.set_boot_slots(read_slots());
-    }
-    app.set_asked(asked(&request));
-    // Opening the data partition, or a user's own files in it, under way,
-    // and the users whose own files are still closed once it is open.
-    let mut decryptor: Option<Decryptor> = None;
-    let mut closed: Vec<Closed> = Vec::new();
-    let mut arriving = Some(Incoming::Arrived);
-    // The mount page shows the partitions as they are when it opens and
-    // after each change; why they cannot be read is the page's to say.
-    let mounts = || read_mounts(programs).map_err(|e| format!("{e:#}"));
+}
 
-    let mut screen = Canvas::new(w, h);
-    // A page sliding over another draws on three screens' worth of canvas
-    // besides the panel's: made ready now, the first slide finds them so.
-    Canvas::keep_ready(w, h, 3);
-    let mut shown_clock = String::new();
-    // The readings are taken again on a thread of their own; those taken
-    // here as work ends say how it left the phone, and readings started
-    // before them are out of date.
-    let readings = Readings::start(cfg)?;
-    let mut read_at = Instant::now();
-    let mut installer: Option<Installer> = None;
-    // Whether the panel's frame memory has been blacked out for an off
-    // panel; cleared once a real frame is shown again.
-    let mut blanked = false;
-    // The panel's own doze, on a phone that names one: a dark panel then
-    // keeps the time on the glass with the backlight at 0.
-    let mut doze = cfg.aod.as_ref().map(aod::Panel::new);
-    let mut faced = String::new();
-    // The face the doze on the glass was drawn with, so that the next frame
-    // is drawn when the minute turns or the face is changed under it.
-    let mut faced_style: Option<AodStyle> = None;
-    // Whether the settings page offers a switch for the panel's own doze: a
-    // phone whose panel has one.
-    app.state.panel_dozes = cfg.aod.is_some();
-    // The two-tap wake is offered where the phone's configuration names it and
-    // the panel can doze: the taps are only felt while the panel stays in its
-    // doze, so a phone with no doze of its own has no way to offer them.
-    app.state.panel_taps = cfg.touch.double_tap && app.state.panel_dozes;
-    // The credential an earlier start kept, where remembering is on: offered
-    // on the decrypt page, and tried by the page's own open where it can be.
-    // A phone that turned remembering off, or forgot it, has none.
-    app.state.remembered = if app.state.remember_password { crate::remembered::load() } else { None };
-    if app.state.remember_password && app.state.remembered.is_none() {
-        // Remembering is on and nothing is kept: a wiped /metadata, or a
-        // credential sealed by a phone that is not this one.
-        let _ = skyward_sys::kmsg("remembering the decrypt password is on, and no credential is kept");
-    }
-    // A credential kept from an earlier start is worth nothing unless the data
-    // partition is opened for it: nothing else at a start asks for the owner's
-    // files, so the recovery would sit on the home page with the phone's
-    // storage shut until someone went to the decrypt page — which is the one
-    // thing this switch exists to spare them. So the open is begun here, and
-    // the kept credential goes with it where the phone asks for one.
-    if app.state.remembered.is_some() && !mount::is_mount_point(Path::new(skyward_crypto::data::MOUNT))? {
-        let _ = skyward_sys::kmsg("a kept credential is here, so the data partition is opened at this start");
-        decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
-    }
-    // When the panel gone dark began to rest.
-    let mut rested_at: Option<Instant> = None;
-    // When the panel went dark, which is what the phone's sleep waits out: a
-    // tap right after the panel goes dark should find it awake.
-    let mut dark_at: Option<Instant> = None;
-    // Whether the touchscreen is armed to wake the phone, and whether that
-    // it could not be has been said already rather than every turn.
-    let mut taps_wake = false;
-    let mut taps_told = false;
-    // Whether the panel was dark the last time the readings were told how
-    // often to look, so that they are told only when that changes.
-    let mut was_dark = false;
-    // The credential just typed, held until the phone says whether it opened
-    // anything: a password a phone turns down is not one to write down.
-    let mut unlock_typed: Option<(u32, String)> = None;
-    // Whether the credential in hand was the one kept from an earlier
-    // start rather than one typed at the page: a kept one the phone
-    // refuses is thrown away, where a typed one is simply wrong.
-    let mut unlock_auto = false;
-    // Started for fastboot, the port goes to the phone's own fastbootd. The
-    // page says whether it came up and how far a computer has the port;
-    // why it did not come up goes to the kernel log and on screen.
-    let mut fastboot = first == Screen::Fastboot;
-    let mut port_at = Instant::now();
-    // File transfer runs while its switch is on, and offers internal
-    // storage while that is open; one that does not start says why on
-    // screen, and the recovery carries on.
-    let mut transfer: Option<Transfer> = None;
-    if app.state.file_transfer {
-        match Transfer::start(cfg, &info, app.state.time_zone) {
-            Ok(t) => transfer = Some(t),
-            Err(e) => {
-                skyward_sys::kmsg(&format!("file transfer did not start: {e:#}"))?;
-                app.file_transfer_failed(false, &skyward_ui::fmt::transfer_failed(app.state.lang, &format!("{e:#}")), monotonic_ms());
-            }
-        }
-    }
-    // A sideload has the port, which goes back to rest once it ends.
-    let mut sideloading = false;
-    if fastboot {
-        if let Err(e) = skyward_sys::usb::switch("fastboot", USB_TIMEOUT) {
-            skyward_sys::kmsg(&format!("fastbootd has not taken the port: {e:#}"))?;
-            app.report(&format!("{e:#}"), monotonic_ms());
-        }
-        let (running, link) = fastboot_status()?;
-        app.set_fastboot(running, link);
-    }
-    // Work the request asks for that goes on keeps the request in misc,
-    // so a restart halfway comes back to it, until it is done or the user
-    // leaves it for somewhere else.
-    let misc = bcb::misc();
-    let mut kept = request.work.lasts();
-    // The wipe page offers the cache partition where the phone's table has
-    // one; a table that does not read leaves it out, and the page still
-    // works.
-    app.state.cache_partition = match wipe::cache() {
-        Ok(cache) => cache.is_some(),
-        Err(e) => {
-            skyward_sys::kmsg(&format!("whether the phone has a cache partition is not known: {e:#}"))?;
-            false
-        }
-    };
-    app.state.phone_logs = cfg.wipe.logs.len();
-    // Skyward lives in a recovery partition of each slot where the phone
-    // has them, and the install page then offers to keep it there. Such a
-    // phone holds a second system where it also has boot and init_boot
-    // partitions in both slots, which a switch writes.
-    let by_name = Path::new(skyward_block::BY_NAME);
-    let both = |base: &str| -> Result<bool> { Ok(by_name.join(format!("{base}_a")).try_exists()? && by_name.join(format!("{base}_b")).try_exists()?) };
-    app.state.recovery_partitions = both("recovery")?;
-    app.state.dual_boot = app.state.recovery_partitions && both("boot")? && both("init_boot")?;
-    // The second system's work; the systems are read at once, for the home
-    // page to name the one that starts, once a switch cut off before is
-    // finished.
-    let mut systems_worker = match app.state.dual_boot {
-        true => Some(systems::Worker::start(cfg.device.os_version_prop.clone())?),
-        false => None,
-    };
-    // A switch the system asked for, under way; then the phone starts the
-    // system switched to.
-    let mut switch_asked = false;
-    // A switch went through and the phone is restarting into the system.
-    let mut switched = false;
-    // fastbootd may write the boot partitions, which the installed system's
-    // boot set goes back into first, and finds /metadata as it was; why the
-    // boot set could not go back is shown, and fastboot goes on, as the way
-    // left to repair the phone.
-    if fastboot && app.state.dual_boot {
-        let metadata = Path::new("/metadata");
-        let mounted = mount::is_mount_point(metadata)?;
-        let put_back = skyward_systems::install::ensure_installed();
-        if !mounted && mount::is_mount_point(metadata)? {
-            mount::umount(metadata)?;
-        }
-        if let Err(e) = put_back {
-            skyward_sys::kmsg(&format!("the installed system's boot set did not go back before fastboot: {e:#}"))?;
-            app.report(&format!("{e:#}"), monotonic_ms());
-        }
-    }
-    let mut eraser: Option<Eraser> = None;
-    // Erasing the system asked for leaves on its own once it is done, as
-    // does erasing an update asked for, sideloaded with a restart after it;
-    // what the user chose waits for them.
-    let mut erase_leaves = false;
-    // Erasing all user data rescue asked for, whose end goes back to rescue
-    // rather than to a page of its own.
-    let mut rescue_erasing = false;
-    // Where rescue asked the phone to leave for, once it lets USB go.
-    let mut rescue_leaves: Option<(Target, bool)> = None;
-    // The install the system asked for, until the data partition it is in
-    // opens, or the user whose own files hold it unlocks them.
-    let mut pending: Option<Pending> = None;
-    // Work on whole partitions under way, and whether the system asked for
-    // it before the recovery started.
-    let mut part_worker: Option<partwork::Worker> = None;
-    match &request.work {
-        Work::WipeData { reformat } => {
-            eraser = Some(factory_reset(&mut app, request.keep_memtag_mode, true, reformat.clone())?);
-            erase_leaves = true;
-        }
-        Work::WipeCache { reformat } => {
-            eraser = Some(parts_wipe(&mut app, vec![Step::Cache], &cfg.wipe.logs, true, reformat.clone())?);
-            erase_leaves = true;
-        }
-        Work::Sideload { .. } => {
-            app.start_sideload();
-            installer = Some(Installer::start(detach(programs.to_vec()), install_options(&app))?);
-            sideloading = true;
-        }
-        Work::Rescue => {
-            app.start_rescue();
-            installer = Some(Installer::rescue(detach(programs.to_vec()), install_options(&app))?);
-            sideloading = true;
-        }
-        Work::Update(update) => {
-            app.start_asked(update.security, update.package.clone());
-            let retry = update.retry > 0;
-            if !retry && panicked() {
-                skyward_sys::kmsg("the phone came here after its kernel stopped, so the update asked for is not installed")?;
-                app.install(skyward_install::Event::Finished(skyward_install::Outcome::Refused(skyward_install::Refusal::Panicked)), monotonic_ms());
-                bcb::clear(&misc)?;
-                kept = false;
-            } else {
-                let (package, needs) = asked::locate(&update.package, app.state.cache_partition);
-                skyward_sys::kmsg(&format!("the update asked for is {package:?}, which needs {needs:?}"))?;
-                let wanted = Pending { package, needs, retry };
-                match needs {
-                    Needs::Data | Needs::User(_) => {
-                        app.asked_opening();
-                        decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
-                        pending = Some(wanted);
-                    }
-                    Needs::Nothing | Needs::Cache => installer = Some(install_asked(programs, &app, wanted)?),
-                }
-            }
-        }
-        Work::WipeAb { package_size } => {
-            app.part_work_started(PartKind::Disable, true);
-            part_worker = Some(partwork::Worker::start(partwork::Task::Disable { package_size: *package_size })?);
-        }
-        Work::UnshareBlocks => {
-            let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-            app.part_work_started(PartKind::Unshare, true);
-            part_worker = Some(partwork::Worker::start(partwork::Task::Unshare { slot })?);
-        }
-        // The installed system is asked for by a word, and the second by
-        // its id.
-        Work::SwitchSystem { to } => match systems_worker.as_mut() {
-            Some(worker) => {
-                app.switch_asked(if to == "installed" { Who::Installed } else { Who::Other });
-                worker.send(systems::Task::SwitchNamed(to.clone()));
-                switch_asked = true;
-            }
-            // A phone that cannot hold a second system has none to switch
-            // to, and the request is done with.
-            None => {
-                skyward_sys::kmsg(&format!("asked to switch to the system {to:?}, which this phone cannot hold"))?;
-                bcb::clear(&misc)?;
-                kept = false;
-            }
-        },
-        // The second system's start stopped and brought the recovery up to
-        // say why; it still starts next, unless the user switches.
-        Work::SystemStopped => {
-            let why = request.reason.clone().unwrap_or_default();
-            skyward_sys::kmsg(&format!("the second system's start stopped: {why}"))?;
-            if app.state.dual_boot {
-                app.system_stopped(why);
-            }
-        }
-        Work::Menu | Work::Exit | Work::Fastboot | Work::PromptWipeData | Work::Unsupported(_) => {}
-    }
-    // A switch asked for finishes one cut off before itself; fastboot leaves
-    // /metadata to fastbootd until the recovery's pages come up.
-    if let (Some(worker), false, false) = (systems_worker.as_mut(), switch_asked, fastboot) {
-        worker.send(systems::Task::Resume);
-    }
-    // The port came up with adb alone; at rest it offers file transfer
-    // beside it.
-    if transfer.is_some() && !fastboot && !sideloading
-        && let Err(e) = skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT) {
-        skyward_sys::kmsg(&format!("the port did not take file transfer: {e:#}"))?;
-        app.report(&format!("{e:#}"), monotonic_ms());
-    }
-    // Once the work the system asked for is done, the page shows it for a
-    // moment; then the phone starts the system, or powers off where the
-    // request says to.
-    let leave = if request.shutdown_after { Target::PowerOff } else { Target::System };
-    let mut leave_at: Option<u64> = None;
-    // The terminal page's shell, from when the page first asks for one.
-    let mut shell: Option<pty::Shell> = None;
-    // Copying, moving or deleting under way.
-    let mut worker: Option<filework::Worker> = None;
-    // Giving the data partition's files their SELinux labels under way.
-    let mut relabeler: Option<filework::Worker> = None;
-    // Backing up or restoring under way.
-    let mut backuper: Option<backup::Worker> = None;
-    // An update's merge followed: one the recovery found under way, which
-    // the kernel took up again as the snapshots were mapped, or one started
-    // on the update page.
-    let mut merger: Option<merge::Merger> = None;
-    if let Some(slot) = info.slot {
-        let standing = skyward_vab::standing(slot)?;
-        if matches!(standing, Standing::Merging(_)) && skyward_vab::snapshots_mapped(slot)? {
-            skyward_sys::kmsg("the update's merge goes on")?;
-            merger = Some(merge::Merger::start(slot, false)?);
-        }
-        app.set_update(standing);
-    }
-    // The DNS servers the network joined gave, for looking names up.
-    let servers: Servers = Arc::new(Mutex::new(Vec::new()));
-    // The WLAN, on a phone whose driver the recovery brings up. It comes up
-    // with the recovery rather than waiting for the switch on its page, as
-    // the phone's own system brings its WLAN up at boot: the page then shows
-    // the radio coming up instead of a switch that is off. None of this is
-    // what shows the pages, so a phone whose WLAN cannot be brought up still
-    // works, and why it could not goes to the kernel log — as a radio that
-    // fails once tried says why on its own page.
-    let mut wlan = match &cfg.wlan {
-        Some(w) => {
-            let started = (|| -> Result<wlan::Worker> {
-                let modules = cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
-                // Without the bundle of the vendor interface's libraries the
-                // supplicant does not start, and the WLAN page says why.
-                let libraries = secure::libraries().unwrap_or_else(|e| {
-                    let _ = skyward_sys::kmsg(&format!("the vendor interface's libraries are not open: {e:#}"));
-                    None
-                });
-                wlan::Worker::start(w.clone(), modules, libraries, servers.clone())
-            })();
-            match started {
-                Ok(worker) => {
-                    app.start_wlan();
-                    worker.send(wlan::Command::On);
-                    Some(worker)
-                }
-                // With no thread to tell how the radio stands, the page is
-                // not offered at all, as on a phone the recovery brings no
-                // WLAN up for.
-                Err(e) => {
-                    let _ = skyward_sys::kmsg(&format!("the WLAN is not brought up: {e:#}"));
-                    None
-                }
-            }
-        }
-        None => None,
-    };
-    let mut scanned_at = Instant::now();
-    app.state.update_server = cfg.update.is_some();
-    // Asking the update server, and downloading the full package.
-    let mut checker: Option<updates::Worker> = None;
-    let mut downloader: Option<updates::Worker> = None;
-    // Asking GitHub for Skyward's newest release, and updating to it.
-    let mut skyward_checker: Option<updates::Worker> = None;
-    let mut skyward_updater: Option<updates::Worker> = None;
+/// Run the pages. What `request`, read from misc, asks for decides the
+/// first of them; asking for nothing, they start at `start`. `programs`
+/// are the phone's own that the recovery keeps running: the
+/// configuration's, and those the phone's partitions name for its keys.
+pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&Path>) -> Result<()> {
+    let mut pages = Pages::open(cfg, programs, font, mono, request, start, dump)?;
+    pages.begin()?;
     // The phone sleeps while its screen is off and nothing needs it awake.
     let sleeper = Sleeper::start()?;
     // A uevent may be a charger or a computer attached or taken away: the
     // battery is read at once, and the phone stays awake until it is.
     let uevents = uevent::Listener::open()?;
-    let mut asked: Option<Instant> = None;
-    // The USB drive plugged in, looked for each second.
-    let mut plugged: Option<Plugged> = None;
-    let mut seen: Option<String> = None;
-    let mut drive_at = Instant::now();
     loop {
-        let now = monotonic_ms();
-        if leave_at.is_some_and(|at| now >= at) {
-            leave_at = None;
-            power(leave)?;
+        pages.turn(&sleeper, &uevents)?;
+    }
+}
+
+/// The pages, and all the loop that runs them holds from one turn to the
+/// next: the panel and what is drawn on it, what the phone tells of
+/// itself, the request from misc, and the work under way, each on a thread
+/// of its own.
+struct Pages<'a> {
+    cfg: &'a DeviceConfig,
+    /// The phone's own programs that the recovery keeps running.
+    programs: &'a [Service],
+    /// What misc asked for as the recovery started.
+    request: bcb::Request,
+    /// Where each frame shown is written as well.
+    dump: Option<&'a Path>,
+    app: App,
+    info: skyward_info::DeviceInfo,
+    unread: Untaken,
+    fonts: Fonts,
+    surface: KmsSurface,
+    /// The frame last drawn.
+    screen: Canvas,
+    inputs: Inputs,
+    started: Instant,
+    /// Whether the wait for a touch panel to come up is over.
+    touch_known: bool,
+    /// adbd and fastbootd ask over it to go over to fastboot and back.
+    control: Option<Control>,
+    haptics: Option<Haptics>,
+    backlight: Backlight,
+    keeper: Keeper,
+    shown_clock: String,
+    /// The page shown first, until it has been told it shows.
+    arriving: Option<Incoming>,
+    /// The readings are taken again on a thread of their own; those taken
+    /// here as work ends say how it left the phone, and readings started
+    /// before them are out of date.
+    readings: Readings,
+    read_at: Instant,
+    /// When the battery was asked for at once, after a uevent; the phone
+    /// stays awake until it is read.
+    asked: Option<Instant>,
+    /// Whether the panel's frame memory has been blacked out for an off
+    /// panel; cleared once a real frame is shown again.
+    blanked: bool,
+    /// When the panel gone dark began to rest.
+    rested_at: Option<Instant>,
+    /// Started for fastboot, the port goes to the phone's own fastbootd. The
+    /// page says whether it came up and how far a computer has the port;
+    /// why it did not come up goes to the kernel log and on screen.
+    fastboot: bool,
+    port_at: Instant,
+    /// File transfer runs while its switch is on, and offers internal
+    /// storage while that is open; one that does not start says why on
+    /// screen, and the recovery carries on.
+    transfer: Option<Transfer>,
+    /// A sideload has the port, which goes back to rest once it ends.
+    sideloading: bool,
+    misc: PathBuf,
+    /// Work the request asks for that goes on keeps the request in misc,
+    /// so a restart halfway comes back to it, until it is done or the user
+    /// leaves it for somewhere else.
+    kept: bool,
+    /// Once the work the system asked for is done, the page shows it for a
+    /// moment; then the phone starts the system, or powers off where the
+    /// request says to.
+    leave: Target,
+    leave_at: Option<u64>,
+    installer: Option<Installer>,
+    /// The install the system asked for, until the data partition it is in
+    /// opens, or the user whose own files hold it unlocks them.
+    pending: Option<Pending>,
+    /// Where rescue asked the phone to leave for, once it lets USB go.
+    rescue_leaves: Option<(Target, bool)>,
+    eraser: Option<Eraser>,
+    /// Erasing the system asked for leaves on its own once it is done, as
+    /// does erasing an update asked for, sideloaded with a restart after it;
+    /// what the user chose waits for them.
+    erase_leaves: bool,
+    /// Erasing all user data rescue asked for, whose end goes back to rescue
+    /// rather than to a page of its own.
+    rescue_erasing: bool,
+    /// Opening the data partition, or a user's own files in it, under way,
+    /// and the users whose own files are still closed once it is open.
+    decryptor: Option<Decryptor>,
+    closed: Vec<Closed>,
+    /// The credential sent to a screen lock, and whether it was one kept from
+    /// an earlier start rather than one typed here.
+    unlock_typed: Option<(u32, String)>,
+    unlock_auto: bool,
+    /// Work on whole partitions under way.
+    part_worker: Option<partwork::Worker>,
+    /// Copying, moving or deleting under way.
+    worker: Option<filework::Worker>,
+    /// Giving the data partition's files their SELinux labels under way.
+    relabeler: Option<filework::Worker>,
+    /// Backing up or restoring under way.
+    backuper: Option<backup::Worker>,
+    /// An update's merge followed: one the recovery found under way, which
+    /// the kernel took up again as the snapshots were mapped, or one started
+    /// on the update page.
+    merger: Option<merge::Merger>,
+    /// The second system's work, on a phone that can hold one.
+    systems_worker: Option<systems::Worker>,
+    /// A switch the system asked for, under way; then the phone starts the
+    /// system switched to.
+    switch_asked: bool,
+    /// A switch went through and the phone is restarting into the system.
+    switched: bool,
+    /// The DNS servers the network joined gave, for looking names up.
+    servers: Servers,
+    /// The WLAN, on a phone whose driver the recovery brings up.
+    wlan: Option<wlan::Worker>,
+    scanned_at: Instant,
+    /// Asking the update server, and downloading the full package.
+    checker: Option<updates::Worker>,
+    downloader: Option<updates::Worker>,
+    /// Asking GitHub for Skyward's newest release, and updating to it.
+    skyward_checker: Option<updates::Worker>,
+    skyward_updater: Option<updates::Worker>,
+    /// The terminal page's shell, from when the page first asks for one.
+    shell: Option<pty::Shell>,
+    /// The USB drive plugged in, looked for each second.
+    plugged: Option<Plugged>,
+    seen: Option<String>,
+    drive_at: Instant,
+}
+
+impl<'a> Pages<'a> {
+    /// Bring up the panel, the touchscreen and the pages, as the settings
+    /// kept from the starts before leave them, with none of the work the
+    /// request asks for started yet.
+    fn open(cfg: &'a DeviceConfig, programs: &'a [Service], font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&'a Path>) -> Result<Pages<'a>> {
+        if cfg.display.density == 0 {
+            return Err(anyhow!("{}: [display] density is required to lay out the UI", cfg.device.codename));
         }
-        if !touch_known && started.elapsed() >= TOUCH_WAIT {
-            touch_known = true;
-            if !inputs.has_panel() {
-                skyward_sys::kmsg("no touch panel came up; the pages are worked with the keys")?;
-                app.touchscreen_missing();
+        // The pages come up without a battery that cannot be read, as while no
+        // driver for it is loaded; the readings taken each second bring it in
+        // once it can.
+        let mut unread = Untaken::default();
+        let battery = skyward_info::battery_now();
+        untaken(&mut unread.battery, "the battery", battery.as_ref().err())?;
+        let info = skyward_info::collect_with(cfg, battery.unwrap_or_default())?;
+        let fonts = Fonts::load(font, 0, mono)?;
+        let mut surface = KmsSurface::open("/dev/dri/card0")?;
+        let (w, h) = surface.size();
+        // A touch controller that follows the panel wakes as the panel goes
+        // from rest to running, and at no other time. The recovery service
+        // running again finds it as the earlier run left it, at rest where the
+        // panel rested then, so the panel is put to rest and woken with a dark
+        // frame, as every later wake wakes it, before the touchscreen is taken
+        // in and told its settings: a controller at rest answers none of them.
+        if skyward_sys::runs_again() {
+            surface.rest()?;
+            surface.present(&Canvas::new(w, h))?;
+            surface.settle()?;
+        }
+        eprintln!("display {}", surface.describe());
+        let inputs = Inputs::open(w, h, cfg.touch.writes.clone())?;
+        let started = Instant::now();
+        let control = Control::open()?;
+        let haptics = cfg.haptics.as_ref().map(Haptics::open).transpose()?;
+        let backlight = Backlight::open()?;
+        let first = match &request.work {
+            Work::Fastboot => Screen::Fastboot,
+            Work::PromptWipeData => Screen::CantStart,
+            Work::Unsupported(_) => Screen::Unhandled,
+            Work::Menu
+            | Work::Exit
+            | Work::Update(_)
+            | Work::WipeData { .. }
+            | Work::WipeCache { .. }
+            | Work::WipeAb { .. }
+            | Work::Sideload { .. }
+            | Work::Rescue
+            | Work::UnshareBlocks
+            | Work::SwitchSystem { .. }
+            | Work::SystemStopped => start,
+        };
+        let mut app = App::new(first, w, h, cfg.display.density as f32 / 160.0);
+        app.set_screen_corners(cfg.display.corner_radius as f32);
+        // The settings kept from the starts before are back before the first
+        // frame, and before file transfer starts with its switch and the time
+        // zone. The pages speak the language chosen then, or else the one the
+        // system named with the work it asks for, or the one the installed
+        // system is built to start in, or else the one they last spoke.
+        let kept = settings::read()?;
+        let locale = request.locale.as_deref().or(info.locale.as_deref());
+        let named = locale.map(Lang::for_locale).transpose()?;
+        app.take_settings(kept.settings(), named);
+        // The credential an earlier start kept, where remembering is on. A
+        // phone that turned remembering off, or forgot it, has none.
+        app.state.remembered = if app.state.remember_password { crate::remembered::load() } else { None };
+        if app.state.remember_password && app.state.remembered.is_none() {
+            let _ = skyward_sys::kmsg("remembering the decrypt password is on, and no credential is kept");
+        }
+        let keeper = Keeper::new(&kept);
+        skyward_sys::kmsg(&format!(
+            "the pages speak {:?}, {}, and the locale named is {}",
+            app.state.lang,
+            if app.state.language_chosen { "the language chosen" } else { "with none chosen" },
+            locale.unwrap_or("none")
+        ))?;
+        // The clock follows the time zone the installed system was last
+        // seen set to, or else the one it is built to start in, until the
+        // data partition opens and tells which it is set to now. A phone
+        // with no system names none, and keeps the zone chosen.
+        if app.state.system_zone.is_none() {
+            follow_system_zone(&mut app, None, &info)?;
+        }
+        app.set_now(unix_now()?);
+        // The home page tells of a restart into the slot the system does not
+        // run from now: an update or a switch left for the next boot.
+        if info.slot.is_some() {
+            app.set_boot_slots(read_slots());
+        }
+        app.set_asked(asked(&request));
+        let screen = Canvas::new(w, h);
+        // A page sliding over another draws on three screens' worth of canvas
+        // besides the panel's: made ready now, the first slide finds them so.
+        Canvas::keep_ready(w, h, 3);
+        let readings = Readings::start(cfg)?;
+        let read_at = Instant::now();
+        let fastboot = first == Screen::Fastboot;
+        let port_at = Instant::now();
+        let mut transfer: Option<Transfer> = None;
+        if app.state.file_transfer {
+            match Transfer::start(cfg, &info, app.state.zone()) {
+                Ok(t) => transfer = Some(t),
+                Err(e) => {
+                    skyward_sys::kmsg(&format!("file transfer did not start: {e:#}"))?;
+                    app.file_transfer_failed(false, &skyward_ui::fmt::transfer_failed(app.state.lang, &format!("{e:#}")), monotonic_ms());
+                }
             }
         }
-        for fx in app.tick(now) {
-            match fx {
-                Effect::Haptic => {
-                    if let Some(h) = &mut haptics {
-                        h.click(app.state.vibration)?;
-                    }
-                }
-                // The power key held past its wait for volume down turns
-                // the screen off.
-                Effect::Ticks => {
-                    if let Some(h) = &mut haptics {
-                        h.ticks()?;
-                    }
-                }
-                other => unreachable!("time passing asks for nothing but the motor, not {other:?}"),
+        if fastboot {
+            if let Err(e) = skyward_sys::usb::switch("fastboot", USB_TIMEOUT) {
+                skyward_sys::kmsg(&format!("fastbootd has not taken the port: {e:#}"))?;
+                app.report(&format!("{e:#}"), monotonic_ms());
             }
-        }
-        let time = clock(app.state.time_zone)?;
-        if time != shown_clock {
-            shown_clock = time;
-            app.redraw();
-        }
-        for reading in readings.taken() {
-            match reading {
-                Reading::Battery(battery, at) => {
-                    let battery = battery?;
-                    if asked.is_some_and(|asked| at >= asked) {
-                        asked = None;
-                    }
-                    if battery != info.battery {
-                        plug(&mut app, &info.battery, &battery, now)?;
-                        info.battery = battery;
-                        app.refresh();
-                    }
-                }
-                Reading::All(all, at) => {
-                    let all = (*all)?;
-                    if asked.is_some_and(|asked| at >= asked) {
-                        asked = None;
-                    }
-                    if at >= read_at && all != info {
-                        plug(&mut app, &info.battery, &all.battery, now)?;
-                        info = all;
-                        app.refresh();
-                    }
-                }
-            }
-        }
-        // In fastboot the page follows fastbootd and the cable each second.
-        if fastboot && port_at.elapsed().as_secs() >= 1 {
             let (running, link) = fastboot_status()?;
             app.set_fastboot(running, link);
-            port_at = Instant::now();
         }
-        let panel = app.panel(now);
-        let mut shown = false;
-        let dozes = doze.as_ref().is_some_and(aod::Panel::usable);
-        // A phone whose two-tap wake is on has to keep its panel in the
-        // panel's own doze rather than taking it down: Xiaomi's touch driver
-        // suspends the touch IC on the panel's blanking notice, so a panel
-        // turned off is a touchscreen that reports nothing, and no tap can
-        // ever come. The panel dozes dark instead — the CRTC runs, the
-        // touchscreen scans, and the glass shows nothing. With the switch off
-        // the panel is taken down as it always was, and the phone suspends.
-        let keeps_touch = app.state.panel_taps && app.state.double_tap && dozes;
-        if panel.is_some() {
-            // Out of the panel's doze before the page goes over the face.
-            if blanked
-                && let Some(p) = doze.as_mut() {
-                p.want(Want::Lit);
+        // The wipe page offers the cache partition where the phone's table has
+        // one; a table that does not read leaves it out, and the page still
+        // works.
+        app.state.cache_partition = match wipe::cache() {
+            Ok(cache) => cache.is_some(),
+            Err(e) => {
+                skyward_sys::kmsg(&format!("whether the phone has a cache partition is not known: {e:#}"))?;
+                false
             }
-            // A display turned off comes on again with a frame drawn for it.
-            if app.take_dirty() || !surface.is_on() {
-                let t0 = Instant::now();
-                app.compose(&mut screen, &fonts, &info, &shown_clock, now);
-                surface.present(&screen)?;
-                eprintln!("frame {:?} in {} ms", app.screen(), t0.elapsed().as_millis());
-                if let Some(path) = dump {
-                    fs::write(path, &screen.data).with_context(|| format!("write {}", path.display()))?;
-                }
-                shown = true;
-            }
-            blanked = false;
-        } else if dozes && (app.state.always_on || keeps_touch) {
-            // The panel is put into its own doze rather than taken down, so
-            // that the CRTC keeps running and Xiaomi's touch driver keeps the
-            // IC scanning: that is what makes a double tap possible at all.
-            // With the always-on display on, the face goes on the glass
-            // before the panel dozes and again each minute, since an OLED in
-            // its doze shows what the frame holds; with it off the frame is
-            // blacked out first, so the doze is simply dark.
-            if !blanked {
-                faced.clear();
-            }
-            if app.state.always_on {
-                // A face chosen while the panel dozes is drawn at once rather
-                // than at the next minute, so the setting shows what it did.
-                let style = app.state.aod_style;
-                if !blanked || faced != shown_clock || faced_style != Some(style) {
-                    let facts = skyward_ui::aod::Facts {
-                        date: skyward_ui::fmt::date(app.state.lang, unix_now()?, app.state.time_zone),
-                        battery: info.battery.as_ref().map(|b| (b.level, b.plugged)),
-                        slot: info.slot.map(|s| s.letter().to_string()),
-                        data: skyward_ui::fmt::data(app.state.lang, &app.state.data).to_string(),
-                    };
-                    skyward_ui::aod::face(&mut screen, &fonts, &shown_clock, &facts, style, cfg.display.density as f32 / 160.0);
-                    surface.present(&screen)?;
-                    surface.settle()?;
-                    faced.clone_from(&shown_clock);
-                    faced_style = Some(style);
-                }
-            } else if !blanked {
-                screen.data.fill(0);
-                surface.present(&screen)?;
-                surface.settle()?;
-            }
-            if !blanked && doze.as_mut().is_some_and(|p| p.want(Want::Dark) == Shown::Blank) {
-                screen.data.fill(0);
-                surface.present(&screen)?;
-                surface.settle()?;
-            }
-            blanked = true;
-        } else if !blanked {
-            // Black out the panel's frame memory before the backlight goes
-            // to 0 and the display off, so an OLED that floors the backlight
-            // above zero rather than cutting it shows nothing as it goes off.
-            screen.data.fill(0);
-            surface.present(&screen)?;
-            surface.settle()?;
-            blanked = true;
-        }
-        // After the frame is on the panel, so a panel coming back on lights
-        // with what it should show now, never with what it showed when it
-        // went off.
-        if backlight.as_ref().is_some_and(|b| b.level == 0) && panel.is_some() {
-            surface.settle()?;
-        }
-        // Whether the panel keeps the face in its own doze, or is dark in it
-        // so that a tap can be felt: either way what the panel holds is not
-        // the pages, so it must not be rested or turned off under it.
-        let dozing = panel.is_none() && dozes && (app.state.always_on || keeps_touch);
-        // The pages are what this loop is for; a panel whose backlight
-        // cannot be written still shows them, and why it could not goes to
-        // the kernel log once rather than ending the recovery.
-        let lit = match backlight.as_mut() {
-            Some(b) => b.show(panel).map_err(|e| format!("{e:#}")),
-            None => Ok(()),
         };
-        if let Err(e) = lit {
-            let _ = skyward_sys::kmsg(&format!("the panel's backlight is not set: {e}"));
-            backlight = None;
-        } else if dozing {
-            // The panel keeps the face in its doze; there is nothing to rest.
-        } else if panel.is_some() {
-            // Lit, a panel that came on again switches to its fastest
-            // refresh.
-            surface.speed_up()?;
-            rested_at = None;
-            dark_at = None;
-        } else if surface.is_on() {
-            // With the backlight off, the panel rests, and the touch
-            // controller following it stops drawing power. This is the moment
-            // the phone may start thinking about sleeping, and the moment a
-            // tap right after it has to still find it awake.
-            surface.rest()?;
-            rested_at = Some(Instant::now());
-            dark_at = Some(Instant::now());
-        } else if rested_at.is_some_and(|at| at.elapsed() >= REST) {
-            // Rested long enough, the display goes off: the panel and the
-            // display processor feeding it stop drawing power.
-            surface.turn_off()?;
-            rested_at = None;
-        }
-        // A panel the doze keeps on the glass is not dark either, so it is
-        // not somewhere a phone may be left to sleep.
-        if dozing {
-            dark_at = None;
-        }
-        // A page at rest draws the rows it has yet to while nothing else
-        // is to be done, a band at a time, looking for input between bands.
-        let ahead = panel.is_some() && !shown && app.draw_ahead(&fonts, &info);
-        // A frame shown has waited for the one before it to reach the
-        // panel, which keeps the loop to the panel's pace; otherwise the CPU
-        // gets at least a millisecond.
-        let floor = if shown { 0 } else { 1 };
-        let until_due = app.deadline(now).map(|d| d.saturating_sub(now) as i32);
-        // A resting panel turns off once its rest is over.
-        let rest_left = rested_at.map(|at| REST.saturating_sub(at.elapsed()).as_millis() as i32);
-        let timeout = if ahead { 0 } else { until_due.into_iter().chain(rest_left).min().map_or(1000, |t| t.clamp(floor, 1000)) };
-        // A dark phone with nothing to do has no reason to wake every second:
-        // every fd it waits on is still polled, so a key, a cable or a tap
-        // still wakes it at once, and only the periodic look — the battery,
-        // the drive — is spaced out. The panel's own deadlines keep the
-        // shorter wait where anything is due.
-        let quiet = surface.is_off() && !ahead && until_due.is_none() && rest_left.is_none();
-        let timeout = if quiet { DARK_WAIT } else { timeout };
-        // With the display off, the phone sleeps unless something needs it
-        // awake: work under way, fastboot or sideload, a restart on its way,
-        // a command running in the terminal, a network being joined, the
-        // battery read after a uevent, or a computer on the USB port, whose
-        // adb and file transfer stay up.
-        //
-        // A phone whose panel lights on a double tap has to feel the tap, and
-        // a suspended phone is one the touchscreen cannot report a tap to.
-        // The answer is not to stay awake for ever — that is most of what the
-        // recovery's power draw was — but to arm the touchscreen as something
-        // that wakes the phone, so that the tap ends the suspend instead of
-        // being missed by it. Where that cannot be armed, staying awake is
-        // what is left, and `Idle` says so.
-        let systems_busy = systems_worker.as_ref().is_some_and(systems::Worker::busy);
-        let busy = installer.is_some()
-            || eraser.is_some()
-            || worker.is_some()
-            || relabeler.is_some()
-            || backuper.is_some()
-            || merger.is_some()
-            || decryptor.is_some()
-            || part_worker.is_some()
-            || checker.is_some()
-            || downloader.is_some()
-            || skyward_checker.is_some()
-            || skyward_updater.is_some()
-            || systems_busy;
-        let joining = app.state.wlan.as_ref().and_then(|w| w.joined.as_ref()).is_some_and(|j| matches!(j.stage, Joining::Joining | Joining::Addressing));
-        let running = match &shell {
-            Some(sh) => !sh.waiting()?,
-            None => false,
+        app.state.phone_logs = cfg.wipe.logs.len();
+        // Skyward lives in a recovery partition of each slot where the phone
+        // has them, and the install page then offers to keep it there. Such a
+        // phone holds a second system where it also has boot and init_boot
+        // partitions in both slots, which a switch writes.
+        let by_name = Path::new(skyward_block::BY_NAME);
+        let both = |base: &str| -> Result<bool> { Ok(by_name.join(format!("{base}_a")).try_exists()? && by_name.join(format!("{base}_b")).try_exists()?) };
+        app.state.recovery_partitions = both("recovery")?;
+        app.state.dual_boot = app.state.recovery_partitions && both("boot")? && both("init_boot")?;
+        // The second system's work; the systems are read at once, for the home
+        // page to name the one that starts, once a switch cut off before is
+        // finished.
+        let systems_worker = match app.state.dual_boot {
+            true => Some(systems::Worker::start(cfg.device.os_version_prop.clone())?),
+            false => None,
         };
-        let needed = busy
-            || fastboot
-            || sideloading
-            || leave_at.is_some()
-            || joining
-            || running
-            || asked.is_some()
-            || usb_link()? == UsbLink::Connected;
-        // The touchscreen is armed the first time the panel is dark: it is
-        // armed once and stays armed, since the phone may be suspended at any
-        // moment after it. Nothing is written where no panel has come up, or
-        // where the phone asks for no taps at all.
-        let want_taps = keeps_touch;
-        // A driver that can be armed to wake the phone lets the panel be taken
-        // down and the phone sleep, with the tap ending the sleep. This panel's
-        // cannot — its touch hardware has no wakeup source at all — which is
-        // why the panel is kept dozing instead; arming is tried anyway, so a
-        // phone whose driver does offer one gets the cheaper path.
-        if want_taps && surface.is_off() && !taps_wake && !taps_told {
-            let armed = inputs.panel_node().is_some_and(|node| skyward_sys::sleep::arm_wakeup(&node).unwrap_or(false));
-            taps_told = true;
-            taps_wake = armed;
-            if armed {
-                let _ = skyward_sys::kmsg("the touchscreen wakes the phone, so a tap lights the dark panel after it has slept");
-            } else {
-                let _ = skyward_sys::kmsg("the touchscreen cannot wake the phone, so the panel keeps dozing dark for the two taps, and the phone does not sleep");
+        // fastbootd may write the boot partitions, which the installed system's
+        // boot set goes back into first, and finds /metadata as it was; why the
+        // boot set could not go back is shown, and fastboot goes on, as the way
+        // left to repair the phone.
+        if fastboot && app.state.dual_boot {
+            let metadata = Path::new("/metadata");
+            let mounted = mount::is_mount_point(metadata)?;
+            let put_back = skyward_systems::install::ensure_installed();
+            if !mounted && mount::is_mount_point(metadata)? {
+                mount::umount(metadata)?;
+            }
+            if let Err(e) = put_back {
+                skyward_sys::kmsg(&format!("the installed system's boot set did not go back before fastboot: {e:#}"))?;
+                app.report(&format!("{e:#}"), monotonic_ms());
             }
         }
-        let dark_for = dark_at.map(|at| at.elapsed().as_millis() as u64);
-        let idle = Idle { dark: surface.is_off(), dark_for, wants_taps: want_taps, taps_wake, needed };
-        let may_sleep = idle.may_sleep() == Sleep::May && !keeps_touch;
-        sleeper.allow(may_sleep);
-        // With the panel dark the battery is read less often, since each read
-        // is a call into its driver that wakes the CPU for it.
-        if idle.dark != was_dark {
-            was_dark = idle.dark;
-            readings.dark(idle.dark);
+        let mut pages = Pages {
+            cfg,
+            programs,
+            dump,
+            app,
+            info,
+            unread,
+            fonts,
+            surface,
+            screen,
+            inputs,
+            started,
+            touch_known: false,
+            control,
+            haptics,
+            backlight,
+            keeper,
+            shown_clock: String::new(),
+            arriving: Some(Incoming::Arrived),
+            readings,
+            read_at,
+            asked: None,
+            blanked: false,
+            rested_at: None,
+            fastboot,
+            port_at,
+            transfer,
+            sideloading: false,
+            misc: bcb::misc(),
+            kept: request.work.lasts(),
+            leave: if request.shutdown_after { Target::PowerOff } else { Target::System },
+            leave_at: None,
+            request,
+            installer: None,
+            pending: None,
+            rescue_leaves: None,
+            eraser: None,
+            erase_leaves: false,
+            rescue_erasing: false,
+            decryptor: None,
+            closed: Vec::new(),
+            unlock_typed: None,
+            unlock_auto: false,
+            part_worker: None,
+            worker: None,
+            relabeler: None,
+            backuper: None,
+            merger: None,
+            systems_worker,
+            switch_asked: false,
+            switched: false,
+            servers: Arc::new(Mutex::new(Vec::new())),
+            wlan: None,
+            scanned_at: Instant::now(),
+            checker: None,
+            downloader: None,
+            skyward_checker: None,
+            skyward_updater: None,
+            shell: None,
+            plugged: None,
+            seen: None,
+            drive_at: Instant::now(),
+        };
+        // A kept credential is worth nothing unless the data partition is
+        // opened for it: nothing else at a start asks for the owner's files,
+        // so the recovery would sit on the home page with the phone's storage
+        // shut until someone went to the decrypt page, which is the one thing
+        // the switch exists to spare them. So the open is begun here.
+        if pages.app.state.remembered.is_some() && !skyward_block::mount::is_mount_point(Path::new(skyward_crypto::data::MOUNT))? {
+            let _ = skyward_sys::kmsg("a kept credential is here, so the data partition is opened at this start");
+            pages.decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
         }
-        let mut fds = vec![inputs.fd(), uevents.fd(), sleeper.fd()];
-        if let Some(i) = &installer {
-            fds.push(i.fd());
+        Ok(pages)
+    }
+
+    /// Start the work the request in misc asks for, take up what an earlier
+    /// start left under way, and bring the port and the WLAN to where the
+    /// pages start from.
+    fn begin(&mut self) -> Result<()> {
+        let cfg = self.cfg;
+        match &self.request.work {
+            Work::WipeData { reformat } => {
+                self.eraser = Some(factory_reset(&mut self.app, self.request.keep_memtag_mode, true, reformat.clone())?);
+                self.erase_leaves = true;
+            }
+            Work::WipeCache { reformat } => {
+                self.eraser = Some(parts_wipe(&mut self.app, vec![Step::Cache], &cfg.wipe.logs, true, reformat.clone())?);
+                self.erase_leaves = true;
+            }
+            Work::Sideload { .. } => {
+                self.app.start_sideload();
+                self.installer = Some(Installer::start(detach(self.programs.to_vec()), install_options(&self.app))?);
+                self.sideloading = true;
+            }
+            Work::Rescue => {
+                self.app.start_rescue();
+                self.installer = Some(Installer::rescue(detach(self.programs.to_vec()), install_options(&self.app))?);
+                self.sideloading = true;
+            }
+            Work::Update(update) => {
+                self.app.start_asked(update.security, update.package.clone());
+                let retry = update.retry > 0;
+                if !retry && panicked() {
+                    skyward_sys::kmsg("the phone came here after its kernel stopped, so the update asked for is not installed")?;
+                    self.app.install(skyward_install::Event::Finished(skyward_install::Outcome::Refused(skyward_install::Refusal::Panicked)), monotonic_ms());
+                    bcb::clear(&self.misc)?;
+                    self.kept = false;
+                } else {
+                    let (package, needs) = asked::locate(&update.package, self.app.state.cache_partition);
+                    skyward_sys::kmsg(&format!("the update asked for is {package:?}, which needs {needs:?}"))?;
+                    let wanted = Pending { package, needs, retry };
+                    match needs {
+                        Needs::Data | Needs::User(_) => {
+                            self.app.asked_opening();
+                            self.decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
+                            self.pending = Some(wanted);
+                        }
+                        Needs::Nothing | Needs::Cache => self.installer = Some(install_asked(self.programs, &self.app, wanted)?),
+                    }
+                }
+            }
+            Work::WipeAb { package_size } => {
+                self.app.part_work_started(PartKind::Disable, true);
+                self.part_worker = Some(partwork::Worker::start(partwork::Task::Disable { package_size: *package_size })?);
+            }
+            Work::UnshareBlocks => {
+                let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+                self.app.part_work_started(PartKind::Unshare, true);
+                self.part_worker = Some(partwork::Worker::start(partwork::Task::Unshare { slot })?);
+            }
+            // The installed system is asked for by a word, and the second by
+            // its id.
+            Work::SwitchSystem { to } => match self.systems_worker.as_mut() {
+                Some(worker) => {
+                    self.app.switch_asked(if to == "installed" { Who::Installed } else { Who::Other });
+                    worker.send(systems::Task::SwitchNamed(to.clone()));
+                    self.switch_asked = true;
+                }
+                // A phone that cannot hold a second system has none to switch
+                // to, and the request is done with.
+                None => {
+                    skyward_sys::kmsg(&format!("asked to switch to the system {to:?}, which this phone cannot hold"))?;
+                    bcb::clear(&self.misc)?;
+                    self.kept = false;
+                }
+            },
+            // The second system's start stopped and brought the recovery up to
+            // say why; it still starts next, unless the user switches.
+            Work::SystemStopped => {
+                let why = self.request.reason.clone().unwrap_or_default();
+                skyward_sys::kmsg(&format!("the second system's start stopped: {why}"))?;
+                if self.app.state.dual_boot {
+                    self.app.system_stopped(why);
+                }
+            }
+            Work::Menu | Work::Exit | Work::Fastboot | Work::PromptWipeData | Work::Unsupported(_) => {}
         }
-        if let Some(c) = &control {
-            fds.push(c.fd());
+        // A switch asked for finishes one cut off before itself; fastboot leaves
+        // /metadata to fastbootd until the recovery's pages come up.
+        if let (Some(worker), false, false) = (self.systems_worker.as_mut(), self.switch_asked, self.fastboot) {
+            worker.send(systems::Task::Resume);
         }
-        if let Some(e) = &eraser {
-            fds.push(e.fd());
+        // The port came up with adb alone; at rest it offers file transfer
+        // beside it.
+        if self.transfer.is_some()
+            && !self.fastboot
+            && !self.sideloading
+            && let Err(e) = skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT)
+        {
+            skyward_sys::kmsg(&format!("the port did not take file transfer: {e:#}"))?;
+            self.app.report(&format!("{e:#}"), monotonic_ms());
         }
-        if let Some(sh) = &shell {
-            fds.extend(sh.fds());
+        if let Some(slot) = self.info.slot {
+            let standing = skyward_vab::standing(slot)?;
+            if matches!(standing, Standing::Merging(_)) && skyward_vab::snapshots_mapped(slot)? {
+                skyward_sys::kmsg("the update's merge goes on")?;
+                self.merger = Some(merge::Merger::start(slot, false)?);
+            }
+            self.app.set_update(standing);
         }
-        if let Some(w) = &worker {
-            fds.push(w.fd());
+        // The WLAN starts off. Without the bundle of the vendor interface's
+        // libraries the supplicant does not start, and the WLAN page says why.
+        if let Some(w) = &cfg.wlan {
+            self.app.state.wlan = Some(Wlan::default());
+            let modules = cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
+            let libraries = secure::libraries().unwrap_or_else(|e| {
+                let _ = skyward_sys::kmsg(&format!("the vendor interface's libraries are not open: {e:#}"));
+                None
+            });
+            self.wlan = Some(wlan::Worker::start(w.clone(), modules, libraries, self.servers.clone())?);
         }
-        if let Some(r) = &relabeler {
-            fds.push(r.fd());
+        self.scanned_at = Instant::now();
+        self.app.state.update_server = cfg.update.is_some();
+        self.drive_at = Instant::now();
+        Ok(())
+    }
+
+    /// One turn of the loop: the page is shown as it stands, the loop waits
+    /// for something to happen, and what happened is taken in. What the work
+    /// under way told comes first, so a touch acts on the page as it now
+    /// stands.
+    fn turn(&mut self, sleeper: &Sleeper, uevents: &uevent::Listener) -> Result<()> {
+        let now = monotonic_ms();
+        if self.leave_at.is_some_and(|at| now >= at) {
+            self.leave_at = None;
+            power(self.leave)?;
         }
-        if let Some(b) = &backuper {
-            fds.push(b.fd());
+        if !self.touch_known && self.started.elapsed() >= TOUCH_WAIT {
+            self.touch_known = true;
+            if !self.inputs.has_panel() {
+                skyward_sys::kmsg("no touch panel came up; the pages are worked with the keys")?;
+                self.app.touchscreen_missing();
+            }
         }
-        if let Some(m) = &merger {
-            fds.push(m.fd());
+        self.tick(now)?;
+        self.take_readings(now)?;
+        // In fastboot the page follows fastbootd and the cable each second.
+        if self.fastboot && self.port_at.elapsed().as_secs() >= 1 {
+            let (running, link) = fastboot_status()?;
+            self.app.set_fastboot(running, link);
+            self.port_at = Instant::now();
         }
-        if let Some(d) = &decryptor {
-            fds.push(d.fd());
-        }
-        if let Some(p) = &part_worker {
-            fds.push(p.fd());
-        }
-        if let Some(w) = &wlan {
-            fds.push(w.fd());
-        }
-        if let Some(c) = &checker {
-            fds.push(c.fd());
-        }
-        if let Some(d) = &downloader {
-            fds.push(d.fd());
-        }
-        if let Some(c) = &skyward_checker {
-            fds.push(c.fd());
-        }
-        if let Some(u) = &skyward_updater {
-            fds.push(u.fd());
-        }
-        if let Some(s) = &systems_worker {
-            fds.push(s.fd());
-        }
-        fds.push(readings.fd());
-        wait(&fds, timeout)?;
+        let (lit, shown) = self.show(now)?;
+        self.wait(sleeper, uevents, now, lit, shown)?;
         let now = monotonic_ms();
         for slept in sleeper.slept() {
             match slept {
@@ -1957,1281 +1636,870 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
             }
         }
         if uevents.heard()? {
-            readings.ask();
-            asked = Some(Instant::now());
+            self.readings.ask();
+            self.asked = Some(Instant::now());
         }
         let mut drive_told = None;
-        if drive_at.elapsed().as_secs() >= 1 {
-            drive_told = look_for_drive(&mut plugged, &mut seen)?;
-            drive_at = Instant::now();
+        if self.drive_at.elapsed().as_secs() >= 1 {
+            drive_told = look_for_drive(&mut self.plugged, &mut self.seen)?;
+            self.drive_at = Instant::now();
         }
-        // What the installer and the eraser told comes first, so a touch
-        // acts on the page as it now stands.
-        {
-            let told = installer.as_ref().map(Installer::events).unwrap_or_default();
-            for ev in told {
-                use skyward_install::{Event as Told, Outcome};
-                let finished = matches!(ev, Told::Finished(_));
-                let installed = matches!(ev, Told::Finished(Outcome::Installed { .. } | Outcome::Ran { .. }));
-                let wipe_after = matches!(ev, Told::Finished(Outcome::Installed { wipe: true, .. }));
-                let script_cache = matches!(ev, Told::Finished(Outcome::Ran { wipe_cache: true, .. }));
-                // A second system installed is read for the pages to show.
-                if matches!(ev, Told::Done(Outcome::SystemInstalled { .. }) | Told::Finished(Outcome::SystemInstalled { .. })) {
-                    systems_worker.as_mut().context("a second system went in on a phone that cannot hold one")?.send(systems::Task::Read);
+        self.installer_told(now)?;
+        self.eraser_told(now)?;
+        self.files_told(now)?;
+        self.relabel_told(now);
+        self.parts_told(now)?;
+        self.backup_told(now);
+        self.merge_told(now)?;
+        self.systems_told(now)?;
+        self.wlan_told()?;
+        self.keep_settings(now)?;
+        self.updates_told(now)?;
+        self.skyward_told(now)?;
+        self.decrypt_told(now)?;
+        self.shell_told()?;
+        self.take_in(drive_told, now)?;
+        self.offer_storage(now)
+    }
+
+    /// What time passing asks for: the motor's clicks and ticks, and the
+    /// status bar's clock drawn again as its minute turns.
+    fn tick(&mut self, now: u64) -> Result<()> {
+        for fx in self.app.tick(now) {
+            match fx {
+                Effect::Haptic => self.click()?,
+                // The power key held past its wait for volume down turns
+                // the screen off.
+                Effect::Ticks => self.ticks()?,
+                other => unreachable!("time passing asks for nothing but the motor, not {other:?}"),
+            }
+        }
+        let unix = unix_now()?;
+        self.app.set_now(unix);
+        let time = skyward_ui::fmt::clock(unix, self.app.state.zone());
+        if time != self.shown_clock {
+            self.shown_clock = time;
+            self.app.redraw();
+        }
+        Ok(())
+    }
+
+    /// One click of the motor, as strong as the settings say.
+    fn click(&mut self) -> Result<()> {
+        if let Some(h) = &mut self.haptics {
+            h.click(self.app.state.vibration)?;
+        }
+        Ok(())
+    }
+
+    /// The motor's ticks of the screen going off.
+    fn ticks(&mut self) -> Result<()> {
+        if let Some(h) = &mut self.haptics {
+            h.ticks()?;
+        }
+        Ok(())
+    }
+
+    /// Take in the readings taken since the last turn.
+    fn take_readings(&mut self, now: u64) -> Result<()> {
+        for reading in self.readings.taken() {
+            match reading {
+                Reading::Battery(battery, at) => {
+                    if self.asked.is_some_and(|asked| at >= asked) {
+                        self.asked = None;
+                    }
+                    untaken(&mut self.unread.battery, "the battery", battery.as_ref().err())?;
+                    if let Ok(battery) = battery
+                        && battery != self.info.battery
+                    {
+                        plug(&mut self.app, &self.info.battery, &battery, now)?;
+                        self.info.battery = battery;
+                        self.app.refresh();
+                    }
                 }
-                eprintln!("install {ev:?}");
-                match &ev {
-                    // Rescue's own erasing tells rescue how it went once it
-                    // ends; file transfer that will not let internal
-                    // storage go keeps it from starting.
-                    Told::Wipe => {
-                        ensure!(eraser.is_none(), "erasing is under way already");
-                        if withhold(&mut transfer, &mut app, now)? {
-                            eraser = Some(rescue_wipe(&mut app)?);
-                            rescue_erasing = true;
-                        } else {
-                            installer.as_ref().context("rescue asked for erasing")?.wiped(false);
-                        }
+                Reading::All(all, at) => {
+                    if self.asked.is_some_and(|asked| at >= asked) {
+                        self.asked = None;
                     }
-                    Told::Reboot(target) => rescue_leaves = Some(rescue_target(target)),
-                    _ => {}
-                }
-                app.install(ev, now);
-                if finished {
-                    installer = None;
-                    sideloading = false;
-                    // A sideload or an update the system asked for is done
-                    // with however it went, and so is rescue, once its page
-                    // is left or the computer asks the phone to leave. A
-                    // sideload asked to leaves on its own after it, and an
-                    // update that went in does, once what the package or the
-                    // request asked to be erased is.
-                    if matches!(request.work, Work::Sideload { .. } | Work::Update(_) | Work::Rescue) && kept {
-                        bcb::clear(&misc)?;
-                        kept = false;
-                    }
-                    let (leaves, cache_after) = match &request.work {
-                        Work::Sideload { auto_reboot } => (*auto_reboot, script_cache),
-                        Work::Update(update) => (installed, script_cache || (installed && update.wipe_cache)),
-                        _ => (false, script_cache),
-                    };
-                    if cache_after && !app.state.cache_partition {
-                        skyward_sys::kmsg("the install asked for the cache partition to be erased, and the phone has none")?;
-                    }
-                    if wipe_after {
-                        ensure!(eraser.is_none(), "erasing is under way already");
-                        eraser = Some(factory_reset(&mut app, false, false, None)?);
-                        erase_leaves = leaves;
-                    } else if cache_after && app.state.cache_partition {
-                        ensure!(eraser.is_none(), "erasing is under way already");
-                        eraser = Some(parts_wipe(&mut app, vec![Step::Cache], &cfg.wipe.logs, false, None)?);
-                        erase_leaves = leaves;
-                    } else if leaves {
-                        leave_at = Some(now + LEAVE_AFTER_MS);
-                    }
-                    // Rescue asked to come back is told so in misc, as
-                    // Android's own recovery tells it.
-                    if let Some((target, again)) = rescue_leaves.take() {
-                        if again {
-                            bcb::write(&misc, &bcb::Bcb { command: "boot-rescue".into(), args: Vec::new() })?;
-                        }
-                        put_radio_away(&mut wlan);
-                        power(target)?;
+                    untaken(&mut self.unread.details, "the phone's details", all.as_ref().as_ref().err())?;
+                    if let Ok(all) = *all
+                        && at >= self.read_at
+                        && all != self.info
+                    {
+                        plug(&mut self.app, &self.info.battery, &all.battery, now)?;
+                        self.info = all;
+                        self.app.refresh();
                     }
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Put the page on the panel where it changed, and light the panel,
+    /// rest it or turn it off as the page asks. Gives whether the panel is
+    /// lit, and whether a frame was shown.
+    fn show(&mut self, now: u64) -> Result<(bool, bool)> {
+        let panel = self.app.panel(now);
+        let mut shown = false;
+        if panel.is_some() {
+            // A display turned off comes on again with a frame drawn for it.
+            if self.app.take_dirty() || !self.surface.is_on() {
+                let t0 = Instant::now();
+                self.app.compose(&mut self.screen, &self.fonts, &self.info, &self.shown_clock, now);
+                self.surface.present(&self.screen)?;
+                eprintln!("frame {:?} in {} ms", self.app.screen(), t0.elapsed().as_millis());
+                if let Some(path) = self.dump {
+                    fs::write(path, &self.screen.data).with_context(|| format!("write {}", path.display()))?;
+                }
+                shown = true;
+            }
+            self.blanked = false;
+        } else if !self.blanked {
+            // Black out the panel's frame memory before the backlight goes
+            // to 0 and the display off, so an OLED that floors the backlight
+            // above zero rather than cutting it shows nothing as it goes off.
+            self.screen.data.fill(0);
+            self.surface.present(&self.screen)?;
+            self.surface.settle()?;
+            self.blanked = true;
+        }
+        // After the frame is on the panel, so a panel coming back on lights
+        // with what it should show now, never with what it showed when it
+        // went off.
+        if self.backlight.level == 0 && panel.is_some() {
+            self.surface.settle()?;
+        }
+        self.backlight.show(panel)?;
+        if panel.is_some() {
+            // Lit, a panel that came on again switches to its fastest
+            // refresh.
+            self.surface.speed_up()?;
+            self.rested_at = None;
+        } else if self.surface.is_on() {
+            // With the backlight off, the panel rests, and the touch
+            // controller following it stops drawing power.
+            self.surface.rest()?;
+            self.rested_at = Some(Instant::now());
+        } else if self.rested_at.is_some_and(|at| at.elapsed() >= REST) {
+            // Rested long enough, the display goes off: the panel and the
+            // display processor feeding it stop drawing power.
+            self.surface.turn_off()?;
+            self.rested_at = None;
+        }
+        Ok((panel.is_some(), shown))
+    }
+
+    /// Wait until something the loop listens to has something, or the page
+    /// is due to change; the phone is let sleep meanwhile where nothing
+    /// needs it awake. `lit` and `shown` are as [`Pages::show`] gave them.
+    fn wait(&mut self, sleeper: &Sleeper, uevents: &uevent::Listener, now: u64, lit: bool, shown: bool) -> Result<()> {
+        // A page at rest draws the rows it has yet to while nothing else
+        // is to be done, a band at a time, looking for input between bands.
+        let ahead = lit && !shown && self.app.draw_ahead(&self.fonts, &self.info);
+        // A frame shown has waited for the one before it to reach the
+        // panel, which keeps the loop to the panel's pace; otherwise the CPU
+        // gets at least a millisecond.
+        let floor = if shown { 0 } else { 1 };
+        let until_due = self.app.deadline(now).map(|d| d.saturating_sub(now) as i32);
+        // A resting panel turns off once its rest is over.
+        let rest_left = self.rested_at.map(|at| REST.saturating_sub(at.elapsed()).as_millis() as i32);
+        let timeout = if ahead { 0 } else { until_due.into_iter().chain(rest_left).min().map_or(1000, |t| t.clamp(floor, 1000)) };
+        sleeper.allow(self.may_sleep()?);
+        let mut fds = vec![self.inputs.fd(), uevents.fd(), sleeper.fd()];
+        if let Some(i) = &self.installer {
+            fds.push(i.fd());
+        }
+        if let Some(c) = &self.control {
+            fds.push(c.fd());
+        }
+        if let Some(e) = &self.eraser {
+            fds.push(e.fd());
+        }
+        if let Some(sh) = &self.shell {
+            fds.extend(sh.fds());
+        }
+        if let Some(w) = &self.worker {
+            fds.push(w.fd());
+        }
+        if let Some(r) = &self.relabeler {
+            fds.push(r.fd());
+        }
+        if let Some(b) = &self.backuper {
+            fds.push(b.fd());
+        }
+        if let Some(m) = &self.merger {
+            fds.push(m.fd());
+        }
+        if let Some(d) = &self.decryptor {
+            fds.push(d.fd());
+        }
+        if let Some(p) = &self.part_worker {
+            fds.push(p.fd());
+        }
+        if let Some(w) = &self.wlan {
+            fds.push(w.fd());
+        }
+        if let Some(c) = &self.checker {
+            fds.push(c.fd());
+        }
+        if let Some(d) = &self.downloader {
+            fds.push(d.fd());
+        }
+        if let Some(c) = &self.skyward_checker {
+            fds.push(c.fd());
+        }
+        if let Some(u) = &self.skyward_updater {
+            fds.push(u.fd());
+        }
+        if let Some(s) = &self.systems_worker {
+            fds.push(s.fd());
+        }
+        fds.push(self.readings.fd());
+        wait(&fds, timeout)
+    }
+
+    /// Whether the phone may sleep. With the display off, it sleeps unless
+    /// something needs it awake: work under way, fastboot or sideload, a
+    /// restart on its way, a command running in the terminal, a network
+    /// being joined, the battery read after a uevent, or a computer on the
+    /// USB port, whose adb and file transfer stay up.
+    fn may_sleep(&self) -> Result<bool> {
+        let systems_busy = self.systems_worker.as_ref().is_some_and(systems::Worker::busy);
+        let busy = self.installer.is_some()
+            || self.eraser.is_some()
+            || self.worker.is_some()
+            || self.relabeler.is_some()
+            || self.backuper.is_some()
+            || self.merger.is_some()
+            || self.decryptor.is_some()
+            || self.part_worker.is_some()
+            || self.checker.is_some()
+            || self.downloader.is_some()
+            || self.skyward_checker.is_some()
+            || self.skyward_updater.is_some()
+            || systems_busy;
+        let joining = self.app.state.wlan.as_ref().and_then(|w| w.joined.as_ref()).is_some_and(|j| matches!(j.stage, Joining::Joining | Joining::Addressing));
+        let running = match &self.shell {
+            Some(sh) => !sh.waiting()?,
+            None => false,
+        };
+        Ok(self.surface.is_off()
+            && !busy
+            && !self.fastboot
+            && !self.sideloading
+            && self.leave_at.is_none()
+            && !joining
+            && !running
+            && self.asked.is_none()
+            && usb_link()? != UsbLink::Connected)
+    }
+
+    /// The request in misc is done with: a restart from here on starts the
+    /// system rather than coming back to what it asked.
+    fn done_with_request(&mut self) -> Result<()> {
+        if self.kept {
+            bcb::clear(&self.misc)?;
+            self.kept = false;
+        }
+        Ok(())
+    }
+
+    /// The mount page shows the partitions as they are when it opens and
+    /// after each change; why they cannot be read is the page's to say.
+    fn mounts(&self) -> Result<Vec<skyward_ui::app::MountRow>, String> {
+        read_mounts(self.programs).map_err(|e| format!("{e:#}"))
+    }
+}
+
+/// What the work under way told since the last turn, each kind of work
+/// taken in by a method of its own.
+impl Pages<'_> {
+    /// What the installer told: its page follows it, and its end starts
+    /// what the package, the request or rescue asked for after it.
+    fn installer_told(&mut self, now: u64) -> Result<()> {
+        use skyward_install::{Event as Told, Outcome};
+        let told = self.installer.as_ref().map(Installer::events).unwrap_or_default();
+        for ev in told {
+            let finished = matches!(ev, Told::Finished(_));
+            let installed = matches!(ev, Told::Finished(Outcome::Installed { .. } | Outcome::Ran { .. }));
+            let wipe_after = matches!(ev, Told::Finished(Outcome::Installed { wipe: true, .. }));
+            let script_cache = matches!(ev, Told::Finished(Outcome::Ran { wipe_cache: true, .. }));
+            // A second system installed is read for the pages to show.
+            if matches!(ev, Told::Done(Outcome::SystemInstalled { .. }) | Told::Finished(Outcome::SystemInstalled { .. })) {
+                self.systems_worker.as_mut().context("a second system went in on a phone that cannot hold one")?.send(systems::Task::Read);
+            }
+            eprintln!("install {ev:?}");
+            match &ev {
+                // Rescue's own erasing tells rescue how it went once it
+                // ends; file transfer that will not let internal
+                // storage go keeps it from starting.
+                Told::Wipe => {
+                    ensure!(self.eraser.is_none(), "erasing is under way already");
+                    if withhold(&mut self.transfer, &mut self.app, now)? {
+                        self.eraser = Some(rescue_wipe(&mut self.app)?);
+                        self.rescue_erasing = true;
+                    } else {
+                        self.installer.as_ref().context("rescue asked for erasing")?.wiped(false);
+                    }
+                }
+                Told::Reboot(target) => self.rescue_leaves = Some(rescue_target(target)),
+                _ => {}
+            }
+            self.app.install(ev, now);
+            if finished {
+                self.installer = None;
+                self.sideloading = false;
+                // A sideload or an update the system asked for is done
+                // with however it went, and so is rescue, once its page
+                // is left or the computer asks the phone to leave. A
+                // sideload asked to leaves on its own after it, and an
+                // update that went in does, once what the package or the
+                // request asked to be erased is.
+                if matches!(self.request.work, Work::Sideload { .. } | Work::Update(_) | Work::Rescue) {
+                    self.done_with_request()?;
+                }
+                let (leaves, cache_after) = match &self.request.work {
+                    Work::Sideload { auto_reboot } => (*auto_reboot, script_cache),
+                    Work::Update(update) => (installed, script_cache || (installed && update.wipe_cache)),
+                    _ => (false, script_cache),
+                };
+                if cache_after && !self.app.state.cache_partition {
+                    skyward_sys::kmsg("the install asked for the cache partition to be erased, and the phone has none")?;
+                }
+                if wipe_after {
+                    ensure!(self.eraser.is_none(), "erasing is under way already");
+                    self.eraser = Some(factory_reset(&mut self.app, false, false, None)?);
+                    self.erase_leaves = leaves;
+                } else if cache_after && self.app.state.cache_partition {
+                    ensure!(self.eraser.is_none(), "erasing is under way already");
+                    self.eraser = Some(parts_wipe(&mut self.app, vec![Step::Cache], &self.cfg.wipe.logs, false, None)?);
+                    self.erase_leaves = leaves;
+                } else if leaves {
+                    self.leave_at = Some(now + LEAVE_AFTER_MS);
+                }
+                // Rescue asked to come back is told so in misc, as
+                // Android's own recovery tells it.
+                if let Some((target, again)) = self.rescue_leaves.take() {
+                    if again {
+                        bcb::write(&self.misc, &bcb::Bcb { command: "boot-rescue".into(), args: Vec::new() })?;
+                    }
+                    power(target)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// What the eraser told: its page follows it, or rescue's does, and
+    /// its end is the end of what asked for it.
+    fn eraser_told(&mut self, now: u64) -> Result<()> {
+        let told = self.eraser.as_ref().map(Eraser::events).unwrap_or_default();
         let mut erased = false;
-        if let Some(e) = &eraser {
-            for ev in e.events() {
-                match ev {
-                    // Rescue's page says only that erasing is under way.
-                    wipe::Event::At(_) | wipe::Event::Progress(..) if rescue_erasing => {}
-                    wipe::Event::At(step) => app.erase_at(part(step)),
-                    wipe::Event::Progress(done, total) => app.erase_progress(done, total),
-                    // Rescue stays on: its request stays in misc, and the
-                    // computer hears how erasing went.
-                    wipe::Event::Ended(outcome) if rescue_erasing => {
-                        let said = outcome.as_ref().map_or_else(wipe::said, |_| "done".to_string());
-                        skyward_sys::kmsg(&format!("erasing for rescue ended: {said}"))?;
-                        installer.as_ref().context("rescue waits for erasing to end")?.wiped(outcome.is_ok());
-                        app.rescue_wiped(outcome.map_err(erase_stop), now);
-                        if app.state.data == Data::Erased {
-                            closed.clear();
-                        }
-                        rescue_erasing = false;
-                        erased = true;
+        for ev in told {
+            match ev {
+                // Rescue's page says only that erasing is under way.
+                wipe::Event::At(_) | wipe::Event::Progress(..) if self.rescue_erasing => {}
+                wipe::Event::At(step) => self.app.erase_at(part(step)),
+                wipe::Event::Progress(done, total) => self.app.erase_progress(done, total),
+                // Rescue stays on: its request stays in misc, and the
+                // computer hears how erasing went.
+                wipe::Event::Ended(outcome) if self.rescue_erasing => {
+                    let said = outcome.as_ref().map_or_else(wipe::said, |_| "done".to_string());
+                    skyward_sys::kmsg(&format!("erasing for rescue ended: {said}"))?;
+                    self.installer.as_ref().context("rescue waits for erasing to end")?.wiped(outcome.is_ok());
+                    self.app.rescue_wiped(outcome.map_err(erase_stop), now);
+                    if self.app.state.data == Data::Erased {
+                        self.closed.clear();
                     }
-                    wipe::Event::Opened(opening) => {
-                        if let Some(mounted) = &opening.mounted {
-                            log_mounted(mounted)?;
-                        }
-                        closed = opening.closed;
-                        show_closed(&mut app, &closed)?;
+                    self.rescue_erasing = false;
+                    erased = true;
+                }
+                wipe::Event::Opened(opening) => {
+                    if let Some(mounted) = &opening.mounted {
+                        log_mounted(mounted)?;
                     }
-                    wipe::Event::Ended(outcome) => {
-                        let said = outcome.as_ref().map_or_else(wipe::said, |_| "done".to_string());
-                        skyward_sys::kmsg(&format!("erasing ended: {said}"))?;
-                        // As with the phone's own recovery, the request is
-                        // done with either way, so a restart starts the
-                        // system rather than erasing again. A factory
-                        // reset done is what an update that asked for one
-                        // asked, too.
-                        if kept {
-                            bcb::clear(&misc)?;
-                            kept = false;
-                        }
-                        if outcome.is_ok() && app.state.erase.reset {
-                            bcb::clear(&misc)?;
-                        }
-                        if outcome.is_ok() && erase_leaves {
-                            leave_at = Some(now + LEAVE_AFTER_MS);
-                        }
-                        app.erase_ended(outcome.map_err(erase_stop), now);
-                        // Users of a data partition erased whole have no
-                        // files left to open.
-                        if app.state.data == Data::Erased {
-                            closed.clear();
-                        }
-                        erased = true;
+                    self.closed = opening.closed;
+                    show_closed(&mut self.app, &self.closed)?;
+                    follow_system_zone(&mut self.app, kept_time_zone()?.as_deref(), &self.info)?;
+                }
+                wipe::Event::Ended(outcome) => {
+                    let said = outcome.as_ref().map_or_else(wipe::said, |_| "done".to_string());
+                    skyward_sys::kmsg(&format!("erasing ended: {said}"))?;
+                    // As with the phone's own recovery, the request is
+                    // done with either way, so a restart starts the
+                    // system rather than erasing again. A factory
+                    // reset done is what an update that asked for one
+                    // asked, too.
+                    self.done_with_request()?;
+                    if outcome.is_ok() && self.app.state.erase.reset {
+                        bcb::clear(&self.misc)?;
                     }
+                    if outcome.is_ok() && self.erase_leaves {
+                        self.leave_at = Some(now + LEAVE_AFTER_MS);
+                    }
+                    self.app.erase_ended(outcome.map_err(erase_stop), now);
+                    // Users of a data partition erased whole have no
+                    // files left to open.
+                    if self.app.state.data == Data::Erased {
+                        self.closed.clear();
+                    }
+                    erased = true;
                 }
             }
         }
         // Erasing all data makes /metadata afresh, and the settings with it
         // are written there again.
         if erased {
-            eraser = None;
-            keeper.remade();
+            self.eraser = None;
+            self.keeper.remade();
         }
-        let job_end = |end: filework::End| match end {
-            filework::End::Done => JobEnd::Done,
-            filework::End::Stopped => JobEnd::Stopped,
-            filework::End::Failed(why) => JobEnd::Failed(why),
-        };
+        Ok(())
+    }
+
+    /// What copying, moving or deleting told; once it has ended, the
+    /// folder shown is read again for what the work changed.
+    fn files_told(&mut self, now: u64) -> Result<()> {
+        let told = self.worker.as_ref().map(filework::Worker::events).unwrap_or_default();
         let mut worked = false;
-        if let Some(w) = &worker {
-            for ev in w.events() {
-                match ev {
-                    filework::Event::Progress(p) => app.file_progress((p.bytes, p.total_bytes), (p.entries, p.total_entries)),
-                    filework::Event::Relabeling(_) => unreachable!("work on files gives no labels"),
-                    filework::Event::Ended(end) => {
-                        app.file_job_ended(job_end(end), now);
-                        worked = true;
-                    }
+        for ev in told {
+            match ev {
+                filework::Event::Progress(p) => self.app.file_progress((p.bytes, p.total_bytes), (p.entries, p.total_entries)),
+                filework::Event::Relabeling(_) => unreachable!("work on files gives no labels"),
+                filework::Event::Ended(end) => {
+                    self.app.file_job_ended(job_end(end), now);
+                    worked = true;
                 }
             }
         }
+        if worked {
+            self.worker = None;
+            let folder = self.app.state.files.path.clone();
+            list(&mut self.app, folder)?;
+        }
+        Ok(())
+    }
+
+    /// What giving the data partition's files their labels told.
+    fn relabel_told(&mut self, now: u64) {
+        let told = self.relabeler.as_ref().map(filework::Worker::events).unwrap_or_default();
         let mut relabeled = false;
-        if let Some(r) = &relabeler {
-            for ev in r.events() {
-                match ev {
-                    filework::Event::Relabeling(p) => app.relabel_progress(p.checked, p.total, p.changed),
-                    filework::Event::Progress(_) => unreachable!("relabeling moves no bytes"),
-                    filework::Event::Ended(end) => {
-                        app.relabel_ended(job_end(end), now);
-                        relabeled = true;
-                    }
+        for ev in told {
+            match ev {
+                filework::Event::Relabeling(p) => self.app.relabel_progress(p.checked, p.total, p.changed),
+                filework::Event::Progress(_) => unreachable!("relabeling moves no bytes"),
+                filework::Event::Ended(end) => {
+                    self.app.relabel_ended(job_end(end), now);
+                    relabeled = true;
                 }
             }
         }
         if relabeled {
-            relabeler = None;
+            self.relabeler = None;
         }
+    }
+
+    /// What the work on whole partitions told.
+    fn parts_told(&mut self, now: u64) -> Result<()> {
+        let told = self.part_worker.as_ref().map(partwork::Worker::events).unwrap_or_default();
         let mut parted = false;
-        if let Some(p) = &part_worker {
-            for ev in p.events() {
-                match ev {
-                    partwork::Event::Listed(names) => app.part_listed(names),
-                    partwork::Event::At(index) => app.part_at(index),
-                    partwork::Event::Ended(index, item, said) => {
-                        skyward_sys::kmsg(&format!("partition work: item {index} ended as {item:?}"))?;
-                        app.part_ended(index, item_end(item), &said);
-                    }
-                    partwork::Event::Done(done) => {
-                        skyward_sys::kmsg(&format!("partition work ended: {done:?}"))?;
-                        let work = app.state.part_work.as_ref().context("partition work shows on its page")?;
-                        let whole = done.is_ok() && !work.items.iter().any(|(_, s)| matches!(s, ItemState::Ended(ItemEnd::Failed(_))));
-                        let data = work.items.iter().any(|(name, _)| name == DATA_PARTITION);
-                        // What the system asked for is done with either way,
-                        // and the phone leaves on its own once it went
-                        // through every partition.
-                        if work.asked {
-                            if kept {
-                                bcb::clear(&misc)?;
-                                kept = false;
-                            }
-                            if whole {
-                                leave_at = Some(now + LEAVE_AFTER_MS);
-                            }
+        for ev in told {
+            match ev {
+                partwork::Event::Listed(names) => self.app.part_listed(names),
+                partwork::Event::At(index) => self.app.part_at(index),
+                partwork::Event::Ended(index, item, said) => {
+                    skyward_sys::kmsg(&format!("partition work: item {index} ended as {item:?}"))?;
+                    self.app.part_ended(index, item_end(item), &said);
+                }
+                partwork::Event::Done(done) => {
+                    skyward_sys::kmsg(&format!("partition work ended: {done:?}"))?;
+                    let work = self.app.state.part_work.as_ref().context("partition work shows on its page")?;
+                    let whole = done.is_ok() && !work.items.iter().any(|(_, s)| matches!(s, ItemState::Ended(ItemEnd::Failed(_))));
+                    let data = work.items.iter().any(|(name, _)| name == DATA_PARTITION);
+                    let asked = work.asked;
+                    // What the system asked for is done with either way,
+                    // and the phone leaves on its own once it went
+                    // through every partition.
+                    if asked {
+                        self.done_with_request()?;
+                        if whole {
+                            self.leave_at = Some(now + LEAVE_AFTER_MS);
                         }
-                        // Work on the data partition leaves it closed.
-                        if data {
-                            closed.clear();
-                        }
-                        app.part_work_ended(done.map_err(part_stop), now);
-                        parted = true;
                     }
+                    // Work on the data partition leaves it closed.
+                    if data {
+                        self.closed.clear();
+                    }
+                    self.app.part_work_ended(done.map_err(part_stop), now);
+                    parted = true;
                 }
             }
         }
         // Work on whole partitions may have erased or made afresh the one
         // the settings are kept on.
         if parted {
-            part_worker = None;
-            keeper.remade();
+            self.part_worker = None;
+            self.keeper.remade();
         }
-        // The folder shown is read again for what the work changed.
-        if worked {
-            worker = None;
-            let folder = app.state.files.path.clone();
-            list(&mut app, folder, &closed)?;
-        }
+        Ok(())
+    }
+
+    /// What backing up or restoring told.
+    fn backup_told(&mut self, now: u64) {
+        let told = self.backuper.as_ref().map(backup::Worker::events).unwrap_or_default();
         let mut backed = false;
-        if let Some(b) = &backuper {
-            for ev in b.events() {
-                match ev {
-                    backup::Event::Plan(plan) => app.backup_plan(plan),
-                    backup::Event::At { item, done, of, checking } => app.backup_at(BackupAt { item, done, of, checking }),
-                    backup::Event::Ended(end) => {
-                        app.backup_ended(backup_end(end), now);
-                        backed = true;
-                    }
+        for ev in told {
+            match ev {
+                backup::Event::Plan(plan) => self.app.backup_plan(plan),
+                backup::Event::At { item, done, of, checking } => self.app.backup_at(BackupAt { item, done, of, checking }),
+                backup::Event::Ended(end) => {
+                    self.app.backup_ended(backup_end(end), now);
+                    backed = true;
                 }
             }
         }
         if backed {
-            backuper = None;
+            self.backuper = None;
         }
-        if let Some(m) = &merger {
-            let slot = info.slot.context("only an A/B phone merges an update")?;
-            for ev in m.events() {
-                match ev {
-                    merge::Event::Looked(look) => {
-                        eprintln!("merge {look:?}");
-                        app.set_update(match look {
-                            Merge::Going(done) => Standing::Merging(done),
-                            Merge::Done | Merge::NeedsReboot => Standing::Merged,
-                            Merge::Failed(code) => Standing::Failed(code),
-                            Merge::Cancelled | Merge::Idle(_) => skyward_vab::standing(slot)?,
-                        });
-                    }
-                    merge::Event::Failed(why) => {
-                        skyward_sys::kmsg(&format!("the update did not merge: {why}"))?;
-                        app.report(&skyward_ui::fmt::merge_failed(app.state.lang, &why), now);
-                        app.set_update(skyward_vab::standing(slot)?);
-                    }
+    }
+
+    /// What the merge followed told.
+    fn merge_told(&mut self, now: u64) -> Result<()> {
+        let Some(m) = &self.merger else { return Ok(()) };
+        let slot = self.info.slot.context("only an A/B phone merges an update")?;
+        for ev in m.events() {
+            match ev {
+                merge::Event::Looked(look) => {
+                    eprintln!("merge {look:?}");
+                    self.app.set_update(match look {
+                        Merge::Going(done) => Standing::Merging(done),
+                        Merge::Done | Merge::NeedsReboot => Standing::Merged,
+                        Merge::Failed(code) => Standing::Failed(code),
+                        Merge::Cancelled | Merge::Idle(_) => skyward_vab::standing(slot)?,
+                    });
                 }
-            }
-            // Merged or not, the phone's readings say where the update
-            // stands now.
-            if m.ended() {
-                merger = None;
-                read_at = Instant::now();
-                info = skyward_info::collect(cfg)?;
-                app.refresh();
-            }
-        }
-        if let Some(w) = &mut systems_worker {
-            for ev in w.events() {
-                let lang = app.state.lang;
-                match ev {
-                    systems::Event::Resumed(to) => {
-                        skyward_sys::kmsg(&format!("a switch cut off before is finished, and the {to:?} system starts next"))?;
-                        app.report(skyward_ui::fmt::switch_resumed(lang), now);
-                    }
-                    systems::Event::NotResumed(why) => {
-                        skyward_sys::kmsg(&format!("a switch cut off before is not finished: {why}"))?;
-                        app.report(&skyward_ui::fmt::switch_unfinished(lang, &why), now);
-                    }
-                    systems::Event::Switched(to) => {
-                        skyward_sys::kmsg(&format!("the {to:?} system starts next"))?;
-                        // A switch the system asked for is done with.
-                        if switch_asked && kept {
-                            bcb::clear(&misc)?;
-                            kept = false;
-                        }
-                        switch_asked = false;
-                        switched = true;
-                        put_radio_away(&mut wlan);
-                        power(Target::System)?;
-                    }
-                    systems::Event::Failed(why) => {
-                        skyward_sys::kmsg(&format!("work on the systems failed: {why}"))?;
-                        if switch_asked && kept {
-                            bcb::clear(&misc)?;
-                            kept = false;
-                        }
-                        switch_asked = false;
-                        app.systems_work_failed(&why, now);
-                    }
-                    // The page stays as it is while the phone restarts.
-                    systems::Event::Read(read) => {
-                        if !switched {
-                            app.set_systems(read);
-                        }
-                    }
+                merge::Event::Failed(why) => {
+                    skyward_sys::kmsg(&format!("the update did not merge: {why}"))?;
+                    self.app.report(&skyward_ui::fmt::merge_failed(self.app.state.lang, &why), now);
+                    self.app.set_update(skyward_vab::standing(slot)?);
                 }
             }
         }
-        if let Some((told, traffic)) = wlan.as_ref().map(wlan::Worker::told) {
+        // Merged or not, the phone's readings say where the update
+        // stands now.
+        if m.ended() {
+            self.merger = None;
+            self.read_at = Instant::now();
+            read_details(self.cfg, &mut self.info, &mut self.unread.details)?;
+            self.app.refresh();
+        }
+        Ok(())
+    }
+
+    /// What the work on the two systems told.
+    fn systems_told(&mut self, now: u64) -> Result<()> {
+        let Some(worker) = &mut self.systems_worker else { return Ok(()) };
+        for ev in worker.events() {
+            let lang = self.app.state.lang;
+            match ev {
+                systems::Event::Resumed(to) => {
+                    skyward_sys::kmsg(&format!("a switch cut off before is finished, and the {to:?} system starts next"))?;
+                    self.app.report(skyward_ui::fmt::switch_resumed(lang), now);
+                }
+                systems::Event::NotResumed(why) => {
+                    skyward_sys::kmsg(&format!("a switch cut off before is not finished: {why}"))?;
+                    self.app.report(&skyward_ui::fmt::switch_unfinished(lang, &why), now);
+                }
+                systems::Event::Switched(to) => {
+                    skyward_sys::kmsg(&format!("the {to:?} system starts next"))?;
+                    // A switch the system asked for is done with.
+                    if self.switch_asked {
+                        self.done_with_request()?;
+                    }
+                    self.switch_asked = false;
+                    self.switched = true;
+                    power(Target::System)?;
+                }
+                systems::Event::Failed(why) => {
+                    skyward_sys::kmsg(&format!("work on the systems failed: {why}"))?;
+                    if self.switch_asked {
+                        self.done_with_request()?;
+                    }
+                    self.switch_asked = false;
+                    self.app.systems_work_failed(&why, now);
+                }
+                // The page stays as it is while the phone restarts.
+                systems::Event::Read(read) => {
+                    if !self.switched {
+                        self.app.set_systems(read);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// What the WLAN told; its page scans again now and then while it
+    /// shows, as the stock settings do.
+    fn wlan_told(&mut self) -> Result<()> {
+        if let Some((told, traffic)) = self.wlan.as_ref().map(wlan::Worker::told) {
             if let Some(w) = told {
-                app.set_wlan(w);
+                self.app.set_wlan(w);
             }
             if let Some(t) = traffic {
-                app.set_traffic(t);
+                self.app.set_traffic(t);
             }
         }
-        // What the phone keeps of the networks joined, and one just
-        // forgotten: each comes back only when it has changed, so nothing is
-        // redrawn for nothing.
-        if let Some(saved) = wlan.as_ref().and_then(wlan::Worker::saved) {
-            app.set_saved(saved);
+        let wlan_on = self.app.state.wlan.as_ref().is_some_and(|w| w.power == WlanPower::On);
+        if self.app.screen() == Screen::Wlan && wlan_on && self.scanned_at.elapsed() >= SCAN_EVERY {
+            self.scanned_at = Instant::now();
+            wlan_worker(&self.wlan)?.send(wlan::Command::Scan);
         }
-        if let Some(forgot) = wlan.as_ref().and_then(wlan::Worker::forgotten) {
-            app.wlan_forgotten(forgot, now);
-        }
-        // The WLAN page scans again now and then while it shows, as the
-        // stock settings do.
-        let wlan_on = app.state.wlan.as_ref().is_some_and(|w| w.power == WlanPower::On);
-        if app.screen() == Screen::Wlan && wlan_on && scanned_at.elapsed() >= SCAN_EVERY {
-            scanned_at = Instant::now();
-            wlan_worker(&wlan)?.send(wlan::Command::Scan);
-        }
-        // Settings changed go into their file a moment after the last
-        // change, while nothing else has /metadata: not in fastboot, whose
-        // fastbootd may, nor while an install, a merge, erasing, a backup or
-        // work on whole partitions is under way.
-        let metadata_busy = fastboot
-            || installer.is_some()
-            || merger.is_some()
-            || eraser.is_some()
-            || backuper.is_some()
-            || part_worker.is_some()
-            || systems_worker.as_ref().is_some_and(systems::Worker::busy);
+        Ok(())
+    }
+
+    /// Settings changed go into their file a moment after the last change,
+    /// while nothing else has /metadata: not in fastboot, whose fastbootd
+    /// may, nor while an install, a merge, erasing, a backup or work on
+    /// whole partitions is under way.
+    fn keep_settings(&mut self, now: u64) -> Result<()> {
+        let metadata_busy = self.fastboot
+            || self.installer.is_some()
+            || self.merger.is_some()
+            || self.eraser.is_some()
+            || self.backuper.is_some()
+            || self.part_worker.is_some()
+            || self.systems_worker.as_ref().is_some_and(systems::Worker::busy);
         if !metadata_busy
-            && let Some(due) = keeper.due(app.settings(), now) {
+            && let Some(due) = self.keeper.due(self.app.settings(), now)
+        {
             match settings::write(&due) {
                 Ok(()) => {
                     skyward_sys::kmsg("the settings are kept")?;
-                    keeper.written(due);
+                    self.keeper.written(due);
                 }
                 Err(e) => {
                     skyward_sys::kmsg(&format!("the settings were not kept: {e:#}"))?;
-                    keeper.failed();
+                    self.keeper.failed();
                 }
             }
         }
+        Ok(())
+    }
+
+    /// What asking the update server, and downloading the system's full
+    /// package, told.
+    fn updates_told(&mut self, now: u64) -> Result<()> {
+        let told = self.checker.as_ref().map(updates::Worker::events).unwrap_or_default();
         let mut checked = false;
-        if let Some(c) = &checker {
-            for ev in c.events() {
-                let updates::Event::Checked(answer) = ev else { unreachable!("asking the server downloads nothing") };
-                let have = match &answer {
-                    Ok(Some(release)) => have(&app, release),
-                    _ => Have::Nothing,
-                };
-                app.update_checked(answer, have);
-                checked = true;
-            }
+        for ev in told {
+            let updates::Event::Checked(answer) = ev else { unreachable!("asking the server downloads nothing") };
+            let have = match &answer {
+                Ok(Some(release)) => have(&self.app, release),
+                _ => Have::Nothing,
+            };
+            self.app.update_checked(answer, have);
+            checked = true;
         }
         if checked {
-            checker = None;
+            self.checker = None;
         }
+        let told = self.downloader.as_ref().map(updates::Worker::events).unwrap_or_default();
         let mut fetched = false;
-        if let Some(d) = &downloader {
-            for ev in d.events() {
-                match ev {
-                    updates::Event::Progress(progress, rate) => app.download_progress(progress, rate),
-                    updates::Event::Ended(end) => {
-                        let release = app.state.newest().context("a download is of the newest system")?.clone();
-                        let end = match end {
-                            updates::End::Downloaded => DownloadEnd::Downloaded,
-                            updates::End::Stopped => DownloadEnd::Stopped,
-                            updates::End::Failed(why) => DownloadEnd::Failed(why),
-                            updates::End::Updated(_) | updates::End::NotWritten(_) | updates::End::WriteFailed(..) => {
-                                unreachable!("a system's full package is only downloaded")
-                            }
-                        };
-                        skyward_sys::kmsg(&format!("downloading {} ended: {end:?}", release.name))?;
-                        app.download_ended(end, have(&app, &release), now);
-                        fetched = true;
-                    }
-                    updates::Event::Checked(_) | updates::Event::SkywardChecked(_) | updates::Event::Writing { .. } => {
-                        unreachable!("a download asks nothing of its own, and writes nothing")
-                    }
+        for ev in told {
+            match ev {
+                updates::Event::Progress(progress, rate) => self.app.download_progress(progress, rate),
+                updates::Event::Ended(end) => {
+                    let release = self.app.state.newest().context("a download is of the newest system")?.clone();
+                    let end = match end {
+                        updates::End::Downloaded => DownloadEnd::Downloaded,
+                        updates::End::Stopped => DownloadEnd::Stopped,
+                        updates::End::Failed(why) => DownloadEnd::Failed(why),
+                        updates::End::Updated(_) | updates::End::NotWritten(_) | updates::End::WriteFailed(..) => {
+                            unreachable!("a system's full package is only downloaded")
+                        }
+                    };
+                    skyward_sys::kmsg(&format!("downloading {} ended: {end:?}", release.name))?;
+                    let have = have(&self.app, &release);
+                    self.app.download_ended(end, have, now);
+                    fetched = true;
+                }
+                updates::Event::Checked(_) | updates::Event::SkywardChecked(_) | updates::Event::Writing { .. } => {
+                    unreachable!("a download asks nothing of its own, and writes nothing")
                 }
             }
         }
         if fetched {
-            downloader = None;
+            self.downloader = None;
         }
+        Ok(())
+    }
+
+    /// What asking GitHub for Skyward's newest release, and updating to it,
+    /// told.
+    fn skyward_told(&mut self, now: u64) -> Result<()> {
+        let told = self.skyward_checker.as_ref().map(updates::Worker::events).unwrap_or_default();
         let mut asked = false;
-        if let Some(c) = &skyward_checker {
-            for ev in c.events() {
-                let updates::Event::SkywardChecked(answer) = ev else { unreachable!("asking GitHub downloads nothing") };
-                skyward_sys::kmsg(&format!("GitHub told of Skyward's newest release: {answer:?}"))?;
-                app.skyward_checked(answer);
-                asked = true;
-            }
+        for ev in told {
+            let updates::Event::SkywardChecked(answer) = ev else { unreachable!("asking GitHub downloads nothing") };
+            skyward_sys::kmsg(&format!("GitHub told of Skyward's newest release: {answer:?}"))?;
+            self.app.skyward_checked(answer);
+            asked = true;
         }
         if asked {
-            skyward_checker = None;
+            self.skyward_checker = None;
         }
+        let told = self.skyward_updater.as_ref().map(updates::Worker::events).unwrap_or_default();
         let mut updated = false;
-        if let Some(u) = &skyward_updater {
-            for ev in u.events() {
-                match ev {
-                    updates::Event::Progress(progress, rate) => app.skyward_progress(SkywardStage::Download(progress), rate),
-                    updates::Event::Writing { done, total } => app.skyward_progress(SkywardStage::Write { done, total }, 0),
-                    updates::Event::Ended(end) => {
-                        let end = match end {
-                            updates::End::Updated(slots) => SkywardEnd::Updated(slots),
-                            updates::End::Stopped => SkywardEnd::Stopped,
-                            updates::End::Failed(why) => SkywardEnd::Download(why),
-                            updates::End::NotWritten(why) => SkywardEnd::NotWritten(why),
-                            updates::End::WriteFailed(slots, why) => SkywardEnd::WriteFailed(slots, why),
-                            updates::End::Downloaded => unreachable!("Skyward's build is written once it is downloaded"),
-                        };
-                        skyward_sys::kmsg(&format!("updating Skyward ended: {end:?}"))?;
-                        app.skyward_ended(end, now);
-                        updated = true;
-                    }
-                    updates::Event::Checked(_) | updates::Event::SkywardChecked(_) => unreachable!("an update asks nothing of its own"),
+        for ev in told {
+            match ev {
+                updates::Event::Progress(progress, rate) => self.app.skyward_progress(SkywardStage::Download(progress), rate),
+                updates::Event::Writing { done, total } => self.app.skyward_progress(SkywardStage::Write { done, total }, 0),
+                updates::Event::Ended(end) => {
+                    let end = match end {
+                        updates::End::Updated(slots) => SkywardEnd::Updated(slots),
+                        updates::End::Stopped => SkywardEnd::Stopped,
+                        updates::End::Failed(why) => SkywardEnd::Download(why),
+                        updates::End::NotWritten(why) => SkywardEnd::NotWritten(why),
+                        updates::End::WriteFailed(slots, why) => SkywardEnd::WriteFailed(slots, why),
+                        updates::End::Downloaded => unreachable!("Skyward's build is written once it is downloaded"),
+                    };
+                    skyward_sys::kmsg(&format!("updating Skyward ended: {end:?}"))?;
+                    self.app.skyward_ended(end, now);
+                    updated = true;
                 }
+                updates::Event::Checked(_) | updates::Event::SkywardChecked(_) => unreachable!("an update asks nothing of its own"),
             }
         }
         if updated {
-            skyward_updater = None;
+            self.skyward_updater = None;
         }
-        if let Some(ended) = decryptor.as_ref().and_then(Decryptor::ended) {
-            decryptor = None;
-            match ended {
-                decrypt::Ended::Opened(Ok(opening)) => {
-                    if let Some(mounted) = &opening.mounted {
-                        log_mounted(mounted)?;
-                    }
-                    closed = opening.closed;
-                    show_closed(&mut app, &closed)?;
-                    // The owner's files are still shut and a credential was
-                    // kept for them: try it without asking, which is the whole
-                    // point of the switch. A credential the phone no longer
-                    // takes is thrown away rather than tried at every start.
-                    let owner_shut = closed.iter().any(|c| c.user == 0 && !c.made_up);
-                    if let Some(code) = app.auto_attempt(owner_shut) {
-                        skyward_sys::kmsg("the kept credential is being tried on the data partition")?;
-                        let job = decrypt::Job::Unlock { closed: closed.clone(), user: 0, credential: code.clone().into_bytes() };
-                        decryptor = Some(Decryptor::start(job)?);
-                        unlock_typed = Some((0, code));
-                        unlock_auto = true;
-                    }
+        Ok(())
+    }
+
+    /// How opening the data partition, or a user's own files in it, ended.
+    fn decrypt_told(&mut self, now: u64) -> Result<()> {
+        let Some(ended) = self.decryptor.as_ref().and_then(Decryptor::ended) else { return Ok(()) };
+        self.decryptor = None;
+        match ended {
+            decrypt::Ended::Opened(Ok(opening)) => {
+                if let Some(mounted) = &opening.mounted {
+                    log_mounted(mounted)?;
                 }
-                decrypt::Ended::Opened(Err(why)) => {
-                    skyward_sys::kmsg(&format!("the data partition stays closed: {why}"))?;
-                    // The update the system asked for cannot be read, and
-                    // is done with.
-                    if pending.take().is_some() {
-                        let failed = skyward_install::Outcome::Failed(skyward_install::Failure::Unreadable(why.clone()));
-                        app.install(skyward_install::Event::Finished(failed), now);
-                        if kept {
-                            bcb::clear(&misc)?;
-                            kept = false;
-                        }
-                    }
-                    app.data_failed(why);
+                self.closed = opening.closed;
+                show_closed(&mut self.app, &self.closed)?;
+                follow_system_zone(&mut self.app, kept_time_zone()?.as_deref(), &self.info)?;
+                // The owner's files are still shut and a credential was kept
+                // for them: try it without asking, which is the whole point of
+                // the switch.
+                let owner_shut = self.closed.iter().any(|c| c.user == 0 && !c.made_up);
+                if let Some(code) = self.app.auto_attempt(owner_shut) {
+                    skyward_sys::kmsg("the kept credential is being tried on the data partition")?;
+                    let job = decrypt::Job::Unlock { closed: self.closed.clone(), user: 0, credential: code.clone().into_bytes() };
+                    self.decryptor = Some(Decryptor::start(job)?);
+                    self.unlock_typed = Some((0, code));
+                    self.unlock_auto = true;
                 }
-                decrypt::Ended::Unlocked(Ok(still)) => {
-                    closed = still;
-                    show_closed(&mut app, &closed)?;
-                    // What was typed opened the phone's files, so it is the
-                    // credential to keep where the owner asked for it to be
-                    // kept. A second space's password is not the owner's, and
-                    // is not kept.
-                    if let Some((user, code)) = unlock_typed.take()
-                        && user == 0 && app.state.remember_password && app.state.remembered.as_deref() != Some(code.as_str()) {
-                        // Written here rather than queued as an effect:
-                        // this is what puts the sealed file on /metadata,
-                        // and an effect dropped on the floor is a switch
-                        // that does nothing at all.
-                        app.state.remembered = Some(code.clone());
-                        match crate::remembered::save(&code) {
-                            Ok(()) => skyward_sys::kmsg("the credential that opened the phone is kept")?,
-                            Err(e) => {
-                                let _ = skyward_sys::kmsg(&format!("the credential is not kept: {e:#}"));
-                            }
-                        }
-                    }
+            }
+            decrypt::Ended::Opened(Err(why)) => {
+                skyward_sys::kmsg(&format!("the data partition stays closed: {why}"))?;
+                // The update the system asked for cannot be read, and
+                // is done with.
+                if self.pending.take().is_some() {
+                    let failed = skyward_install::Outcome::Failed(skyward_install::Failure::Unreadable(why.clone()));
+                    self.app.install(skyward_install::Event::Finished(failed), now);
+                    self.done_with_request()?;
                 }
-                decrypt::Ended::Unlocked(Err(why)) => {
-                    // A kept credential the phone will not take is not
-                    // kept any more: the owner changed it, and trying
-                    // it again at every start would only add a refusal
-                    // to the log each time.
-                    if std::mem::take(&mut unlock_auto) {
-                        skyward_sys::kmsg(&format!("the kept credential was not taken, and is forgotten: {why}"))?;
-                        app.forget_password();
-                        unlock_typed = None;
-                    }
-                    // Which user the credential was for, so that a page
-                    // holding the recovery at a second space's prompt is not
-                    // read as the owner's own credential being wrong.
-                    let who = match app.state.data {
-                        Data::Locked { user, .. } => format!("the files of user {user}"),
-                        _ => "the user's own files".to_string(),
+                self.app.data_failed(why);
+            }
+            decrypt::Ended::Unlocked(Ok(still)) => {
+                self.closed = still;
+                show_closed(&mut self.app, &self.closed)?;
+                // What was typed opened the phone's files, so it is the
+                // credential to keep where the owner asked for it to be kept.
+                // A second space's password is not the owner's, and is not
+                // kept.
+                if let Some((user, code)) = self.unlock_typed.take()
+                    && user == 0
+                    && self.app.state.remember_password
+                    && self.app.state.remembered.as_deref() != Some(code.as_str())
+                {
+                    self.app.state.remembered = Some(code.clone());
+                    let _ = match crate::remembered::save(&code) {
+                        Ok(()) => skyward_sys::kmsg("the credential that opened the phone is kept"),
+                        Err(e) => skyward_sys::kmsg(&format!("the credential is not kept: {e:#}")),
                     };
-                    let _ = skyward_sys::kmsg(&format!("what was entered did not open {who}: {}", why.details));
-                    use skyward_crypto::credential::Rejection;
-                    let l = app.state.lang;
-                    let message = match why.rejection {
-                        Some(Rejection::Incorrect) => l.pick(["密码错误，请重试", "密碼錯誤，請重試", "Incorrect password. Try again."]).to_string(),
-                        Some(Rejection::Retry { seconds: Some(seconds), incorrect: true }) => skyward_ui::tr!(l, "密码错误，请等待 {seconds} 秒后重试", "密碼錯誤，請等待 {seconds} 秒後重試", "Incorrect password. Try again in {seconds} seconds."),
-                        Some(Rejection::Retry { seconds: Some(seconds), incorrect: false }) => skyward_ui::tr!(l, "请等待 {seconds} 秒后重试", "請等待 {seconds} 秒後重試", "Try again in {seconds} seconds."),
-                        Some(Rejection::Retry { seconds: None, incorrect: true }) => l.pick(["密码错误，请稍后重试", "密碼錯誤，請稍後重試", "Incorrect password. Try again later."]).to_string(),
-                        Some(Rejection::Retry { seconds: None, incorrect: false }) => l.pick(["尝试过于频繁，请稍后重试", "嘗試過於頻繁，請稍後重試", "Too many attempts. Try again later."]).to_string(),
-                        None => why.details,
-                    };
-                    app.unlock_failed(message, now);
                 }
+                self.unlock_auto = false;
             }
-            // Screenshots taken while internal storage was closed go into
-            // the gallery's once it opens.
-            if app.state.place_open(Place::Storage)
-                && let Err(e) = keep_held_screenshots() {
-                let why = format!("{e:#}");
-                skyward_sys::kmsg(&format!("the screenshots held did not go into the gallery's: {why}"))?;
-                app.screenshots_not_kept(&why, now);
-            }
-            // The update the system asked for starts once what holds it is
-            // open; until the user whose own files hold it unlocks them,
-            // its page says to.
-            if let Some(wanted) = pending.take() {
-                match wanted.needs {
-                    Needs::User(user) if closed.iter().any(|c| c.user == user) => {
-                        app.asked_locked(user, now);
-                        pending = Some(wanted);
-                    }
-                    _ => installer = Some(install_asked(programs, &app, wanted)?),
+            decrypt::Ended::Unlocked(Err(why)) => {
+                // A kept credential the phone will not take is not kept any
+                // more: the owner changed it, and trying it again at every
+                // start would only add a refusal to the log each time.
+                if std::mem::take(&mut self.unlock_auto) {
+                    let _ = skyward_sys::kmsg(&format!("the kept credential was not taken, and is forgotten: {why}"));
+                    self.app.forget_password();
+                    self.unlock_typed = None;
                 }
+                skyward_sys::kmsg(&format!("what was entered did not open the user's files: {why}"))?;
+                self.app.unlock_failed(why, now);
             }
         }
-        if let Some(sh) = &mut shell {
-            let wrote = sh.read()?;
-            if !wrote.is_empty() {
-                app.term_output(&wrote);
-            }
-            if let Some(status) = sh.ended()? {
-                // What it wrote last shows before its end does.
-                let last = sh.read()?;
-                if !last.is_empty() {
-                    app.term_output(&last);
+        // Screenshots taken while internal storage was closed go into
+        // the gallery's once it opens.
+        if self.app.state.place_open(Place::Storage)
+            && let Err(e) = keep_held_screenshots()
+        {
+            let why = format!("{e:#}");
+            skyward_sys::kmsg(&format!("the screenshots held did not go into the gallery's: {why}"))?;
+            self.app.screenshots_not_kept(&why, now);
+        }
+        // The update the system asked for starts once what holds it is
+        // open; until the user whose own files hold it unlocks them,
+        // its page says to.
+        if let Some(wanted) = self.pending.take() {
+            match wanted.needs {
+                Needs::User(user) if self.closed.iter().any(|c| c.user == user) => {
+                    self.app.asked_locked(user, now);
+                    self.pending = Some(wanted);
                 }
-                app.term_ended(pty::how(status));
-                shell = None;
+                _ => self.installer = Some(install_asked(self.programs, &self.app, wanted)?),
             }
         }
-        // Then what programs asked on the recovery socket, each answered as
-        // the recovery stands when its turn comes.
-        let requests = match &control {
-            Some(c) => c.requests()?,
-            None => Vec::new(),
-        };
-        let incoming = arriving
-            .take()
-            .into_iter()
-            .chain(drive_told.map(Incoming::Drive))
-            .chain(requests.into_iter().map(Incoming::Asked))
-            .chain(inputs.read()?.into_iter().map(Incoming::Input));
-        for came in incoming {
-            let effects = match came {
-                Incoming::Arrived => app.arrive(),
-                Incoming::Drive(drive) => app.set_usb_drive(drive),
-                Incoming::Asked(asked) => {
-                    skyward_sys::kmsg(&format!("asked on the recovery socket: {asked:?}"))?;
-                    answer(asked, fastboot)
-                }
-                Incoming::Input(Event::Touch(t, at)) => app.touch(t, &fonts, at),
-                Incoming::Input(Event::Key(k, true)) => app.key(k, now),
-                Incoming::Input(Event::Key(k, false)) => app.key_up(k, now),
-            };
-            // What the pages ask for in answer to the work done goes on
-            // after it.
-            let mut queue = VecDeque::from(effects);
-            while let Some(fx) = queue.pop_front() {
-                eprintln!("effect {fx:?}");
-                match fx {
-                    // Leaving is the user's answer to whatever the request
-                    // still kept in misc asked.
-                    Effect::Reboot(target) => {
-                        if kept {
-                            bcb::clear(&misc)?;
-                            kept = false;
-                        }
-                        // The radio goes away before the phone does: a chip
-                        // left running is one the system's own driver finds
-                        // already up as it boots and will not start cold.
-                        put_radio_away(&mut wlan);
-                        power(target)?
-                    }
-                    Effect::Dismiss => {
-                        if kept {
-                            bcb::clear(&misc)?;
-                            kept = false;
-                        }
-                    }
-                    Effect::FactoryReset => {
-                        ensure!(eraser.is_none(), "erasing is under way already");
-                        if !withhold(&mut transfer, &mut app, now)? {
-                            continue;
-                        }
-                        eraser = Some(factory_reset(&mut app, request.keep_memtag_mode, true, None)?);
-                        erase_leaves = true;
-                    }
-                    // Opening the data partition and erasing it are not to
-                    // cross; the page says to wait for the one under way.
-                    Effect::Wipe(chosen) => {
-                        ensure!(eraser.is_none(), "erasing is under way already");
-                        if decryptor.is_some() {
-                            app.report(app.state.lang.pick(DATA_OPENING), now);
-                            continue;
-                        }
-                        if !withhold(&mut transfer, &mut app, now)? {
-                            continue;
-                        }
-                        erase_leaves = false;
-                        if chosen.contains(&Wipe::All) {
-                            eraser = Some(factory_reset(&mut app, false, false, None)?);
-                        } else if chosen.iter().any(|&w| w != Wipe::Cache) && app.state.data == Data::Erased {
-                            app.erase_started(false, false, Vec::new());
-                            app.erase_ended(Err(EraseStop::Erased), now);
-                        } else {
-                            let steps = chosen.into_iter().map(step).collect();
-                            eraser = Some(parts_wipe(&mut app, steps, &cfg.wipe.logs, false, None)?);
-                        }
-                    }
-                    Effect::Install => installer.as_ref().context("no installer holds an update")?.install(),
-                    // A shell that will not start, or will not take keys,
-                    // is the page's to report; the recovery carries on.
-                    Effect::StartShell(folder) => {
-                        ensure!(shell.is_none(), "a shell runs already");
-                        let (rows, cols) = app.term_size(&fonts);
-                        match pty::Shell::start(rows, cols, &cfg.device.codename, Path::new(&folder)) {
-                            Ok(sh) => {
-                                shell = Some(sh);
-                                app.term_started(rows, cols);
-                            }
-                            Err(e) => {
-                                skyward_sys::kmsg(&format!("no shell for the terminal: {e:#}"))?;
-                                app.report(&format!("{e:#}"), now);
-                            }
-                        }
-                    }
-                    Effect::TermInput(bytes) => {
-                        let sh = shell.as_mut().context("keys went to a shell that has ended")?;
-                        if let Err(e) = sh.write(&bytes) {
-                            app.report(&format!("{e:#}"), now);
-                        }
-                    }
-                    Effect::ShellTo(folder) => {
-                        let sh = shell.as_mut().context("a folder went to a shell that has ended")?;
-                        let went = match sh.waiting() {
-                            Ok(true) => sh.change_to(&folder),
-                            Ok(false) => {
-                                app.report(app.state.lang.pick(skyward_ui::fmt::TERMINAL_BUSY), now);
-                                Ok(())
-                            }
-                            Err(e) => Err(e),
-                        };
-                        if let Err(e) = went {
-                            app.report(&format!("{e:#}"), now);
-                        }
-                    }
-                    Effect::Haptic => {
-                        if let Some(h) = &mut haptics {
-                            h.click(app.state.vibration)?;
-                        }
-                    }
-                    Effect::Ticks => {
-                        if let Some(h) = &mut haptics {
-                            h.ticks()?;
-                        }
-                    }
-                    // The panel shows the last frame drawn, which is what is
-                    // saved; one that cannot be is the page's to report.
-                    Effect::Screenshot { storage } => {
-                        let t0 = Instant::now();
-                        let saved = save_screenshot(&screen, storage, app.state.time_zone).map_err(|e| format!("{e:#}"));
-                        eprintln!("screenshot {saved:?} in {} ms", t0.elapsed().as_millis());
-                        app.screenshot_saved(saved, now);
-                    }
-                    Effect::Sideload => {
-                        ensure!(installer.is_none(), "an installer is running already");
-                        if !withhold(&mut transfer, &mut app, now)? {
-                            continue;
-                        }
-                        installer = Some(Installer::start(detach(programs.to_vec()), install_options(&app))?);
-                        sideloading = true;
-                    }
-                    Effect::InstallFile(place, path) => {
-                        ensure!(installer.is_none(), "an installer is running already");
-                        if !withhold(&mut transfer, &mut app, now)? {
-                            continue;
-                        }
-                        installer = Some(Installer::open(in_place(place, &path), detach(programs.to_vec()), install_options(&app))?);
-                    }
-                    Effect::InstallPath(path) => {
-                        ensure!(installer.is_none(), "an installer is running already");
-                        if !withhold(&mut transfer, &mut app, now)? {
-                            continue;
-                        }
-                        installer = Some(Installer::open(PathBuf::from(path), detach(programs.to_vec()), install_options(&app))?);
-                    }
-                    Effect::Flash { partition, pick } => {
-                        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-                        installer.as_ref().context("no installer holds an image")?.flash(partition, pick.slots(slot));
-                    }
-                    Effect::Cancel => match &installer {
-                        Some(i) => i.cancel()?,
-                        // The update the system asked for, waiting on the
-                        // lock of the user whose files hold it, is given up
-                        // as its page is left, and is done with.
-                        None => {
-                            ensure!(pending.take().is_some(), "no installer to cancel");
-                            skyward_sys::kmsg("the update asked for is given up, its page left")?;
-                            if kept {
-                                bcb::clear(&misc)?;
-                                kept = false;
-                            }
-                            let cancelled = skyward_install::Event::Finished(skyward_install::Outcome::Cancelled);
-                            app.install(cancelled, now);
-                        }
-                    },
-                    Effect::ReadMounts => app.set_mounts(mounts()),
-                    Effect::ReadSlots => app.set_boot_slots(read_slots()),
-                    Effect::SetSlot(slot) => app.slot_switched(set_slot(slot), now),
-                    Effect::ReadSystems => systems_worker.as_mut().context("this phone holds no second system")?.send(systems::Task::Read),
-                    // An install still under way may yet write the boot
-                    // partitions; a switch waits for it.
-                    Effect::SwitchSystem(to) => {
-                        if installer.is_some() {
-                            app.systems_work_failed(app.state.lang.pick(INSTALL_UNFINISHED), now);
-                            continue;
-                        }
-                        skyward_sys::kmsg(&format!("switching to the {to:?} system, as the systems page asked"))?;
-                        systems_worker.as_mut().context("this phone holds no second system")?.send(systems::Task::Switch(to));
-                    }
-                    Effect::RemoveSystem => {
-                        if installer.is_some() {
-                            app.systems_work_failed(app.state.lang.pick(INSTALL_UNFINISHED), now);
-                            continue;
-                        }
-                        skyward_sys::kmsg("removing the second system, as the systems page asked")?;
-                        systems_worker.as_mut().context("this phone holds no second system")?.send(systems::Task::Remove);
-                    }
-                    Effect::InstallSystem { size } => installer.as_ref().context("no installer holds a system")?.install_system(size),
-                    // The decrypt page shows meanwhile that the work is
-                    // under way, and takes nothing more until it is done.
-                    Effect::OpenData => {
-                        ensure!(decryptor.is_none(), "the data partition is being opened already");
-                        decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
-                    }
-                    Effect::Unlock { user, code } => {
-                        ensure!(decryptor.is_none(), "the data partition is being opened already");
-                        let job = decrypt::Job::Unlock { closed: closed.clone(), user, credential: code.clone().into_bytes() };
-                        decryptor = Some(Decryptor::start(job)?);
-                        // Kept only once it opens: what a phone is given that
-                        // it turns down is not a credential to write down.
-                        unlock_typed = Some((user, code));
-                    }
-                    Effect::ReadAvb => {
-                        app.avb_read(skyward_install::commands::avbctl::current().map_err(|e| e.to_string()), None);
-                    }
-                    Effect::SetAvb { expected, check, disabled } => {
-                        use skyward_install::commands::avbctl;
-                        // Nothing else may be writing partitions while vbmeta
-                        // is changed: an install may be flashing the very
-                        // image this is about to rewrite.
-                        let busy = installer.is_some()
-                            || part_worker.is_some()
-                            || eraser.is_some()
-                            || backuper.is_some()
-                            || skyward_updater.is_some();
-                        if busy {
-                            let said = app.state.lang.pick([
-                                "其他分区操作尚未结束，暂不能修改 AVB。",
-                                "其他分割區操作尚未結束，暫不能變更 AVB。",
-                                "Another partition operation is active; AVB cannot be changed yet.",
-                            ]);
-                            app.avb_read(avbctl::current().map_err(|e| e.to_string()), Some(said.into()));
-                            continue;
-                        }
-                        let (state, notice) = match avbctl::change(&expected, check, disabled) {
-                            Ok((state, backup)) => {
-                                let said = match backup.to_str() {
-                                    Some(path) => {
-                                        format!("{} {path}", app.state.lang.pick(["已写入并校验，重启后生效。原镜像：", "已寫入並驗證，重新啟動後生效。原映像檔：", "Written and verified; effective after the next start. The image as it was:"]))
-                                    }
-                                    None => app.state.lang.pick(["已写入并校验，重启后生效。", "已寫入並驗證，重新啟動後生效。", "Written and verified; effective after the next start."]).to_string(),
-                                };
-                                (Ok(state), said)
-                            }
-                            Err(e) => {
-                                let said = format!(
-                                    "{}: {e}",
-                                    app.state.lang.pick(["修改失败，请核对当前状态", "修改失敗，請核對目前狀態", "The change failed; check the state it is in now"])
-                                );
-                                (avbctl::current().map_err(|e| e.to_string()), said)
-                            }
-                        };
-                        app.avb_read(state, Some(notice));
-                    }
-                    // A copy of the slot's vbmeta is kept beside the backups,
-                    // and put back from there. Both are writes to a partition
-                    // and follow the rule a flag change follows: nothing else
-                    // may be writing partitions, and what is written is read
-                    // back before it is believed. The rollback index is
-                    // checked where the write is made, against the partition
-                    // as it is now.
-                    Effect::VbmetaBackup { place } => app.vbmeta_notice(crate::vbmeta::keep(place, app.state.lang)),
-                    Effect::VbmetaRestore { place, name } => {
-                        let busy = installer.is_some() || part_worker.is_some() || eraser.is_some() || backuper.is_some() || skyward_updater.is_some();
-                        if busy {
-                            let said = app.state.lang.pick([
-                                "其他分区操作尚未结束，暂不能写回 vbmeta。",
-                                "其他分割區操作尚未結束，暫不能寫回 vbmeta。",
-                                "Another partition operation is active; vbmeta cannot be written back yet.",
-                            ]);
-                            app.vbmeta_notice(said.to_string());
-                        } else {
-                            app.vbmeta_notice(crate::vbmeta::write_back(place, &name, app.state.lang));
-                        }
-                    }
-                    Effect::FindVbmeta { storage, usb } => app.set_vbmeta_copies(crate::vbmeta::find(storage, usb)),
-                    Effect::RememberPassword(code) => match code {
-                        Some(credential) => match crate::remembered::save(&credential) {
-                            Ok(()) => app.state.remembered = Some(credential),
-                            Err(e) => {
-                                let _ = skyward_sys::kmsg(&format!("the credential is not kept: {e:#}"));
-                            }
-                        },
-                        None => {
-                            app.state.remembered = None;
-                            if let Err(e) = crate::remembered::forget() {
-                                let _ = skyward_sys::kmsg(&format!("the kept credential is not removed: {e:#}"));
-                            }
-                        }
-                    },
-                    Effect::ReadDir(folder) => list(&mut app, folder, &closed)?,
-                    // The box's answer is bounded work done here rather than
-                    // on a thread of its own: it stops at a couple of
-                    // thousand folders, so the page waits a moment and the
-                    // run cannot be held by a tree that never ends. Failing
-                    // to walk it says so on the page; it does not end the run.
-                    Effect::FindFiles { root, query, generation, sort } => {
-                        let found = crate::find::find(Path::new(&root), &query, sort).map_err(|e| format!("{e:#}"));
-                        app.found_files(generation, found);
-                    }
-                    Effect::ReadPlace(place, folder) => list_place(&mut app, place, folder)?,
-                    // A name taken where an entry goes is the user's to
-                    // decide on before anything is written.
-                    Effect::Paste { op, path, into, clash } => {
-                        if worker.is_some() {
-                            // A second paste asked for while the first is
-                            // still going comes from a frame drawn before
-                            // the work began. Dropping it leaves the run
-                            // going, where ending it would take the phone
-                            // back to the home page mid-copy.
-                            let _ = skyward_sys::kmsg("work on files is under way already; the paste asked for is dropped");
-                            app.report(app.state.lang.pick(["文件操作还在进行", "檔案操作還在進行", "Work on files is already under way"]), now);
-                            continue;
-                        }
-                        let clash = match clash {
-                            Some(choice) => clash_rule(choice),
-                            None => match skyward_files::clashes(&[PathBuf::from(&path)], Path::new(&into)) {
-                                Ok(taken) if taken.is_empty() => skyward_files::Clash::Refuse,
-                                Ok(taken) => {
-                                    let names = taken.iter().map(|t| t.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())).collect();
-                                    app.file_clash(op, path, into, names);
-                                    continue;
-                                }
-                                Err(e) => {
-                                    app.report(&format!("{e:#}"), now);
-                                    continue;
-                                }
-                            },
-                        };
-                        let ownership = match ownership(Path::new(&into)) {
-                            Ok(ownership) => ownership,
-                            Err(e) => {
-                                app.report(&format!("{e:#}"), now);
-                                continue;
-                            }
-                        };
-                        let (from, to) = (PathBuf::from(&path), PathBuf::from(&into));
-                        let (task, shown) = match op {
-                            FileOp::Copy => (filework::Task::Copy { from, into: to, clash, ownership }, FileTask::Copy { path, into }),
-                            FileOp::Move => (filework::Task::Move { from, into: to, clash, ownership }, FileTask::Move { path, into }),
-                        };
-                        worker = Some(filework::Worker::start(task)?);
-                        app.file_job_started(shown);
-                    }
-                    Effect::Delete(path) => {
-                        if worker.is_some() {
-                            // As with a paste: a delete asked for twice is
-                            // dropped, never allowed to end the run.
-                            let _ = skyward_sys::kmsg("work on files is under way already; the delete asked for is dropped");
-                            app.report(app.state.lang.pick(["文件操作还在进行", "檔案操作還在進行", "Work on files is already under way"]), now);
-                            continue;
-                        }
-                        worker = Some(filework::Worker::start(filework::Task::Delete { path: PathBuf::from(&path) })?);
-                        app.file_job_started(FileTask::Delete { path });
-                    }
-                    // Stopping what is not running is a tap from a frame
-                    // drawn before the work ended, not a reason to end the
-                    // run.
-                    Effect::StopJob => match &worker {
-                        Some(w) => w.stop(),
-                        None => {
-                            let _ = skyward_sys::kmsg("no work on files to stop; the request is dropped");
-                        }
-                    },
-                    // Rules kept on a partition that is not mounted are the
-                    // page's to report, with what to do first.
-                    Effect::Relabel => {
-                        if relabeler.is_some() {
-                            let _ = skyward_sys::kmsg("relabeling is under way already; the request is dropped");
-                            app.report(app.state.lang.pick(["文件操作还在进行", "檔案操作還在進行", "Work on files is already under way"]), now);
-                            continue;
-                        }
-                        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-                        match relabel::rule_files(slot) {
-                            Ok(rules) => {
-                                relabeler = Some(filework::Worker::start(filework::Task::Relabel { rules })?);
-                                app.relabel_started();
-                            }
-                            Err(e) => match e.downcast_ref::<relabel::Unmounted>() {
-                                Some(relabel::Unmounted(base)) => app.report(&skyward_ui::fmt::mount_first(app.state.lang, base), now),
-                                None => app.report(&skyward_ui::fmt::rules_unread(app.state.lang, &format!("{e:#}")), now),
-                            },
-                        }
-                    }
-                    Effect::StopRelabel => match &relabeler {
-                        Some(r) => r.stop(),
-                        None => {
-                            let _ = skyward_sys::kmsg("no relabeling to stop; the request is dropped");
-                        }
-                    },
-                    // Partitions that cannot be read are the page's to say.
-                    Effect::ReadFilesystems => app.set_filesystems(read_filesystems().map_err(|e| format!("{e:#}"))),
-                    // The data partition made afresh as another filesystem
-                    // is a factory reset, as the system asks for one; the
-                    // rest is work on one partition. Opening the data
-                    // partition and working on it are not to cross, and file
-                    // transfer lets internal storage go first.
-                    Effect::Filesystem { name, action } => {
-                        ensure!(eraser.is_none() && part_worker.is_none(), "work on partitions is under way already");
-                        if name == DATA_PARTITION && decryptor.is_some() {
-                            app.report(app.state.lang.pick(DATA_OPENING), now);
-                            continue;
-                        }
-                        if name == DATA_PARTITION && !withhold(&mut transfer, &mut app, now)? {
-                            continue;
-                        }
-                        let part = fs_part(&name)?;
-                        let (kind, task) = match action {
-                            FsAction::Remake(filesystem) if name == DATA_PARTITION => {
-                                erase_leaves = false;
-                                eraser = Some(factory_reset(&mut app, false, false, Some(filesystem))?);
-                                continue;
-                            }
-                            FsAction::Repair => (PartKind::Repair, partwork::Task::Repair(part)),
-                            FsAction::Remake(filesystem) => (PartKind::Remake(filesystem.clone()), partwork::Task::Remake(part, filesystem)),
-                        };
-                        skyward_sys::kmsg(&format!("{kind:?} the filesystem of {name}, as the filesystem page asked"))?;
-                        app.part_work_started(kind, false);
-                        part_worker = Some(partwork::Worker::start(task)?);
-                    }
-                    // An install still stopping may yet write; a backup or
-                    // restore waits for it.
-                    Effect::Backup { parts, place, compress, verify } => {
-                        ensure!(backuper.is_none(), "a backup or restore is under way already");
-                        if installer.is_some() {
-                            app.report(app.state.lang.pick(INSTALL_UNFINISHED), now);
-                            continue;
-                        }
-                        let into = backups_in(place);
-                        let there = into.ancestors().find(|p| p.exists()).context("the root is always there")?;
-                        let ownership = match ownership(there) {
-                            Ok(ownership) => ownership,
-                            Err(e) => {
-                                app.report(&format!("{e:#}"), now);
-                                continue;
-                            }
-                        };
-                        let made = unix_now()?;
-                        let task = backup::BackupTask {
-                            parts: backup_parts(parts),
-                            stamp: skyward_ui::fmt::stamp(made, app.state.time_zone),
-                            into,
-                            ownership,
-                            compress,
-                            verify,
-                            remount: (place == Place::UsbDrive).then(|| PathBuf::from(USB_DRIVE)),
-                            made,
-                            device: cfg.device.codename.clone(),
-                            system: info.os_version.clone(),
-                            android: info.android.clone(),
-                            efs: cfg.backup.efs.clone(),
-                            skipped: cfg.backup.data_skipped.clone(),
-                        };
-                        backuper = Some(backup::Worker::start(backup::Task::Backup(task))?);
-                        app.backup_started(false, place, verify);
-                    }
-                    Effect::Restore { place, name, parts } => {
-                        ensure!(backuper.is_none(), "a backup or restore is under way already");
-                        if installer.is_some() {
-                            app.report(app.state.lang.pick(INSTALL_UNFINISHED), now);
-                            continue;
-                        }
-                        let task = backup::RestoreTask {
-                            folder: backups_in(place).join(&name),
-                            parts: backup_parts(parts),
-                            device: cfg.device.codename.clone(),
-                            android: info.android.clone(),
-                            skipped: cfg.backup.data_skipped.clone(),
-                            detach: detach(programs.to_vec()),
-                        };
-                        backuper = Some(backup::Worker::start(backup::Task::Restore(task))?);
-                        app.backup_started(true, place, true);
-                    }
-                    Effect::FindBackups { storage, usb } => find_backups(&mut app, storage, usb, now),
-                    Effect::DeleteBackup { place, name } => {
-                        let deleted = delete_backup(place, &backups_in(place).join(&name)).map_err(|e| format!("{e:#}"));
-                        queue.extend(app.backup_deleted(deleted, now));
-                    }
-                    Effect::StopBackup => backuper.as_ref().context("there is no backup or restore to stop")?.stop(),
-                    Effect::ReadUpdate => {
-                        let slot = info.slot.context("only an A/B phone has an update to merge")?;
-                        // A merge followed tells where it stands itself.
-                        if merger.is_none() {
-                            app.set_update(skyward_vab::standing(slot)?);
-                        }
-                        // An update in the other slot starts with that slot,
-                        // which a system's updater may not have set yet.
-                        app.set_boot_slots(read_slots());
-                    }
-                    Effect::Merge => {
-                        ensure!(merger.is_none(), "the update is being merged already");
-                        let slot = info.slot.context("only an A/B phone merges an update")?;
-                        skyward_sys::kmsg("merging the update, as the update page asked")?;
-                        merger = Some(merge::Merger::start(slot, true)?);
-                    }
-                    Effect::Wlan(on) => wlan_worker(&wlan)?.send(if on { wlan::Command::On } else { wlan::Command::Off }),
-                    Effect::ScanWlan => {
-                        scanned_at = Instant::now();
-                        wlan_worker(&wlan)?.send(wlan::Command::Scan);
-                    }
-                    Effect::JoinWlan { ssid, name, security, password } => {
-                        // Whether the password is kept for the next start is
-                        // the settings page's switch, read here rather than
-                        // asked of the page that typed it.
-                        let remember = app.state.remember_wlan;
-                        wlan_worker(&wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0, remember })
-                    }
-                    Effect::LeaveWlan => wlan_worker(&wlan)?.send(wlan::Command::Leave),
-                    // What the installed system is called is the page's to
-                    // report when it cannot be read.
-                    Effect::CheckUpdate => {
-                        ensure!(checker.is_none(), "the update server is being asked already");
-                        let server = cfg.update.as_ref().context("the phone's update server is not known")?.server.clone();
-                        let probe = cfg.wlan.as_ref().context("the phone's WLAN is not brought up")?.probe.clone();
-                        match installed(cfg, &info) {
-                            Ok(installed) => {
-                                checker = Some(updates::Worker::start(updates::Task::Check { server, probe, installed }, servers.clone())?)
-                            }
-                            Err(e) => app.update_checked(Err(Unanswered::Failed(format!("{e:#}"))), Have::Nothing),
-                        }
-                    }
-                    Effect::Download(release) => {
-                        ensure!(downloader.is_none(), "the full package is being downloaded already");
-                        let server = cfg.update.as_ref().context("the phone's update server is not known")?.server.clone();
-                        let path = downloaded(&release);
-                        match installed(cfg, &info) {
-                            Ok(installed) => {
-                                let task = updates::Task::Download { server, installed, release, path };
-                                downloader = Some(updates::Worker::start(task, servers.clone())?);
-                            }
-                            Err(e) => app.download_ended(DownloadEnd::Failed(Failure::Other(format!("{e:#}"))), have(&app, &release), now),
-                        }
-                    }
-                    // Pausing stops the transfer and keeps what came of it:
-                    // whoever goes on downloads from the part's own length.
-                    // No `?` on a stray pause — an error out of `run()` is a
-                    // recovery that restarts, which is the shape of the bug
-                    // this release is fixing.
-                    Effect::PauseDownload => match &downloader {
-                        Some(d) => d.stop(),
-                        None => {
-                            let _ = skyward_sys::kmsg("there is no download to pause");
-                        }
-                    },
-                    // Deleting the package whole, once nothing is downloading
-                    // it and no install is reading it.
-                    Effect::DeleteDownload(name) => {
-                        let folder = Path::new(skyward_crypto::data::SDCARD).join(skyward_ui::app::DOWNLOADS);
-                        let deleted = match (downloader.is_some(), installer.is_some(), updates::package_in(&folder, &name)) {
-                            (true, _, _) => Err("the package is being downloaded".to_string()),
-                            (_, true, _) => Err("an install is under way".to_string()),
-                            (_, _, None) => Err(format!("{name} is not a package name")),
-                            (false, false, Some(path)) => updates::delete(&path).map_err(|e| format!("{e:#}")),
-                        };
-                        // What internal storage holds of the newest package
-                        // now, read from disk rather than assumed: deleting a
-                        // part and deleting a whole one leave different
-                        // states behind.
-                        let after = app.state.newest().map_or(Have::Nothing, |release| have(&app, release));
-                        app.download_deleted(deleted, after, now);
-                    }
-                    // Forgetting a network takes what the phone keeps of it
-                    // away. An empty name is the WLAN switch turned off,
-                    // which forgets everything stored rather than one network.
-                    // The thread does it, and tells the page what is kept
-                    // now when it has.
-                    Effect::ForgetWlan(name) => {
-                        let asked = wlan_worker(&wlan).map(|w| w.forget(name.clone())).map_err(|e| format!("{e:#}"));
-                        app.wlan_forgotten(asked.map(|()| name), now);
-                    }
-                    Effect::CheckSkyward => {
-                        ensure!(skyward_checker.is_none(), "GitHub is being asked already");
-                        let probe = cfg.wlan.as_ref().context("the phone's WLAN is not brought up")?.probe.clone();
-                        let task = updates::Task::CheckSkyward { probe, codename: cfg.device.codename.clone() };
-                        skyward_checker = Some(updates::Worker::start(task, servers.clone())?);
-                    }
-                    // The zip goes into the recovery's own folder, which is
-                    // in memory, before its image goes into the recovery
-                    // partitions.
-                    Effect::UpdateSkyward(build) => {
-                        ensure!(skyward_updater.is_none(), "Skyward is being updated already");
-                        ensure!(installer.is_none(), "an installer is running already");
-                        skyward_sys::kmsg(&format!("updating Skyward to {}", build.name))?;
-                        let path = Path::new(skyward_sys::RUN).join(&build.name);
-                        let task = updates::Task::UpdateSkyward { build, codename: cfg.device.codename.clone(), path };
-                        skyward_updater = Some(updates::Worker::start(task, servers.clone())?);
-                    }
-                    Effect::StopSkywardUpdate => skyward_updater.as_ref().context("Skyward is not being updated")?.stop(),
-                    // Logs that cannot be saved are the page's to report;
-                    // the recovery carries on.
-                    Effect::ExportLogs { recovery, kernel, storage } => {
-                        let into = match storage {
-                            true => Path::new(skyward_crypto::data::SDCARD).join(STORAGE_LOGS),
-                            false => PathBuf::from(TMP_LOGS),
-                        };
-                        match export_logs(recovery, kernel, &into, app.state.time_zone) {
-                            Ok(folder) => app.report(&skyward_ui::fmt::exported(app.state.lang, &folder.display().to_string()), now),
-                            Err(e) => app.report(&skyward_ui::fmt::export_failed(app.state.lang, &format!("{e:#}")), now),
-                        }
-                    }
-                    Effect::SetMode { path, mode } => {
-                        let outcome = skyward_files::set_mode(Path::new(&path), mode).map_err(|e| format!("{e:#}"));
-                        app.mode_set(mode, outcome, now);
-                    }
-                    Effect::OpenText(path) => {
-                        let read = skyward_files::read_up_to(Path::new(&path), skyward_ui::editor::MAX_BYTES).map_err(|e| format!("{e:#}"));
-                        app.text_opened(&fonts, path, read, now);
-                    }
-                    // The folder is listed again, for the file's new size
-                    // and time.
-                    Effect::SaveText { path, text } => match skyward_files::replace(Path::new(&path), text.as_bytes()) {
-                        Ok(()) => {
-                            app.text_saved(Ok(()), now);
-                            let folder = app.state.files.path.clone();
-                            list(&mut app, folder, &closed)?;
-                        }
-                        Err(e) => app.text_saved(Err(format!("{e:#}")), now),
-                    },
-                    Effect::Rename { path, name } => match skyward_files::rename(Path::new(&path), &name) {
-                        Ok(_) => {
-                            app.renamed(Ok(()), now);
-                            let folder = app.state.files.path.clone();
-                            list(&mut app, folder, &closed)?;
-                        }
-                        Err(e) if e.is::<skyward_files::Taken>() => app.renamed(Err(RenameRefused::Taken), now),
-                        Err(e) => app.renamed(Err(RenameRefused::Failed(format!("{e:#}"))), now),
-                    },
-                    // A partition that will not mount, or is in use, is the
-                    // page's to report; the recovery carries on.
-                    Effect::Mount(base) => {
-                        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-                        if let Err(e) = skyward_vab::mount_one(slot, &base) {
-                            app.mount_failed(MountFailure { mounting: true, base, detail: format!("{e:#}") });
-                        }
-                        app.set_mounts(mounts());
-                    }
-                    Effect::Unmount(base) => {
-                        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-                        if let Err(e) = skyward_vab::unmount_one(slot, &base) {
-                            app.mount_failed(MountFailure { mounting: false, base, detail: format!("{e:#}") });
-                        }
-                        app.set_mounts(mounts());
-                    }
-                    // init stops fastbootd as the port goes through "none";
-                    // then the slot's partitions come up as at boot.
-                    Effect::EnterRecovery => {
-                        skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT)?;
-                        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-                        crate::prepare(cfg, slot)?;
-                        read_at = Instant::now();
-                        info = skyward_info::collect(cfg)?;
-                        fastboot = false;
-                        app.enter_recovery();
-                        if let Some(w) = systems_worker.as_mut() {
-                            w.send(systems::Task::Resume);
-                        }
-                    }
-                    // A port that something else has takes file transfer
-                    // on, or leaves it, when it comes back to rest.
-                    Effect::FileTransfer(on) => {
-                        let rests = !fastboot && !sideloading;
-                        match (on, transfer.take()) {
-                            (true, None) => match Transfer::start(cfg, &info, app.state.time_zone) {
-                                Ok(t) => {
-                                    transfer = Some(t);
-                                    if rests
-                                        && let Err(e) = skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT) {
-                                        skyward_sys::kmsg(&format!("the port did not take file transfer: {e:#}"))?;
-                                        app.report(&format!("{e:#}"), now);
-                                    }
-                                }
-                                Err(e) => {
-                                    skyward_sys::kmsg(&format!("file transfer did not start: {e:#}"))?;
-                                    app.file_transfer_failed(false, &skyward_ui::fmt::transfer_failed(app.state.lang, &format!("{e:#}")), now);
-                                }
-                            },
-                            (false, Some(t)) => {
-                                if let Err(e) = t.stop(rests) {
-                                    skyward_sys::kmsg(&format!("file transfer did not stop cleanly: {e:#}"))?;
-                                    app.report(&skyward_ui::fmt::transfer_left_on(app.state.lang, &format!("{e:#}")), now);
-                                }
-                            }
-                            (on, t) => unreachable!("the switch turned file transfer {on} while it was {}", t.is_some()),
-                        }
-                    }
-                    // A flag, and nothing it can fail: the next update check
-                    // and download reach GitHub itself first and a mirror only
-                    // when that does not answer.
-                    Effect::SetMirror(on) => skyward_net::mirror::set(on),
-                }
-            }
+        Ok(())
+    }
+
+    /// What the terminal's shell wrote, and its end.
+    fn shell_told(&mut self) -> Result<()> {
+        let Some(sh) = &mut self.shell else { return Ok(()) };
+        let wrote = sh.read()?;
+        if !wrote.is_empty() {
+            self.app.term_output(&wrote);
         }
-        // Internal storage goes to the computer while it is open, and no
-        // erasing or installing could take it away. File transfer that does
-        // not follow, or whose service ended, stops, and the page says why.
-        let kept = match &mut transfer {
+        if let Some(status) = sh.ended()? {
+            // What it wrote last shows before its end does.
+            let last = sh.read()?;
+            if !last.is_empty() {
+                self.app.term_output(&last);
+            }
+            self.app.term_ended(pty::how(status));
+            self.shell = None;
+        }
+        Ok(())
+    }
+
+    /// Internal storage goes to the computer while it is open, and no
+    /// erasing or installing could take it away. File transfer that does
+    /// not follow, or whose service ended, stops, and the page says why.
+    fn offer_storage(&mut self, now: u64) -> Result<()> {
+        let kept = match &mut self.transfer {
             Some(t) if !t.service.running() => Err(anyhow!("the file transfer service ended")),
             Some(t) => {
-                let offer = app.state.data.storage_open() && eraser.is_none() && installer.is_none();
-                t.offer(offer, app.state.lang).and_then(|()| {
-                    if t.zone != app.state.time_zone {
-                        t.service.set_zone(skyward_ui::fmt::rules(app.state.time_zone).clone())?;
-                        t.zone = app.state.time_zone;
+                let offer = self.app.state.data.storage_open() && self.eraser.is_none() && self.installer.is_none();
+                t.offer(offer, self.app.state.lang).and_then(|()| {
+                    if &t.zone != self.app.state.zone() {
+                        t.zone = self.app.state.zone().clone();
+                        t.service.set_zone(t.zone.clone())?;
                     }
                     Ok(())
                 })
@@ -3240,12 +2508,622 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
         };
         if let Err(e) = kept {
             // An ended service's own error says more than its ending does.
-            let why = match transfer.take().expect("only file transfer that runs fails").stop(!fastboot && !sideloading) {
+            let why = match self.transfer.take().expect("only file transfer that runs fails").stop(!self.fastboot && !self.sideloading) {
                 Err(cause) => cause,
                 Ok(()) => e,
             };
             skyward_sys::kmsg(&format!("file transfer stops: {why:#}"))?;
-            app.file_transfer_failed(false, &skyward_ui::fmt::transfer_stopped(app.state.lang, &format!("{why:#}")), now);
+            self.app.file_transfer_failed(false, &skyward_ui::fmt::transfer_stopped(self.app.state.lang, &format!("{why:#}")), now);
         }
+        Ok(())
+    }
+}
+
+/// What comes in to the pages, and what they ask for in answer.
+impl Pages<'_> {
+    /// Hand the pages what came in since the last turn: the first page
+    /// showing, a USB drive plugged in or pulled out, what programs asked on
+    /// the recovery socket, each answered as the recovery stands when its
+    /// turn comes, and touches and keys. What the pages ask for is done in
+    /// the order they ask.
+    fn take_in(&mut self, drive_told: Option<Option<UsbDrive>>, now: u64) -> Result<()> {
+        let requests = match &self.control {
+            Some(c) => c.requests()?,
+            None => Vec::new(),
+        };
+        let incoming = self
+            .arriving
+            .take()
+            .into_iter()
+            .chain(drive_told.map(Incoming::Drive))
+            .chain(requests.into_iter().map(Incoming::Asked))
+            .chain(self.inputs.read()?.into_iter().map(Incoming::Input));
+        for came in incoming {
+            let effects = match came {
+                Incoming::Arrived => self.app.arrive(),
+                Incoming::Drive(drive) => self.app.set_usb_drive(drive),
+                Incoming::Asked(asked) => {
+                    skyward_sys::kmsg(&format!("asked on the recovery socket: {asked:?}"))?;
+                    answer(asked, self.fastboot)
+                }
+                Incoming::Input(Event::Touch(t, at)) => self.app.touch(t, &self.fonts, at),
+                Incoming::Input(Event::Key(k, true)) => self.app.key(k, now),
+                Incoming::Input(Event::Key(k, false)) => self.app.key_up(k, now),
+            };
+            // What the pages ask for in answer to the work done goes on
+            // after it.
+            let mut queue = VecDeque::from(effects);
+            while let Some(fx) = queue.pop_front() {
+                eprintln!("effect {fx:?}");
+                queue.extend(self.effect(fx, now)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Do what a page asks for, and give what the pages ask for in answer
+    /// to it.
+    fn effect(&mut self, fx: Effect, now: u64) -> Result<Vec<Effect>> {
+        let cfg = self.cfg;
+        match fx {
+            // Leaving is the user's answer to whatever the request
+            // still kept in misc asked.
+            Effect::Reboot(target) => {
+                self.done_with_request()?;
+                power(target)?
+            }
+            Effect::Dismiss => self.done_with_request()?,
+            Effect::FactoryReset => self.reset_asked(now)?,
+            Effect::Wipe(chosen) => self.wipe(chosen, now)?,
+            Effect::Install => self.installer.as_ref().context("no installer holds an update")?.install(),
+            Effect::StartShell(folder) => self.start_shell(&folder, now)?,
+            // A shell that will not take keys is the page's to report; the
+            // recovery carries on.
+            Effect::TermInput(bytes) => {
+                let sh = self.shell.as_mut().context("keys went to a shell that has ended")?;
+                if let Err(e) = sh.write(&bytes) {
+                    self.app.report(&format!("{e:#}"), now);
+                }
+            }
+            Effect::ShellTo(folder) => self.shell_to(&folder, now)?,
+            Effect::Haptic => self.click()?,
+            Effect::Ticks => self.ticks()?,
+            // The panel shows the last frame drawn, which is what is
+            // saved; one that cannot be is the page's to report.
+            Effect::Screenshot { storage } => {
+                let t0 = Instant::now();
+                let saved = save_screenshot(&self.screen, storage, self.app.state.zone()).map_err(|e| format!("{e:#}"));
+                eprintln!("screenshot {saved:?} in {} ms", t0.elapsed().as_millis());
+                self.app.screenshot_saved(saved, now);
+            }
+            Effect::Sideload => {
+                if self.may_install(now)? {
+                    self.installer = Some(Installer::start(detach(self.programs.to_vec()), install_options(&self.app))?);
+                    self.sideloading = true;
+                }
+            }
+            Effect::InstallFile(place, path) => {
+                if self.may_install(now)? {
+                    self.installer = Some(Installer::open(in_place(place, &path), detach(self.programs.to_vec()), install_options(&self.app))?);
+                }
+            }
+            Effect::InstallPath(path) => {
+                if self.may_install(now)? {
+                    self.installer = Some(Installer::open(PathBuf::from(path), detach(self.programs.to_vec()), install_options(&self.app))?);
+                }
+            }
+            Effect::Flash { partition, place, pick } => {
+                let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+                self.installer.as_ref().context("no installer holds an image")?.flash(partition, pick.slots(place, slot));
+            }
+            Effect::Cancel => self.cancel_install(now)?,
+            Effect::ReadMounts => self.app.set_mounts(self.mounts()),
+            Effect::ReadSlots => self.app.set_boot_slots(read_slots()),
+            Effect::SetSlot(slot) => self.app.slot_switched(set_slot(slot), now),
+            Effect::ReadSystems => self.systems()?.send(systems::Task::Read),
+            // An install still under way may yet write the boot
+            // partitions; a switch waits for it.
+            Effect::SwitchSystem(to) => {
+                if self.installer.is_some() {
+                    self.app.systems_work_failed(self.app.state.lang.pick(INSTALL_UNFINISHED), now);
+                } else {
+                    skyward_sys::kmsg(&format!("switching to the {to:?} system, as the systems page asked"))?;
+                    self.systems()?.send(systems::Task::Switch(to));
+                }
+            }
+            Effect::RemoveSystem => {
+                if self.installer.is_some() {
+                    self.app.systems_work_failed(self.app.state.lang.pick(INSTALL_UNFINISHED), now);
+                } else {
+                    skyward_sys::kmsg("removing the second system, as the systems page asked")?;
+                    self.systems()?.send(systems::Task::Remove);
+                }
+            }
+            Effect::InstallSystem { size } => self.installer.as_ref().context("no installer holds a system")?.install_system(size),
+            // The decrypt page shows meanwhile that the work is
+            // under way, and takes nothing more until it is done.
+            Effect::OpenData => {
+                ensure!(self.decryptor.is_none(), "the data partition is being opened already");
+                self.decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
+            }
+            Effect::Unlock { user, code } => {
+                ensure!(self.decryptor.is_none(), "the data partition is being opened already");
+                let job = decrypt::Job::Unlock { closed: self.closed.clone(), user, credential: code.clone().into_bytes() };
+                self.decryptor = Some(Decryptor::start(job)?);
+                self.unlock_typed = Some((user, code));
+                self.unlock_auto = false;
+            }
+            // The credential kept for the screen lock is written down, or
+            // taken away where remembering was turned off.
+            Effect::RememberPassword(code) => match code {
+                Some(credential) => match crate::remembered::save(&credential) {
+                    Ok(()) => self.app.state.remembered = Some(credential),
+                    Err(e) => {
+                        let _ = skyward_sys::kmsg(&format!("the credential is not kept: {e:#}"));
+                    }
+                },
+                None => {
+                    self.app.state.remembered = None;
+                    if let Err(e) = crate::remembered::forget() {
+                        let _ = skyward_sys::kmsg(&format!("the kept credential is not removed: {e:#}"));
+                    }
+                }
+            },
+            Effect::ReadDir(folder) => list(&mut self.app, folder)?,
+            Effect::ReadPlace(place, folder) => list_place(&mut self.app, place, folder)?,
+            Effect::Paste { op, path, into, clash } => self.paste(op, path, into, clash, now)?,
+            Effect::Delete(path) => {
+                ensure!(self.worker.is_none(), "work on files is under way already");
+                self.worker = Some(filework::Worker::start(filework::Task::Delete { path: PathBuf::from(&path) })?);
+                self.app.file_job_started(FileTask::Delete { path });
+            }
+            Effect::StopJob => self.worker.as_ref().context("there is no work on files to stop")?.stop(),
+            Effect::Relabel => self.relabel(now)?,
+            Effect::StopRelabel => self.relabeler.as_ref().context("there is no relabeling to stop")?.stop(),
+            // Partitions that cannot be read are the page's to say.
+            Effect::ReadFilesystems => self.app.set_filesystems(read_filesystems().map_err(|e| format!("{e:#}"))),
+            Effect::Filesystem { name, action } => self.filesystem(&name, action, now)?,
+            Effect::Backup { parts, place, compress, verify } => self.back_up(parts, place, compress, verify, now)?,
+            Effect::Restore { place, name, parts } => self.restore(place, &name, parts, now)?,
+            Effect::FindBackups { storage, usb } => find_backups(&mut self.app, storage, usb, now),
+            Effect::DeleteBackup { place, name } => {
+                let deleted = delete_backup(place, &backups_in(place).join(&name)).map_err(|e| format!("{e:#}"));
+                return Ok(self.app.backup_deleted(deleted, now));
+            }
+            Effect::StopBackup => self.backuper.as_ref().context("there is no backup or restore to stop")?.stop(),
+            Effect::ReadUpdate => {
+                let slot = self.info.slot.context("only an A/B phone has an update to merge")?;
+                // A merge followed tells where it stands itself.
+                if self.merger.is_none() {
+                    self.app.set_update(skyward_vab::standing(slot)?);
+                }
+                // An update in the other slot starts with that slot,
+                // which a system's updater may not have set yet.
+                self.app.set_boot_slots(read_slots());
+            }
+            Effect::Merge => {
+                ensure!(self.merger.is_none(), "the update is being merged already");
+                let slot = self.info.slot.context("only an A/B phone merges an update")?;
+                skyward_sys::kmsg("merging the update, as the update page asked")?;
+                self.merger = Some(merge::Merger::start(slot, true)?);
+            }
+            Effect::Wlan(on) => wlan_worker(&self.wlan)?.send(if on { wlan::Command::On } else { wlan::Command::Off }),
+            Effect::ScanWlan => {
+                self.scanned_at = Instant::now();
+                wlan_worker(&self.wlan)?.send(wlan::Command::Scan);
+            }
+            Effect::JoinWlan { ssid, name, security, password } => {
+                wlan_worker(&self.wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0, remember: true })
+            }
+            Effect::LeaveWlan => wlan_worker(&self.wlan)?.send(wlan::Command::Leave),
+            Effect::CheckUpdate => self.check_update()?,
+            Effect::Download(release) => self.download(release, now)?,
+            Effect::StopDownload => self.downloader.as_ref().context("there is no download to stop")?.stop(),
+            Effect::CheckSkyward => {
+                ensure!(self.skyward_checker.is_none(), "GitHub is being asked already");
+                let probe = cfg.wlan.as_ref().context("the phone's WLAN is not brought up")?.probe.clone();
+                let task = updates::Task::CheckSkyward { probe, codename: cfg.device.codename.clone() };
+                self.skyward_checker = Some(updates::Worker::start(task, self.servers.clone())?);
+            }
+            // The zip goes into the recovery's own folder, which is
+            // in memory, before its image goes into the recovery
+            // partitions.
+            Effect::UpdateSkyward(build) => {
+                ensure!(self.skyward_updater.is_none(), "Skyward is being updated already");
+                ensure!(self.installer.is_none(), "an installer is running already");
+                skyward_sys::kmsg(&format!("updating Skyward to {}", build.name))?;
+                let path = Path::new(skyward_sys::RUN).join(&build.name);
+                let task = updates::Task::UpdateSkyward { build, codename: cfg.device.codename.clone(), path };
+                self.skyward_updater = Some(updates::Worker::start(task, self.servers.clone())?);
+            }
+            Effect::StopSkywardUpdate => self.skyward_updater.as_ref().context("Skyward is not being updated")?.stop(),
+            // Logs that cannot be saved are the page's to report;
+            // the recovery carries on.
+            Effect::ExportLogs { recovery, kernel, storage } => {
+                let into = match storage {
+                    true => Path::new(skyward_crypto::data::SDCARD).join(STORAGE_LOGS),
+                    false => PathBuf::from(TMP_LOGS),
+                };
+                match export_logs(recovery, kernel, &into, self.app.state.zone()) {
+                    Ok(folder) => self.app.report(&skyward_ui::fmt::exported(self.app.state.lang, &folder.display().to_string()), now),
+                    Err(e) => self.app.report(&skyward_ui::fmt::export_failed(self.app.state.lang, &format!("{e:#}")), now),
+                }
+            }
+            Effect::SetMode { path, mode } => {
+                let outcome = skyward_files::set_mode(Path::new(&path), mode).map_err(|e| format!("{e:#}"));
+                self.app.mode_set(mode, outcome, now);
+            }
+            Effect::OpenText(path) => {
+                let read = skyward_files::read_up_to(Path::new(&path), skyward_ui::editor::MAX_BYTES).map_err(|e| format!("{e:#}"));
+                self.app.text_opened(&self.fonts, path, read, now);
+            }
+            // The folder is listed again, for the file's new size
+            // and time.
+            Effect::SaveText { path, text } => match skyward_files::replace(Path::new(&path), text.as_bytes()) {
+                Ok(()) => {
+                    self.app.text_saved(Ok(()), now);
+                    let folder = self.app.state.files.path.clone();
+                    list(&mut self.app, folder)?;
+                }
+                Err(e) => self.app.text_saved(Err(format!("{e:#}")), now),
+            },
+            Effect::Rename { path, name } => match skyward_files::rename(Path::new(&path), &name) {
+                Ok(_) => {
+                    self.app.renamed(Ok(()), now);
+                    let folder = self.app.state.files.path.clone();
+                    list(&mut self.app, folder)?;
+                }
+                Err(e) if e.is::<skyward_files::Taken>() => self.app.renamed(Err(RenameRefused::Taken), now),
+                Err(e) => self.app.renamed(Err(RenameRefused::Failed(format!("{e:#}"))), now),
+            },
+            // A partition that will not mount, or is in use, is the
+            // page's to report; the recovery carries on.
+            Effect::Mount(base) => {
+                let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+                if let Err(e) = skyward_vab::mount_one(slot, &base) {
+                    self.app.mount_failed(MountFailure { mounting: true, base, detail: format!("{e:#}") });
+                }
+                self.app.set_mounts(self.mounts());
+            }
+            Effect::Unmount(base) => {
+                let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+                if let Err(e) = skyward_vab::unmount_one(slot, &base) {
+                    self.app.mount_failed(MountFailure { mounting: false, base, detail: format!("{e:#}") });
+                }
+                self.app.set_mounts(self.mounts());
+            }
+            Effect::EnterRecovery => self.enter_recovery()?,
+            Effect::FileTransfer(on) => self.file_transfer(on, now)?,
+        }
+        Ok(Vec::new())
+    }
+
+    /// The second system's work, which only a phone that can hold a second
+    /// system has.
+    fn systems(&mut self) -> Result<&mut systems::Worker> {
+        self.systems_worker.as_mut().context("this phone holds no second system")
+    }
+
+    /// Whether an install may start: none runs, and file transfer has let
+    /// internal storage go, which the page is told otherwise.
+    fn may_install(&mut self, now: u64) -> Result<bool> {
+        ensure!(self.installer.is_none(), "an installer is running already");
+        withhold(&mut self.transfer, &mut self.app, now)
+    }
+
+    /// Erase all user data, as the page the system's request showed asks.
+    fn reset_asked(&mut self, now: u64) -> Result<()> {
+        ensure!(self.eraser.is_none(), "erasing is under way already");
+        if !withhold(&mut self.transfer, &mut self.app, now)? {
+            return Ok(());
+        }
+        self.eraser = Some(factory_reset(&mut self.app, self.request.keep_memtag_mode, true, None)?);
+        self.erase_leaves = true;
+        Ok(())
+    }
+
+    /// Erase what the wipe page chose. Opening the data partition and
+    /// erasing it are not to cross; the page says to wait for the one under
+    /// way.
+    fn wipe(&mut self, chosen: Vec<Wipe>, now: u64) -> Result<()> {
+        ensure!(self.eraser.is_none(), "erasing is under way already");
+        if self.decryptor.is_some() {
+            self.app.report(self.app.state.lang.pick(DATA_OPENING), now);
+            return Ok(());
+        }
+        if !withhold(&mut self.transfer, &mut self.app, now)? {
+            return Ok(());
+        }
+        self.erase_leaves = false;
+        if chosen.contains(&Wipe::All) {
+            self.eraser = Some(factory_reset(&mut self.app, false, false, None)?);
+        } else if chosen.iter().any(|&w| w != Wipe::Cache) && self.app.state.data == Data::Erased {
+            self.app.erase_started(false, false, Vec::new());
+            self.app.erase_ended(Err(EraseStop::Erased), now);
+        } else {
+            let steps = chosen.into_iter().map(step).collect();
+            self.eraser = Some(parts_wipe(&mut self.app, steps, &self.cfg.wipe.logs, false, None)?);
+        }
+        Ok(())
+    }
+
+    /// Start the terminal's shell in `folder`. A shell that will not start
+    /// is the page's to report; the recovery carries on.
+    fn start_shell(&mut self, folder: &str, now: u64) -> Result<()> {
+        ensure!(self.shell.is_none(), "a shell runs already");
+        let (rows, cols) = self.app.term_size(&self.fonts);
+        match pty::Shell::start(rows, cols, &self.cfg.device.codename, Path::new(folder)) {
+            Ok(sh) => {
+                self.shell = Some(sh);
+                self.app.term_started(rows, cols);
+            }
+            Err(e) => {
+                skyward_sys::kmsg(&format!("no shell for the terminal: {e:#}"))?;
+                self.app.report(&format!("{e:#}"), now);
+            }
+        }
+        Ok(())
+    }
+
+    /// Have the terminal's shell go to `folder`, while it waits for a
+    /// command; one that will not is the page's to report.
+    fn shell_to(&mut self, folder: &str, now: u64) -> Result<()> {
+        let sh = self.shell.as_mut().context("a folder went to a shell that has ended")?;
+        let went = match sh.waiting() {
+            Ok(true) => sh.change_to(folder),
+            Ok(false) => {
+                self.app.report(self.app.state.lang.pick(skyward_ui::fmt::TERMINAL_BUSY), now);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = went {
+            self.app.report(&format!("{e:#}"), now);
+        }
+        Ok(())
+    }
+
+    /// Stop waiting for the computer, for where an image goes, or for an
+    /// update to be agreed to.
+    fn cancel_install(&mut self, now: u64) -> Result<()> {
+        match &self.installer {
+            Some(i) => i.cancel()?,
+            // The update the system asked for, waiting on the
+            // lock of the user whose files hold it, is given up
+            // as its page is left, and is done with.
+            None => {
+                ensure!(self.pending.take().is_some(), "no installer to cancel");
+                skyward_sys::kmsg("the update asked for is given up, its page left")?;
+                self.done_with_request()?;
+                let cancelled = skyward_install::Event::Finished(skyward_install::Outcome::Cancelled);
+                self.app.install(cancelled, now);
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy or move `path` into the folder `into`. A name taken where an
+    /// entry goes is the user's to decide on before anything is written.
+    fn paste(&mut self, op: FileOp, path: String, into: String, clash: Option<ClashChoice>, now: u64) -> Result<()> {
+        ensure!(self.worker.is_none(), "work on files is under way already");
+        let clash = match clash {
+            Some(choice) => clash_rule(choice),
+            None => match skyward_files::clashes(&[PathBuf::from(&path)], Path::new(&into)) {
+                Ok(taken) if taken.is_empty() => skyward_files::Clash::Refuse,
+                Ok(taken) => {
+                    let names = taken.iter().map(|t| t.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())).collect();
+                    self.app.file_clash(op, path, into, names);
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.app.report(&format!("{e:#}"), now);
+                    return Ok(());
+                }
+            },
+        };
+        let ownership = match ownership(Path::new(&into)) {
+            Ok(ownership) => ownership,
+            Err(e) => {
+                self.app.report(&format!("{e:#}"), now);
+                return Ok(());
+            }
+        };
+        let (from, to) = (PathBuf::from(&path), PathBuf::from(&into));
+        let (task, shown) = match op {
+            FileOp::Copy => (filework::Task::Copy { from, into: to, clash, ownership }, FileTask::Copy { path, into }),
+            FileOp::Move => (filework::Task::Move { from, into: to, clash, ownership }, FileTask::Move { path, into }),
+        };
+        self.worker = Some(filework::Worker::start(task)?);
+        self.app.file_job_started(shown);
+        Ok(())
+    }
+
+    /// Give the data partition's files the labels the installed system's
+    /// rules give them. Rules kept on a partition that is not mounted are
+    /// the page's to report, with what to do first.
+    fn relabel(&mut self, now: u64) -> Result<()> {
+        ensure!(self.relabeler.is_none(), "relabeling is under way already");
+        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+        match relabel::rule_files(slot) {
+            Ok(rules) => {
+                self.relabeler = Some(filework::Worker::start(filework::Task::Relabel { rules })?);
+                self.app.relabel_started();
+            }
+            Err(e) => match e.downcast_ref::<relabel::Unmounted>() {
+                Some(relabel::Unmounted(base)) => self.app.report(&skyward_ui::fmt::mount_first(self.app.state.lang, base), now),
+                None => self.app.report(&skyward_ui::fmt::rules_unread(self.app.state.lang, &format!("{e:#}")), now),
+            },
+        }
+        Ok(())
+    }
+
+    /// Repair the filesystem of the partition `name`, or make it afresh.
+    /// The data partition made afresh as another filesystem is a factory
+    /// reset, as the system asks for one; the rest is work on one
+    /// partition. Opening the data partition and working on it are not to
+    /// cross, and file transfer lets internal storage go first.
+    fn filesystem(&mut self, name: &str, action: FsAction, now: u64) -> Result<()> {
+        ensure!(self.eraser.is_none() && self.part_worker.is_none(), "work on partitions is under way already");
+        if name == DATA_PARTITION && self.decryptor.is_some() {
+            self.app.report(self.app.state.lang.pick(DATA_OPENING), now);
+            return Ok(());
+        }
+        if name == DATA_PARTITION && !withhold(&mut self.transfer, &mut self.app, now)? {
+            return Ok(());
+        }
+        let part = fs_part(name)?;
+        let (kind, task) = match action {
+            FsAction::Remake(filesystem) if name == DATA_PARTITION => {
+                self.erase_leaves = false;
+                self.eraser = Some(factory_reset(&mut self.app, false, false, Some(filesystem))?);
+                return Ok(());
+            }
+            FsAction::Repair => (PartKind::Repair, partwork::Task::Repair(part)),
+            FsAction::Remake(filesystem) => (PartKind::Remake(filesystem.clone()), partwork::Task::Remake(part, filesystem)),
+        };
+        skyward_sys::kmsg(&format!("{kind:?} the filesystem of {name}, as the filesystem page asked"))?;
+        self.app.part_work_started(kind, false);
+        self.part_worker = Some(partwork::Worker::start(task)?);
+        Ok(())
+    }
+
+    /// Back the parts chosen up into `place`. An install still stopping may
+    /// yet write; a backup waits for it.
+    fn back_up(&mut self, parts: [bool; 5], place: Place, compress: bool, verify: bool, now: u64) -> Result<()> {
+        ensure!(self.backuper.is_none(), "a backup or restore is under way already");
+        if self.installer.is_some() {
+            self.app.report(self.app.state.lang.pick(INSTALL_UNFINISHED), now);
+            return Ok(());
+        }
+        let into = backups_in(place);
+        let there = into.ancestors().find(|p| p.exists()).context("the root is always there")?;
+        let ownership = match ownership(there) {
+            Ok(ownership) => ownership,
+            Err(e) => {
+                self.app.report(&format!("{e:#}"), now);
+                return Ok(());
+            }
+        };
+        let made = unix_now()?;
+        let task = backup::BackupTask {
+            parts,
+            stamp: skyward_ui::fmt::stamp(made, self.app.state.zone()),
+            into,
+            ownership,
+            compress,
+            verify,
+            remount: (place == Place::UsbDrive).then(|| PathBuf::from(USB_DRIVE)),
+            made,
+            device: self.cfg.device.codename.clone(),
+            system: self.info.os_version.clone(),
+            android: self.info.android.clone(),
+            efs: self.cfg.backup.efs.clone(),
+            skipped: self.cfg.backup.data_skipped.clone(),
+        };
+        self.backuper = Some(backup::Worker::start(backup::Task::Backup(task))?);
+        self.app.backup_started(false, place, verify);
+        Ok(())
+    }
+
+    /// Restore the parts chosen of the backup `name` in `place`. An install
+    /// still stopping may yet write; a restore waits for it.
+    fn restore(&mut self, place: Place, name: &str, parts: [bool; 5], now: u64) -> Result<()> {
+        ensure!(self.backuper.is_none(), "a backup or restore is under way already");
+        if self.installer.is_some() {
+            self.app.report(self.app.state.lang.pick(INSTALL_UNFINISHED), now);
+            return Ok(());
+        }
+        let task = backup::RestoreTask {
+            folder: backups_in(place).join(name),
+            parts,
+            device: self.cfg.device.codename.clone(),
+            android: self.info.android.clone(),
+            skipped: self.cfg.backup.data_skipped.clone(),
+            detach: detach(self.programs.to_vec()),
+        };
+        self.backuper = Some(backup::Worker::start(backup::Task::Restore(task))?);
+        self.app.backup_started(true, place, true);
+        Ok(())
+    }
+
+    /// Ask the update server for the newest system. What the installed
+    /// system is called is the page's to report when it cannot be read.
+    fn check_update(&mut self) -> Result<()> {
+        ensure!(self.checker.is_none(), "the update server is being asked already");
+        let server = self.cfg.update.as_ref().context("the phone's update server is not known")?.server.clone();
+        let probe = self.cfg.wlan.as_ref().context("the phone's WLAN is not brought up")?.probe.clone();
+        match installed(self.cfg, &self.info) {
+            Ok(installed) => {
+                self.checker = Some(updates::Worker::start(updates::Task::Check { server, probe, installed }, self.servers.clone())?)
+            }
+            Err(e) => self.app.update_checked(Err(Unanswered::Failed(format!("{e:#}"))), Have::Nothing),
+        }
+        Ok(())
+    }
+
+    /// Download `release`'s full package into internal storage.
+    fn download(&mut self, release: Release, now: u64) -> Result<()> {
+        ensure!(self.downloader.is_none(), "the full package is being downloaded already");
+        let server = self.cfg.update.as_ref().context("the phone's update server is not known")?.server.clone();
+        let path = downloaded(&release);
+        match installed(self.cfg, &self.info) {
+            Ok(installed) => {
+                let task = updates::Task::Download { server, installed, release, path };
+                self.downloader = Some(updates::Worker::start(task, self.servers.clone())?);
+            }
+            Err(e) => {
+                let have = have(&self.app, &release);
+                self.app.download_ended(DownloadEnd::Failed(Failure::Other(format!("{e:#}"))), have, now);
+            }
+        }
+        Ok(())
+    }
+
+    /// Leave fastboot for the recovery's pages. init stops fastbootd as the
+    /// port goes through "none"; then the slot's partitions come up as at
+    /// boot.
+    fn enter_recovery(&mut self) -> Result<()> {
+        skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT)?;
+        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+        crate::prepare(self.cfg, slot)?;
+        self.read_at = Instant::now();
+        read_details(self.cfg, &mut self.info, &mut self.unread.details)?;
+        self.fastboot = false;
+        self.app.enter_recovery();
+        if let Some(w) = self.systems_worker.as_mut() {
+            w.send(systems::Task::Resume);
+        }
+        Ok(())
+    }
+
+    /// Turn file transfer on or off. A port that something else has takes
+    /// file transfer on, or leaves it, when it comes back to rest.
+    fn file_transfer(&mut self, on: bool, now: u64) -> Result<()> {
+        let rests = !self.fastboot && !self.sideloading;
+        match (on, self.transfer.take()) {
+            (true, None) => match Transfer::start(self.cfg, &self.info, self.app.state.zone()) {
+                Ok(t) => {
+                    self.transfer = Some(t);
+                    if rests
+                        && let Err(e) = skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT)
+                    {
+                        skyward_sys::kmsg(&format!("the port did not take file transfer: {e:#}"))?;
+                        self.app.report(&format!("{e:#}"), now);
+                    }
+                }
+                Err(e) => {
+                    skyward_sys::kmsg(&format!("file transfer did not start: {e:#}"))?;
+                    self.app.file_transfer_failed(false, &skyward_ui::fmt::transfer_failed(self.app.state.lang, &format!("{e:#}")), now);
+                }
+            },
+            (false, Some(t)) => {
+                if let Err(e) = t.stop(rests) {
+                    skyward_sys::kmsg(&format!("file transfer did not stop cleanly: {e:#}"))?;
+                    self.app.report(&skyward_ui::fmt::transfer_left_on(self.app.state.lang, &format!("{e:#}")), now);
+                }
+            }
+            (on, t) => unreachable!("the switch turned file transfer {on} while it was {}", t.is_some()),
+        }
+        Ok(())
     }
 }

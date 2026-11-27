@@ -9,7 +9,7 @@ use std::ffi::CString;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub enum Event {
     /// A touch and when the panel reported it, on [`monotonic_ms`]'s clock.
@@ -278,18 +278,6 @@ impl Inputs {
     /// Whether a touch panel has come up.
     pub fn has_panel(&self) -> bool {
         self.panel.is_some()
-    }
-
-    /// Where the touch panel's input node is under /sys, which is what says
-    /// whether it may wake the phone from a suspend.
-    ///
-    /// The node is `/dev/input/eventN`, and the class folder of the same name
-    /// holds the `device` link to the driver's own device, whose
-    /// `power/wakeup` is the switch. `None` until a panel has come up.
-    pub fn panel_node(&self) -> Option<PathBuf> {
-        let panel = self.panel.as_ref()?;
-        let name = panel.path.file_name()?.to_str()?;
-        Some(Path::new("/sys/class/input").join(name))
     }
 
     /// Readable while a device has something queued, or /dev/input changed.

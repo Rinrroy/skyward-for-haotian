@@ -195,16 +195,9 @@ impl Offer {
 }
 
 /// A service the computer asked to open.
-///
-/// None of these names the file the computer sends. `adb sideload` says how
-/// long its package is and in what blocks it serves it, and nothing else:
-/// the name the user gave it stays on the computer. So the name a package is
-/// served under here cannot be the one it was sent with, and a package a
-/// computer sends is served under the fixed name the recovery gives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Service {
     /// `sideload-host:<size>:<block size>`: send a package block by block.
-    /// The name of the package is not among them.
     SideloadHost(Offer),
     /// `sideload:<size>`: send the whole package in one go, as adb did
     /// before Android 4.4.
@@ -225,7 +218,7 @@ pub enum Service {
 }
 
 pub fn service(payload: &[u8]) -> Service {
-    let name = String::from_utf8_lossy(payload.strip_suffix(&[0]).unwrap_or(payload)).into_owned();
+    let name = String::from_utf8_lossy(payload.trim_suffix(&[0])).into_owned();
     if let Some(args) = name.strip_prefix("sideload-host:") {
         return offered(args).map_or(Service::Other(name), Service::SideloadHost);
     }
