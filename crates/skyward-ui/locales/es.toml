@@ -616,6 +616,11 @@ both_slots = "La nueva versión se escribe en la partición recovery de la ranur
 reboot_to_use = "Después de actualizar, reinicia en recovery para usar la nueva versión."
 
 [settings]
+always_on_display = "Pantalla siempre encendida"
+always_on = "Siempre activo"
+clock_style = "Estilo del reloj"
+always_on_note = "Con la pantalla apagada, la hora, la batería, el slot y el descifrado siguen visibles, con la luz de fondo apagada."
+double_tap = "Doble toque para despertar"
 remember_password = "Recordar contraseña"
 remember_password_note = "Activado, el bloqueo de pantalla se guarda en este teléfono y se prueba solo en el próximo inicio. Cualquiera con este teléfono puede leerlo."
 light_mode = "Modo claro"

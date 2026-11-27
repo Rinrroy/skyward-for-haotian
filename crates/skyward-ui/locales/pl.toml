@@ -621,6 +621,11 @@ both_slots = "Nowa wersja trafia na partycję recovery slotu, który uruchomi si
 reboot_to_use = "Po aktualizacji zrestartuj do recovery, aby korzystać z nowej wersji."
 
 [settings]
+always_on_display = "Zawsze włączony ekran"
+always_on = "Zawsze włączone"
+clock_style = "Styl zegara"
+always_on_note = "Przy wygaszonym ekranie godzina, bateria, slot i odszyfrowanie pozostają widoczne, podświetlenie jest wyłączone."
+double_tap = "Dotknij dwukrotnie, aby wybudzić"
 remember_password = "Zapamiętaj hasło"
 remember_password_note = "Gdy włączone, blokada ekranu jest przechowywana na tym telefonie i sprawdzana sama przy następnym uruchomieniu. Każdy, kto ma ten telefon, może ją odczytać."
 light_mode = "Tryb jasny"

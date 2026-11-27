@@ -616,6 +616,11 @@ both_slots = "A nova versão vai para a partição recovery do slot que inicia e
 reboot_to_use = "Depois de atualizar, reinicie no recovery para usar a nova versão."
 
 [settings]
+always_on_display = "Tela sempre ativa"
+always_on = "Sempre ativo"
+clock_style = "Estilo do relógio"
+always_on_note = "Com a tela desligada, a hora, a bateria, o slot e a descriptografia continuam visíveis, com a luz de fundo apagada."
+double_tap = "Toque duplo para despertar"
 remember_password = "Lembrar senha"
 remember_password_note = "Ativado, o bloqueio de tela é mantido neste telefone e tentado sozinho na próxima inicialização. Qualquer pessoa com este telefone pode lê-lo."
 light_mode = "Modo claro"

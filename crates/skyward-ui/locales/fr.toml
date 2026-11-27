@@ -616,6 +616,11 @@ both_slots = "La nouvelle version est écrite dans la partition recovery du slot
 reboot_to_use = "Une fois la mise à jour terminée, redémarrez en recovery pour utiliser la nouvelle version."
 
 [settings]
+always_on_display = "Affichage permanent"
+always_on = "Toujours actif"
+clock_style = "Style d'horloge"
+always_on_note = "Écran éteint, l'heure, la batterie, le slot et l'état du déchiffrement restent affichés, le rétroéclairage reste éteint."
+double_tap = "Double toucher pour réveiller"
 remember_password = "Mémoriser le mot de passe"
 remember_password_note = "Activé, le verrouillage d'écran est conservé sur ce téléphone et essayé de lui-même au prochain démarrage. Quiconque a ce téléphone peut le lire."
 light_mode = "Mode clair"

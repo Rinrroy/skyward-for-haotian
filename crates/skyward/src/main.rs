@@ -32,6 +32,8 @@ mod relabel;
 #[cfg(target_os = "android")]
 mod remembered;
 #[cfg(target_os = "android")]
+mod aod;
+#[cfg(target_os = "android")]
 mod secure;
 #[cfg(target_os = "android")]
 mod services;

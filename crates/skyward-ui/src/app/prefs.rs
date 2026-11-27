@@ -36,6 +36,11 @@ pub enum Switch {
     RememberPassword,
     /// Keep the time zone the installed system is set to.
     SystemTimeZone,
+    /// Keep the clock and the phone's readings on the glass in the panel's
+    /// own doze, with the backlight out.
+    AlwaysOn,
+    /// Two taps on the dark panel light it again.
+    DoubleTap,
 }
 
 /// How long the screen stays on with nothing touched, in milliseconds, in

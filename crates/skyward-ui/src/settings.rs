@@ -5,6 +5,7 @@
 //! a time zone by its name in the tz database, a part or a place by its
 //! name, so a later version that lists them otherwise reads them the same.
 
+use crate::aod::{AodStyle, STYLES};
 use crate::app::{Place, State, SystemZone, SCREEN_OFF, TIME_ZONES};
 use crate::Lang;
 use anyhow::{Context, Result};
@@ -16,6 +17,9 @@ pub const WAIT_MS: u64 = 2000;
 
 /// The parts a backup takes, by name, in the order of the backup page.
 const PARTS: [&str; 5] = ["boot", "system", "data", "media", "modem"];
+/// The faces the dark panel can wear, by name, in the order the setting goes
+/// round them.
+const AOD_STYLES: [&str; STYLES.len()] = ["digits", "offset", "dial"];
 /// Where a backup goes, by name.
 const STORAGE: &str = "storage";
 const USB_DRIVE: &str = "usb_drive";
@@ -58,6 +62,14 @@ pub struct Settings {
     /// The screen lock is kept once it opens the data partition, and tried
     /// by itself at the next start.
     pub remember_password: bool,
+    /// A dark panel keeps the clock and the phone's readings on the glass in
+    /// the panel's own doze, rather than being put out.
+    pub always_on: bool,
+    /// The face the dark panel wears while it dozes, by name: digits, offset
+    /// or dial.
+    pub aod_style: String,
+    /// Two taps on the dark panel light it again.
+    pub double_tap: bool,
     pub install: Install,
     pub backup: Backup,
     pub logs: Logs,
@@ -138,6 +150,14 @@ impl Settings {
             vibration: state.vibration,
             file_transfer: state.file_transfer,
             remember_password: state.remember_password,
+            always_on: state.always_on,
+            aod_style: AOD_STYLES[match state.aod_style {
+                AodStyle::Digits => 0,
+                AodStyle::Offset => 1,
+                AodStyle::Dial => 2,
+            }]
+            .to_string(),
+            double_tap: state.double_tap,
             install: Install { check_signature: state.check_signature, keep_recovery: state.keep_recovery },
             backup: Backup {
                 parts: names(&state.backup, &PARTS),
@@ -201,6 +221,11 @@ impl Settings {
         }
         state.file_transfer = self.file_transfer;
         state.remember_password = self.remember_password;
+        state.always_on = self.always_on;
+        if let Some(at) = AOD_STYLES.iter().position(|name| *name == self.aod_style) {
+            state.aod_style = STYLES[at];
+        }
+        state.double_tap = self.double_tap;
         state.check_signature = self.install.check_signature;
         state.keep_recovery = self.install.keep_recovery;
         state.backup = picked(&self.backup.parts, &PARTS);

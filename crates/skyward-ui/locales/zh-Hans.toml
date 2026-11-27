@@ -606,6 +606,11 @@ both_slots = "新版本将写入下次启动所用槽位的 recovery 分区；�
 reboot_to_use = "更新完成后，重启到恢复模式即可使用新版本。"
 
 [settings]
+always_on_display = "息屏显示"
+always_on = "常亮"
+clock_style = "时钟样式"
+always_on_note = "屏幕熄灭后仍显示时间、电量、槽位与解密状态，背光保持关闭。"
+double_tap = "双击亮屏"
 remember_password = "记住密码"
 remember_password_note = "打开后，屏幕锁会保存在这台手机上，下次启动时自动尝试。拿到这台手机的人可以读出它。"
 light_mode = "浅色模式"

@@ -611,6 +611,11 @@ both_slots = "Die neue Version kommt in die recovery-Partition des Slots, der al
 reboot_to_use = "Starte nach dem Update ins Recovery neu, um die neue Version zu nutzen."
 
 [settings]
+always_on_display = "Always-On-Display"
+always_on = "Immer an"
+clock_style = "Uhrstil"
+always_on_note = "Bei ausgeschaltetem Bildschirm bleiben Uhrzeit, Akku, Slot und Entschlüsselung sichtbar, die Hintergrundbeleuchtung bleibt aus."
+double_tap = "Zum Aufwecken doppelt tippen"
 remember_password = "Passwort merken"
 remember_password_note = "Wenn an, bleibt die Displaysperre auf diesem Telefon gespeichert und wird beim nächsten Start von selbst versucht. Wer dieses Telefon hat, kann sie lesen."
 light_mode = "Heller Modus"

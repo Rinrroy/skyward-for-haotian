@@ -41,8 +41,7 @@ impl App {
             }
             // The switch moves at once; the runtime then tells how the WLAN
             // came up, or went off.
-            Action::Toggle(Switch::Wlan) => {
-                let w = self.state.wlan.as_mut().expect("the WLAN switch shows on a phone whose WLAN is brought up");
+            Action::Toggle(Switch::Wlan) => {                let w = self.state.wlan.as_mut().expect("the WLAN switch shows on a phone whose WLAN is brought up");
                 let on = matches!(w.power, Power::Off | Power::Failed(_));
                 *w = Wlan { power: if on { Power::Starting } else { Power::Off }, ..Wlan::default() };
                 self.refresh();
@@ -59,6 +58,12 @@ impl App {
                 self.state.follow_system_zone.toggle();
                 self.refresh();
             }
+            // The face the panel wears while it dozes goes round the three, the
+            // digits the recovery has always drawn first.
+            Action::AodStyle => {
+                self.state.aod_style = self.state.aod_style.next();
+                self.refresh();
+            }
             Action::Toggle(switch) => {
                 let on = match switch {
                     Switch::Vibrate => &mut self.state.vibrate,
@@ -69,6 +74,8 @@ impl App {
                     Switch::KeepRecovery => &mut self.state.keep_recovery,
                     Switch::ShowPassword => &mut self.state.show_password,
                     Switch::RememberPassword => &mut self.state.remember_password,
+                    Switch::AlwaysOn => &mut self.state.always_on,
+                    Switch::DoubleTap => &mut self.state.double_tap,
                     Switch::Wlan | Switch::SystemTimeZone => unreachable!("the switch is turned above"),
                 };
                 *on = !*on;

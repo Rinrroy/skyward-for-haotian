@@ -2,6 +2,7 @@
 //! and the clock do to it, and what it asks of the runtime in return. Each
 //! page's own types, methods and tests are in the module named for it.
 
+use crate::aod::AodStyle;
 use crate::canvas::{Canvas, Run};
 use crate::charge;
 use crate::color::Rgba;
@@ -242,6 +243,8 @@ pub enum Action {
     Back,
     Theme { dark: bool },
     Toggle(Switch),
+    /// Go round to the next face the dark panel can wear.
+    AodStyle,
     RebootTarget(usize),
     /// Choose or leave out what the wipe page erases.
     WipeItem(Wipe),

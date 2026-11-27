@@ -616,6 +616,11 @@ both_slots = "La nuova versione viene scritta nella partizione recovery dello sl
 reboot_to_use = "Dopo l'aggiornamento, riavvia in recovery per usare la nuova versione."
 
 [settings]
+always_on_display = "Display sempre attivo"
+always_on = "Sempre attivo"
+clock_style = "Stile dell'orologio"
+always_on_note = "A schermo spento, ora, batteria, slot e stato della decifratura restano visibili, con la retroilluminazione spenta."
+double_tap = "Doppio tocco per svegliare"
 remember_password = "Ricorda password"
 remember_password_note = "Se attivo, il blocco schermo resta su questo telefono e viene provato da solo al prossimo avvio. Chiunque abbia questo telefono può leggerlo."
 light_mode = "Modalità chiara"

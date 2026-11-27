@@ -611,6 +611,11 @@ both_slots = "Phiên bản mới được ghi vào phân vùng recovery của kh
 reboot_to_use = "Sau khi cập nhật, hãy khởi động lại vào recovery để dùng phiên bản mới."
 
 [settings]
+always_on_display = "Màn hình luôn bật"
+always_on = "Luôn bật"
+clock_style = "Kiểu đồng hồ"
+always_on_note = "Khi tắt màn hình, giờ, pin, slot và trạng thái giải mã vẫn hiển thị, đèn nền vẫn tắt."
+double_tap = "Chạm hai lần để đánh thức"
 remember_password = "Ghi nhớ mật khẩu"
 remember_password_note = "Khi bật, khóa màn hình được giữ trên điện thoại này và tự thử ở lần khởi động sau. Bất kỳ ai có điện thoại này đều có thể đọc nó."
 light_mode = "Chế độ sáng"

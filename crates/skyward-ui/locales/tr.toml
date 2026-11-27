@@ -611,6 +611,11 @@ both_slots = "Yeni sürüm, bir sonraki açılışta kullanılacak slotun recove
 reboot_to_use = "Güncellemeden sonra yeni sürümü kullanmak için kurtarma moduna yeniden başlatın."
 
 [settings]
+always_on_display = "Her zaman açık ekran"
+always_on = "Her zaman açık"
+clock_style = "Saat stili"
+always_on_note = "Ekran kapalıyken saat, pil, slot ve şifre çözme durumu görünür kalır, arka ışık kapalıdır."
+double_tap = "Uyandırmak için iki kez dokun"
 remember_password = "Parolayı hatırla"
 remember_password_note = "Açıkken ekran kilidi bu telefonda saklanır ve bir sonraki başlatmada kendiliğinden denenir. Bu telefonu elinde tutan herkes okuyabilir."
 light_mode = "Açık mod"

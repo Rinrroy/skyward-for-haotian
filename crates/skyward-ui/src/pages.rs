@@ -349,13 +349,43 @@ pub fn settings(cx: &Ctx) -> Frame {
     if let Some(r) = vibration.below {
         out.push(Hit { rect: r, action: Action::Toggle(Switch::Vibrate) });
     }
-    y = widgets::section(&mut c, t, f, vibration.bottom, l.pick(texts::settings::GENERAL));
-    let general = widgets::list(&mut c, t, f, y, &[
+    // A phone whose panel has a doze of its own can keep a little on the glass
+    // with the screen off; one whose panel has none shows nothing to offer.
+    // The switch starts off, so a phone that has never been to this page puts
+    // a dark panel out the way the recovery always did. It sits under the
+    // vibration, so the settings above it stay where the pages have always put
+    // them.
+    let mut y = vibration.bottom;
+    if s.panel_dozes {
+        y = widgets::section(&mut c, t, f, y, l.pick(texts::settings::ALWAYS_ON_DISPLAY));
+        let on = Row::new(l.pick(texts::settings::ALWAYS_ON)).trail(Trail::Switch(s.always_on));
+        // The face the panel wears while it dozes, which the row goes round:
+        // the digits the recovery has always drawn, the hour and the minute
+        // set askew, and a clock face. It shows whether the face is on or not,
+        // so that the one chosen is there to be seen before it is turned on.
+        let style = Row::new(l.pick(texts::settings::CLOCK_STYLE)).trail(Trail::Value(s.aod_style.name(l)));
+        let aod = widgets::list(&mut c, t, f, y, &[on, style]);
+        out.extend(hits(&aod.rows, &[Action::Toggle(Switch::AlwaysOn), Action::AodStyle]));
+        y = widgets::footnote(&mut c, t, f, aod.bottom, l.pick(texts::settings::ALWAYS_ON_NOTE));
+    }
+    y = widgets::section(&mut c, t, f, y, l.pick(texts::settings::GENERAL));
+    // Two taps on the dark panel light it, on a panel whose touch controller
+    // goes on reporting fingers with the panel off. It costs the phone its
+    // suspend — the panel has to keep dozing for the taps to be felt at all,
+    // since Xiaomi's driver suspends the touchscreen with the panel's blanking
+    // — so it is asked for here rather than shipped on.
+    let mut rows = vec![
         Row::new(l.pick(texts::page::LANGUAGE)).icon(BLUE, Icon::Globe).trail(Trail::Value(l.name())),
         Row::new(l.pick(texts::page::TIME_ZONE)).icon(ORANGE, Icon::Clock).trail(Trail::Value(s.zone_name())),
         Row::new(l.pick(texts::settings::REMEMBER_PASSWORD)).icon(SLATE, Icon::Lock).trail(Trail::Switch(s.remember_password)),
-    ]);
-    out.extend(hits(&general.rows, &[Action::Open(Screen::Language), Action::Open(Screen::TimeZone), Action::Toggle(Switch::RememberPassword)]));
+    ];
+    let mut opens = vec![Action::Open(Screen::Language), Action::Open(Screen::TimeZone), Action::Toggle(Switch::RememberPassword)];
+    if s.panel_taps {
+        rows.push(Row::new(l.pick(texts::settings::DOUBLE_TAP)).trail(Trail::Switch(s.double_tap)));
+        opens.push(Action::Toggle(Switch::DoubleTap));
+    }
+    let general = widgets::list(&mut c, t, f, y, &rows);
+    out.extend(hits(&general.rows, &opens));
     y = widgets::footnote(&mut c, t, f, general.bottom, l.pick(texts::settings::REMEMBER_PASSWORD_NOTE));
     y = widgets::section(&mut c, t, f, y, "USB");
     let usb = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(texts::settings::FILE_TRANSFER)).icon(BLUE, Icon::Usb).trail(Trail::Switch(s.file_transfer))]);

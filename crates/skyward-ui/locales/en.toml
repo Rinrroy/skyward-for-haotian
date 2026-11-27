@@ -694,6 +694,11 @@ both_slots = "The new version goes into the recovery partition of the slot that 
 reboot_to_use = "Once updated, reboot to recovery to use the new version."
 
 [settings]
+always_on_display = "Always-on display"
+always_on = "Always on"
+clock_style = "Clock style"
+always_on_note = "With the screen off, the time, the battery, the slot and the data partition stay on the glass, with the backlight out."
+double_tap = "Double tap to wake"
 remember_password = "Remember password"
 remember_password_note = "When on, the screen lock is kept on this phone and tried by itself at the next start. Anyone with this phone can read it."
 light_mode = "Light mode"

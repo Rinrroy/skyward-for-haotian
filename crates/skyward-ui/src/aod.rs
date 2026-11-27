@@ -117,12 +117,11 @@ pub const STYLES: [AodStyle; 3] = [AodStyle::Digits, AodStyle::Offset, AodStyle:
 impl AodStyle {
     /// The name the style is known by, as the setting shows it.
     pub fn name(self, l: Lang) -> &'static str {
-        let names: [&'static str; 3] = match self {
-            AodStyle::Digits => ["数字", "數字", "Digits"],
-            AodStyle::Offset => ["错位", "錯位", "Offset"],
-            AodStyle::Dial => ["表盘", "錶盤", "Dial"],
-        };
-        l.pick(names)
+        match self {
+            AodStyle::Digits => l.among("数字", "數字", "Digits"),
+            AodStyle::Offset => l.among("错位", "錯位", "Offset"),
+            AodStyle::Dial => l.among("表盘", "錶盤", "Dial"),
+        }
     }
 
     /// The style after this one, as the setting is tapped.

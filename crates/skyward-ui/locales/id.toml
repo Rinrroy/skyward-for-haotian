@@ -606,6 +606,11 @@ both_slots = "Versi baru ditulis ke partisi recovery slot yang digunakan pada bo
 reboot_to_use = "Setelah diupdate, mulai ulang ke recovery untuk menggunakan versi baru."
 
 [settings]
+always_on_display = "Layar selalu aktif"
+always_on = "Selalu aktif"
+clock_style = "Gaya jam"
+always_on_note = "Saat layar mati, waktu, baterai, slot, dan status dekripsi tetap terlihat, lampu latar tetap mati."
+double_tap = "Ketuk dua kali untuk bangun"
 remember_password = "Ingat kata sandi"
 remember_password_note = "Saat aktif, kunci layar disimpan di ponsel ini dan dicoba sendiri pada awal berikutnya. Siapa pun yang memegang ponsel ini dapat membacanya."
 light_mode = "Mode terang"

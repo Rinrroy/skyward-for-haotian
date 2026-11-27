@@ -186,6 +186,19 @@ pub struct State {
     pub remember_password: bool,
     /// The last credential the phone accepted, where remembering is on.
     pub remembered: Option<String>,
+    /// A dark panel keeps the clock and the phone's readings on the glass in
+    /// the panel's own doze, rather than being put out. A phone whose driver
+    /// names no doze has none of this.
+    pub always_on: bool,
+    /// The face the dark panel wears while it dozes.
+    pub aod_style: AodStyle,
+    /// Whether the panel has a doze of its own to offer the switch for.
+    pub panel_dozes: bool,
+    /// Two taps on the dark panel light it again, where the panel's touch
+    /// controller keeps reporting fingers with the panel off.
+    pub double_tap: bool,
+    /// Whether the panel can be woken by two taps at all.
+    pub panel_taps: bool,
     /// The phone maker's update server is known, and the update page asks
     /// it.
     pub update_server: bool,
@@ -282,6 +295,11 @@ impl Default for State {
             show_password: false,
             remember_password: false,
             remembered: None,
+            always_on: false,
+            aod_style: AodStyle::Digits,
+            panel_dozes: false,
+            double_tap: false,
+            panel_taps: false,
             update_server: false,
             check: Check::Idle,
             have: Have::Nothing,
