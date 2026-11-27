@@ -91,7 +91,9 @@ pub enum Command {
     Join { ssid: Vec<u8>, name: String, security: Security, password: String, remember: bool },
     Leave,
     /// Forget the network named `name`, with whatever was kept of it; an
-    /// empty name forgets every network kept.
+    /// empty name forgets every network kept. The pages that list the kept
+    /// networks are not ported yet, so nothing sends this today.
+    #[allow(dead_code)]
     Forget { name: String },
 }
 
@@ -206,7 +208,8 @@ impl Worker {
     /// Forget the network named `name`, with whatever the phone kept of it:
     /// its password and how it is protected. An empty name forgets every
     /// network kept, which is what the switch that turns remembering off
-    /// asks for.
+    /// asks for. The pages that list the kept networks are not ported yet.
+    #[allow(dead_code)]
     pub fn forget(&self, name: String) {
         self.send(Command::Forget { name });
     }
@@ -217,11 +220,13 @@ impl Worker {
     /// channel itself: two drains of one channel would each take part of what
     /// the other was going to return, and which part would depend on the
     /// order the screen happened to ask in.
+    #[allow(dead_code)]
     pub fn saved(&self) -> Option<Vec<SavedNetwork>> {
         self.stashed().saved.take()
     }
 
     /// How forgetting a network went, if it ended since the last call.
+    #[allow(dead_code)]
     pub fn forgotten(&self) -> Option<Result<String, String>> {
         self.stashed().forgotten.take()
     }
@@ -261,14 +266,6 @@ impl Worker {
 }
 
 impl Worker {
-    /// Put the radio away now, and wait for the thread to have done it: the
-    /// thread is the only one that can stop the chip's firmware and take the
-    /// driver out of the kernel, and a recovery that stops with the chip
-    /// running hands it to the system in a state its own driver cannot start.
-    pub fn stop(mut self) {
-        self.end();
-    }
-
     fn end(&mut self) {
         if let Some(thread) = self.thread.take() {
             let _ = self.inbox.send(Inbox::End);
