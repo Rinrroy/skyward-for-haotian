@@ -685,7 +685,10 @@ pub enum BackupRefusal {
     Resized(String),
     /// The data partition has been made afresh since the backup, as a
     /// factory reset makes it: the files backed up would not open in it.
-    DataReset,
+    /// The data files are those of a newer Android than the phone's system
+    /// is, which does not read them: the release the backup was made on,
+    /// and the phone's.
+    OlderAndroid { was: String, now: String },
 }
 
 /// An entry of a folder, as the file manager lists it.
@@ -8322,6 +8325,7 @@ mod tests {
             os_version: None,
             android: None,
             locale: None,
+            time_zone: None,
             security_patch: None,
             kernel: "5.15.178".into(),
             storage: Storage { total: 496_550_785_024, free: None },

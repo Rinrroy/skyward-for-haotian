@@ -554,7 +554,7 @@ fn main() -> Result<()> {
             app.state.backup_job = job(true, plan(), at, Some(BackupEnd::Failed("write /dev/block/dm-61: Input/output error (os error 5)".into())))
         }),
         ("109-restore-job-dark-refused", Screen::BackupJob, true, &|app| {
-            app.state.backup_job = job(true, Vec::new(), None, Some(BackupEnd::Refused(BackupRefusal::DataReset)))
+            app.state.backup_job = job(true, Vec::new(), None, Some(BackupEnd::Refused(BackupRefusal::OlderAndroid { was: "17".into(), now: "16".into() })))
         }),
         ("49-advanced-light", Screen::Advanced, false, &|_| {}),
         ("50-files-light", Screen::Files, false, &|app| app.set_files("/".into(), Ok(sample_root()), LISTED)),
@@ -1560,6 +1560,7 @@ fn haotian(cfg: &DeviceConfig) -> DeviceInfo {
         os_version: Some("OS4.0.0.19.XOBCNXM".into()),
         android: Some("17".into()),
         locale: Some("zh-CN".into()),
+        time_zone: Some("Asia/Shanghai".into()),
         security_patch: Some(PatchLevel { year: 2026, month: 9, day: 1 }),
         kernel: "6.6.118-android15-8-gb9cc6ec16bc8-abogki536571621-4k".into(),
         storage: Storage { total: 1_024_209_543_168, free: Some(611_375_398_912) },

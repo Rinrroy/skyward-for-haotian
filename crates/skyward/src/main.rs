@@ -297,10 +297,12 @@ fn main() -> Result<()> {
         Cmd::Services { config } => {
             let slot = booted_slot()?;
             let props = skyward_info::installed_props(slot)?;
-            let services: Vec<Started> = DeviceConfig::load(&config)?.services.into_iter().filter(|s| s.runs_on(&props)).map(Started::from).collect();
+            let cfg = DeviceConfig::load(&config)?;
+            let services: Vec<Started> = cfg.services.into_iter().filter(|s| s.runs_on(&props)).map(Started::from).collect();
             let libraries = secure::libraries()?;
             services::start(&services, libraries.as_deref())?;
-            keys::start(&keys::found(slot, libraries.as_deref())?.steps?)?;
+            let modules = cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
+            keys::start(&keys::found(slot, libraries.as_deref())?.steps?, &modules)?;
             loop {
                 std::thread::park();
             }
@@ -416,7 +418,7 @@ fn main() -> Result<()> {
             use skyward_crypto::data;
             let binder = skyward_binder::driver::Binder::open()?;
             let service = skyward_crypto::keymint::KeyMint::open(&binder)?;
-            let opening = data::open_without_credential(&service)?;
+            let opening = data::open_without_credential(Some(&service))?;
             match &opening.mounted {
                 Some(mounted) => {
                     if let Some(checked) = &mounted.checked {
@@ -635,7 +637,8 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     for line in keys::describe(&steps) {
         skyward_sys::kmsg(&format!("for the phone's keys: {}", line.replace("\n  ", ", ")))?;
     }
-    keys::start(&steps)?;
+    let modules = cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
+    keys::start(&steps, &modules)?;
     agree_on_the_notes_key(&registering)
 }
 
@@ -997,7 +1000,7 @@ fn open_data_for_art() -> Result<()> {
     use skyward_crypto::data;
     let binder = skyward_binder::driver::Binder::open()?;
     let service = skyward_crypto::keymint::KeyMint::open(&binder)?;
-    data::open_without_credential(&service)?;
+    data::open_without_credential(Some(&service))?;
     Ok(())
 }
 

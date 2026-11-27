@@ -522,14 +522,24 @@ fn backups_at(place: Place) -> Result<Vec<BackupEntry>> {
 
 /// What a backup's manifest records, as the pages show it.
 fn held(m: &skyward_backup::Manifest) -> Held {
+    let [boot, system, data, media, efs] = m.parts();
     Held {
         made: m.made,
         size: m.size(),
-        parts: m.parts(),
+        // The pages tell four parts: the data partition and internal
+        // storage are offered together, as the one data part.
+        parts: [boot, system, data || media, efs],
         device: m.device.clone(),
         system: m.system.clone(),
         slot: skyward_vab::Slot::from_suffix(&m.slot),
     }
+}
+
+/// The parts the pages offer, as the manifest of a backup states them: the
+/// data part is the data partition and internal storage together.
+fn backup_parts(parts: [bool; 4]) -> [bool; 5] {
+    let [boot, system, data, efs] = parts;
+    [boot, system, data, data, efs]
 }
 
 /// Look for backups in the places asked, the restore page showing what is
@@ -576,7 +586,7 @@ fn backup_end(end: backup::End) -> BackupEnd {
             backup::Refusal::Update(state) => BackupRefusal::Update(state),
             backup::Refusal::OtherPhone(device) => BackupRefusal::OtherPhone(device),
             backup::Refusal::Resized(name) => BackupRefusal::Resized(name),
-            backup::Refusal::DataReset => BackupRefusal::DataReset,
+            backup::Refusal::OlderAndroid { was, now } => BackupRefusal::OlderAndroid { was, now },
         }),
         backup::End::Failed(why) => BackupEnd::Failed(why),
     }
@@ -2958,7 +2968,7 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                         };
                         let made = unix_now()?;
                         let task = backup::BackupTask {
-                            parts,
+                            parts: backup_parts(parts),
                             stamp: skyward_ui::fmt::stamp(made, app.state.time_zone),
                             into,
                             ownership,
@@ -2968,8 +2978,9 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                             made,
                             device: cfg.device.codename.clone(),
                             system: info.os_version.clone(),
+                            android: info.android.clone(),
                             efs: cfg.backup.efs.clone(),
-                            skipped: backup::data_skipped(&cfg.backup.data_skipped),
+                            skipped: cfg.backup.data_skipped.clone(),
                         };
                         backuper = Some(backup::Worker::start(backup::Task::Backup(task))?);
                         app.backup_started(false, place, verify);
@@ -2982,9 +2993,10 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
                         }
                         let task = backup::RestoreTask {
                             folder: backups_in(place).join(&name),
-                            parts,
+                            parts: backup_parts(parts),
                             device: cfg.device.codename.clone(),
-                            skipped: backup::data_skipped(&cfg.backup.data_skipped),
+                            android: info.android.clone(),
+                            skipped: cfg.backup.data_skipped.clone(),
                             detach: detach(programs.to_vec()),
                         };
                         backuper = Some(backup::Worker::start(backup::Task::Restore(task))?);

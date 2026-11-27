@@ -170,6 +170,13 @@ pub struct Firmware {
     /// read-only while the file is read.
     #[serde(default)]
     pub partition: Option<String>,
+    /// Whether the phone may be without the file, as it is without the
+    /// MAC address until its own system has written one into the folder
+    /// its init makes for it: the driver then starts without the file, as
+    /// it does in the phone's own system. Any other failure to read it
+    /// still ends bringing the WLAN up.
+    #[serde(default)]
+    pub optional: bool,
 }
 
 /// The phone maker's update server, which the stock updater asks about the
@@ -239,6 +246,12 @@ pub struct Haptics {
     #[serde(default)]
     pub firmware: Vec<Firmware>,
     pub strength: Strength,
+    /// Whether the strength goes into the samples made, each made that
+    /// share of itself and played at the driver's full magnitude, on
+    /// phones whose driver plays samples at only two strengths whatever
+    /// magnitude between none and the full one it is given.
+    #[serde(default)]
+    pub scale_samples: bool,
 }
 
 /// The panel's own doze: what the display driver is told to keep a little of
@@ -1205,6 +1218,9 @@ mod tests {
         assert!(with("{ name = \"a.ini\", path = \"vendor/etc/a.ini\" }").is_err());
         assert!(with("{ name = \"mac.bin\", partition = \"persist\", path = \"/kiwi/mac.bin\" }").is_err());
         assert!(with("{ name = \"mac.bin\", partition = \"by-name/persist\", path = \"mac.bin\" }").is_err());
+        let file = |file: &str| with(file).unwrap().wlan.unwrap().firmware.remove(0);
+        assert!(!file("{ name = \"wlan/a.ini\", path = \"/vendor/etc/a.ini\" }").optional, "a phone has each file unless it is said it may not");
+        assert!(file("{ name = \"wlan/mac.bin\", partition = \"persist\", path = \"kiwi/mac.bin\", optional = true }").optional);
     }
 
     #[test]
