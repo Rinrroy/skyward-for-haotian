@@ -555,8 +555,9 @@ mod tests {
         app.touch(Touch::Down(300.0, 900.0), &f, 500);
         app.touch(Touch::Down(300.0, 900.0), &f, 500 + Tap::WINDOW_MS + 1);
         assert!(!app.display_on(), "the window is 300 ms");
-        app.touch(Touch::Down(300.0, 900.0), &f, 900);
-        app.touch(Touch::Down(300.0 + W as f32 * Tap::SLOP * 2.0, 900.0), &f, 950);
+        // Well clear of the 300 ms window, so only the slop can join these two.
+        app.touch(Touch::Down(300.0, 900.0), &f, 1200);
+        app.touch(Touch::Down(300.0 + W as f32 * Tap::SLOP * 2.0, 900.0), &f, 1250);
         assert!(!app.display_on(), "and two taps further apart than the slop are not a double tap");
         // Without the settings, nothing lights it.
         let mut app = App::new(Screen::Home, W, H, PPD);
