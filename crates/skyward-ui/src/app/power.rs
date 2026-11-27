@@ -537,6 +537,38 @@ mod tests {
     }
 
     #[test]
+    fn two_taps_on_the_dark_panel_light_it_again() {
+        let (f, _i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.panel_dozes = true;
+        app.state.panel_taps = true;
+        app.state.double_tap = true;
+        app.tick(0);
+        app.sleep(100);
+        assert!(!app.display_on());
+        assert!(app.touch(Touch::Down(300.0, 900.0), &f, 200).is_empty(), "one tap waits for the second");
+        assert!(!app.display_on());
+        assert!(app.touch(Touch::Down(320.0, 910.0), &f, 280).is_empty(), "the second lights it and works nothing");
+        assert!(app.display_on(), "two taps near each other, soon enough, light the panel");
+        // A tap too late, or too far away, starts the count again.
+        app.sleep(400);
+        app.touch(Touch::Down(300.0, 900.0), &f, 500);
+        app.touch(Touch::Down(300.0, 900.0), &f, 500 + Tap::WINDOW_MS + 1);
+        assert!(!app.display_on(), "the window is 300 ms");
+        app.touch(Touch::Down(300.0, 900.0), &f, 900);
+        app.touch(Touch::Down(300.0 + W as f32 * Tap::SLOP * 2.0, 900.0), &f, 950);
+        assert!(!app.display_on(), "and two taps further apart than the slop are not a double tap");
+        // Without the settings, nothing lights it.
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.panel_dozes = true;
+        app.tick(0);
+        app.sleep(100);
+        app.touch(Touch::Down(300.0, 900.0), &f, 200);
+        app.touch(Touch::Down(300.0, 900.0), &f, 280);
+        assert!(!app.display_on(), "the gesture is a switch, and ships off");
+    }
+
+    #[test]
     fn never_leaves_the_panel_on() {
         let mut app = App::new(Screen::Home, W, H, PPD);
         app.state.screen_off = SCREEN_OFF.iter().position(Option::is_none).unwrap();
